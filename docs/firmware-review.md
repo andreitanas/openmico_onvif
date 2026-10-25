@@ -235,9 +235,10 @@ Done; the camera runs it:
   - Boot to streaming takes about 36 s.
   - `image/flash.sh` installs over ssh with verification and automatic
     restore; `build/image/demo.bin` is for setup-button installs.
-- **Clock** (proposal 2): uvcd waits for NTP before connecting. After
-  reboots, Protect now records the low-res stream within a minute; it used
-  to be refused for about 75 s.
+- **Clock** (proposal 2): uvcd waits for NTP before connecting. Without
+  NTP (no internet access), it takes the time from the console's web server
+  after 30 s. After reboots, Protect now records the low-res stream within a
+  minute; it used to be refused for about 75 s.
 - **Watchdog** (proposal 4): armed at 60 s and fed while video flows and
   Protect was reachable within 30 min. Tested:
   - a frozen uvcd reboots the camera in under a minute;
@@ -251,6 +252,11 @@ Done; the camera runs it:
   the config flash.
 
 Found on the way:
+- Scrub-preview "stalls": Protect's recorder writes timelapse frames in
+  batches (about 4 min for the main track, 15 min for the low-res one) and
+  drops the batch in progress whenever a camera reconnects. Frequent
+  reconnects while developing explained the gaps; with a stable connection
+  they fill in.
 - The libimp compatibility shim overrode `mmap` for the whole binary.
   musl's `sem_open` (64-bit offset) then mapped its semaphore at a garbage
   offset and crashed with SIGBUS; it had only worked by luck. libimp's own
