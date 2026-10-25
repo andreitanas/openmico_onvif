@@ -29,6 +29,13 @@ static void defaults(struct config *c) {
     SET(hi_source, "/dev/video3");
     SET(snapshot, "/dev/video4");
     SET(state_file, "/config/uvcd.state");
+    SET(night_file, "/tmp/night_vision_enabled");
+    c->hi_kbps = 2000;
+    c->lo_kbps = 300;
+    c->hi_gop = 50;
+    c->lo_gop = 25;
+    c->lo_width = 640;
+    c->lo_height = 360;
     c->fps = 25;
     c->audio = 1;
     c->allow_reboot = 1;
@@ -64,6 +71,19 @@ static void set_key(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "LO_SOURCE")) SET(lo_source, v);
     else if (!strcmp(k, "SNAPSHOT_SOURCE")) SET(snapshot, v);
     else if (!strcmp(k, "STATE_FILE")) SET(state_file, v);
+    else if (!strcmp(k, "CAPTURE")) c->capture = atoi(v);
+    else if (!strcmp(k, "HI_MIRROR")) SET(hi_mirror, v);
+    else if (!strcmp(k, "LO_MIRROR")) SET(lo_mirror, v);
+    else if (!strcmp(k, "JPEG_MIRROR")) SET(jpeg_mirror, v);
+    else if (!strcmp(k, "HI_BITRATE")) c->hi_kbps = atoi(v);
+    else if (!strcmp(k, "LO_BITRATE")) c->lo_kbps = atoi(v);
+    else if (!strcmp(k, "HI_GOP")) c->hi_gop = atoi(v);
+    else if (!strcmp(k, "LO_GOP")) c->lo_gop = atoi(v);
+    else if (!strcmp(k, "LO_WIDTH")) c->lo_width = atoi(v);
+    else if (!strcmp(k, "LO_HEIGHT")) c->lo_height = atoi(v);
+    else if (!strcmp(k, "FLIP_V")) c->flip_v = atoi(v);
+    else if (!strcmp(k, "FLIP_H")) c->flip_h = atoi(v);
+    else if (!strcmp(k, "NIGHT_FILE")) SET(night_file, v);
     else if (!strcmp(k, "FPS")) c->fps = atoi(v);
     else if (!strcmp(k, "AUDIO")) c->audio = atoi(v);
     else if (!strcmp(k, "ALLOW_REBOOT")) c->allow_reboot = atoi(v);
@@ -147,13 +167,19 @@ int config_load(struct config *c, const char *path) {
     discover(c);
     // The state file only ever records that adoption succeeded.
     parse_file(c, c->state_file, 0);
-    if (!*c->nvr || strlen(c->mac) != 12 || !*c->ip) {
-        log_error("config needs NVR_HOST, and a MAC/IP (from %s or MAC=/IP=)", c->iface);
-        return -1;
-    }
-    if (!c->adopted && !*c->token) {
-        log_error("not adopted yet: set ADOPTION_TOKEN (Protect: /proxy/protect/api/cameras/manage-payload)");
-        return -1;
+    // Without Protect settings a capturing uvcd still feeds RTSP/ONVIF.
+    const char *missing = NULL;
+    if (!*c->nvr || strlen(c->mac) != 12 || !*c->ip)
+        missing = "config needs NVR_HOST, and a MAC/IP (from IFACE or MAC=/IP=)";
+    else if (!c->adopted && !*c->token)
+        missing = "not adopted yet: set ADOPTION_TOKEN (Protect: /proxy/protect/api/cameras/manage-payload)";
+    c->protect = !missing;
+    if (missing) {
+        if (!c->capture) {
+            log_error("%s", missing);
+            return -1;
+        }
+        log_warn("%s; capturing only", missing);
     }
     return 0;
 }

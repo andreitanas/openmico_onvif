@@ -90,22 +90,25 @@ struct frame *queue_pop(struct queue *q, int timeout_ms) {
     return f;
 }
 
-static void publish(struct source *s, const uint8_t *data, size_t len) {
+struct frame *frame_new(size_t len) {
     struct frame *f = malloc(sizeof(*f) + len);
     if (!f)
-        return;
+        return NULL;
     f->refs = 1;
-    f->len = len;
+    f->key = 0;
     f->ts_ms = mono_ms();
-    memcpy(f->data, data, len);
-    f->key = h264_is_key(data, len);
+    f->len = len;
+    return f;
+}
 
+void source_push(struct source *s, struct frame *f) {
+    f->key = h264_is_key(f->data, f->len);
     pthread_mutex_lock(&s->lock);
     s->last_frame_ms = f->ts_ms;
     if (f->key && !s->width) {
         size_t pos = 0, n;
         const uint8_t *nal;
-        while (h264_next_nal(data, len, &pos, &nal, &n)) {
+        while (h264_next_nal(f->data, f->len, &pos, &nal, &n)) {
             int w, h;
             if (n && h264_type(nal) == NAL_SPS && h264_sps_size(nal, n, &w, &h) == 0) {
                 s->width = w;
@@ -118,6 +121,14 @@ static void publish(struct source *s, const uint8_t *data, size_t len) {
     for (struct queue *q = s->subs; q; q = q->next)
         queue_push(q, f);
     pthread_mutex_unlock(&s->lock);
+}
+
+static void publish(struct source *s, const uint8_t *data, size_t len) {
+    struct frame *f = frame_new(len);
+    if (!f)
+        return;
+    memcpy(f->data, data, len);
+    source_push(s, f);
     frame_unref(f);
 }
 
@@ -213,13 +224,17 @@ static void *source_main(void *arg) {
     return NULL;
 }
 
-int source_start(struct source *s, const char *path, int fps) {
+void source_init(struct source *s, const char *name) {
     memset(s, 0, sizeof(*s));
-    snprintf(s->path, sizeof(s->path), "%s", path);
+    snprintf(s->path, sizeof(s->path), "%s", name);
+    pthread_mutex_init(&s->lock, NULL);
+}
+
+int source_start(struct source *s, const char *path, int fps) {
+    source_init(s, path);
     s->fps = fps;
     struct stat st;
     s->file = stat(path, &st) == 0 && S_ISREG(st.st_mode);
-    pthread_mutex_init(&s->lock, NULL);
     return pthread_create(&s->thread, NULL, source_main, s);
 }
 

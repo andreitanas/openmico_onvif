@@ -1,6 +1,8 @@
 // Symbols Ingenic's prebuilt libimp.a expects from its original uClibc
 // toolchain (and from libalog), provided for a static musl build.
 
+#ifdef UVC_IMP
+
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -50,3 +52,5 @@ struct cleanup_frame;
 void __pthread_register_cancel(struct cleanup_frame *f) {}
 void __pthread_unregister_cancel(struct cleanup_frame *f) {}
 void __pthread_unwind_next(struct cleanup_frame *f) { abort(); }
+
+#endif

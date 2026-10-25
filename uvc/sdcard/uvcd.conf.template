@@ -15,11 +15,29 @@ STATE_FILE=/sdcard/uvc/uvcd.state
 # MAC/IP are read from wlan0. Protect identifies the camera by MAC.
 #IFACE=wlan0
 
-# H.264 from OpenMiko's videocapture (v4l2loopback): HI_SOURCE (1080p) for video1,
-# LO_SOURCE (640x360, see videocapture_settings.json) for video2/video3.
-HI_SOURCE=/dev/video3
-LO_SOURCE=/dev/video5
-SNAPSHOT_SOURCE=/dev/video4
+# CAPTURE=1: uvcd drives the sensor and encoders itself (libimp) instead of
+# reading OpenMiko's videocapture, which must then not run. Encoded streams
+# are copied to the v4l2loopback devices so RTSP/ONVIF keep working.
+CAPTURE=1
+HI_MIRROR=/dev/video3
+JPEG_MIRROR=/dev/video4
+LO_MIRROR=/dev/video5
+# kbit/s and keyframe interval (frames) of the 1080p and low-res streams
+#HI_BITRATE=2000
+#HI_GOP=50
+#LO_BITRATE=300
+#LO_GOP=25
+#LO_WIDTH=640
+#LO_HEIGHT=360
+#FLIP_V=0
+#FLIP_H=0
+
+# CAPTURE=0: H.264 from OpenMiko's videocapture (v4l2loopback): HI_SOURCE
+# (1080p) for video1, LO_SOURCE (640x360, see videocapture_settings.json)
+# for video2/video3, JPEG snapshots from SNAPSHOT_SOURCE.
+#HI_SOURCE=/dev/video3
+#LO_SOURCE=/dev/video5
+#SNAPSHOT_SOURCE=/dev/video4
 FPS=25
 
 # UniFi identity (UVC G5 Pro). FW_VERSION should be the newest firmware

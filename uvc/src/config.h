@@ -19,6 +19,18 @@ struct config {
     char lo_source[128]; // H.264 for video2/video3 (may equal hi_source)
     char snapshot[128];  // JPEG device or file
     char state_file[128];
+    // CAPTURE=1: uvcd drives the sensor and encoders through libimp itself,
+    // replacing OpenMiko's videocapture, and copies the encoded streams to
+    // these v4l2loopback devices for v4l2rtspserver (RTSP/ONVIF).
+    int capture;
+    char hi_mirror[64];
+    char lo_mirror[64];
+    char jpeg_mirror[64];
+    int hi_kbps, lo_kbps, hi_gop, lo_gop;
+    int lo_width, lo_height;
+    int flip_v, flip_h;
+    char night_file[64]; // OpenMiko's autonight writes 0/1 here
+    int protect;         // Protect is configured (else only capture runs)
     int fps;
     int audio;
     int allow_reboot;

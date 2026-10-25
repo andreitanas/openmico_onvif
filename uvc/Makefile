@@ -4,6 +4,7 @@
 
 MBEDTLS := third_party/mbedtls
 CJSON := third_party/cjson
+INGENIC := third_party/ingenic
 
 SRC := $(wildcard src/*.c)
 DEP_SRC := $(wildcard $(MBEDTLS)/library/*.c) $(CJSON)/cJSON.c
@@ -19,9 +20,13 @@ build/host/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(HOST_CC) $(if $(filter src/%,$<),$(CFLAGS_COMMON),$(DEP_CFLAGS)) -c $< -o $@
 
+# libimp (Ingenic's camera SDK, prebuilt for uClibc) only in camera builds.
+IMP_CFLAGS := -DUVC_IMP -I$(INGENIC)/src/include/imp -I$(INGENIC)/src/include
+
 build/camera/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CAMERA_CC) $(if $(filter src/%,$<),$(CFLAGS_COMMON),$(DEP_CFLAGS)) -c $< -o $@
+	$(CAMERA_CC) $(if $(filter src/%,$<),$(CFLAGS_COMMON),$(DEP_CFLAGS)) \
+		$(if $(filter src/capture.c src/imp_compat.c,$<),$(IMP_CFLAGS)) -c $< -o $@
 
 HOST_OBJ := $(patsubst %.c,build/host/%.o,$(SRC) $(DEP_SRC))
 CAMERA_OBJ := $(patsubst %.c,build/camera/%.o,$(SRC) $(DEP_SRC))
@@ -38,7 +43,7 @@ build/uvcd: $(HOST_OBJ)
 camera: build/uvcd-mipsel
 
 build/uvcd-mipsel: $(CAMERA_OBJ)
-	$(CAMERA_CC) -static -s -Wl,--gc-sections -o $@ $^ -lpthread
+	$(CAMERA_CC) -static -s -Wl,--gc-sections -o $@ $^ $(INGENIC)/lib/libimp.a -lpthread -lm
 	@ls -l $@
 
 build/test_flv: test/test_flv.c $(LIB_HOST_OBJ)

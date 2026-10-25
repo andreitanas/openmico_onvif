@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "capture.h"
 #include "https.h"
 #include "mbedtls/sha1.h"
 #include "stream.h"
@@ -429,7 +430,8 @@ static void *upload_main(void *arg) {
     struct upload *u = arg;
     uint8_t *jpeg;
     size_t len;
-    if (read_jpeg(cfg->snapshot, &jpeg, &len) == 0) {
+    int rc = cfg->capture ? capture_jpeg(&jpeg, &len) : read_jpeg(cfg->snapshot, &jpeg, &len);
+    if (rc == 0) {
         int status = https_post_file(u->uri, u->fields, u->nfields, "screen.jpg", jpeg, len);
         log_debug("uploaded %s (%zu bytes): HTTP %d", u->what, len, status);
         free(jpeg);

@@ -1,6 +1,7 @@
 // uvcd: makes an OpenMiko camera adopt into UniFi Protect as a native
 // UniFi camera, speaking Protect's own camera protocol on the device.
 
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 #include <unistd.h>
 
 #include "avclient.h"
+#include "capture.h"
 #include "config.h"
 #include "source.h"
 #include "tls.h"
@@ -16,6 +18,17 @@
 static void usage(void) {
     fprintf(stderr, "usage: uvcd [-c /etc/uvcd.conf] [-v]\n");
     exit(2);
+}
+
+// SIGTERM/SIGINT are blocked in every thread and taken here, so libimp is
+// shut down cleanly for whoever owns the camera next.
+static void *signal_main(void *arg) {
+    sigset_t *set = arg;
+    int sig;
+    sigwait(set, &sig);
+    log_info("signal %d: stopping", sig);
+    capture_stop();
+    _exit(0);
 }
 
 int main(int argc, char **argv) {
@@ -38,20 +51,39 @@ int main(int argc, char **argv) {
         log_level = LOG_DEBUG;
     log_info("uvcd: %s mac %s ip %s, Protect %s", cfg.name, cfg.mac, cfg.ip, cfg.nvr);
 
-    if (tls_init(cfg.cert) < 0)
-        return 1;
+    static sigset_t stop_set;
+    sigemptyset(&stop_set);
+    sigaddset(&stop_set, SIGTERM);
+    sigaddset(&stop_set, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &stop_set, NULL);
+    pthread_t sig_thread;
+    pthread_create(&sig_thread, NULL, signal_main, &stop_set);
 
     static struct source hi, lo;
     struct source *lop = &hi;
-    source_start(&hi, cfg.hi_source, cfg.fps);
-    if (strcmp(cfg.lo_source, cfg.hi_source)) {
-        source_start(&lo, cfg.lo_source, cfg.fps);
+    if (cfg.capture) {
+        source_init(&hi, "capture:hi");
+        source_init(&lo, "capture:lo");
         lop = &lo;
+        if (capture_start(&cfg, &hi, &lo) < 0)
+            return 1;
+    } else {
+        source_start(&hi, cfg.hi_source, cfg.fps);
+        if (strcmp(cfg.lo_source, cfg.hi_source)) {
+            source_start(&lo, cfg.lo_source, cfg.fps);
+            lop = &lo;
+        }
     }
     // Resolutions go into the adoption handshake, so learn them first.
     while (source_wait_ready(&hi, 10000) < 0 || source_wait_ready(lop, 10000) < 0)
-        log_warn("waiting for H.264 from %s / %s", cfg.hi_source, cfg.lo_source);
+        log_warn("waiting for H.264 from %s / %s", hi.path, lop->path);
 
+    if (!cfg.protect) {
+        for (;;)
+            pause();
+    }
+    if (tls_init(cfg.cert) < 0)
+        return 1;
     avclient_run(&cfg, &hi, lop);
     return 0;
 }
