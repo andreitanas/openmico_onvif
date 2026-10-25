@@ -1,0 +1,11 @@
+src/
+build-host/
+build-mips/
+build-mips.cmake
+zig-ar
+zig-ranlib
+bench-host
+bench-mipsel
+models/
+images/
+build-tools/
