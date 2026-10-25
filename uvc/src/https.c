@@ -48,10 +48,11 @@ int https_post_file(const char *url, const struct form_field *fields, int nfield
                          boundary, fields[i].name, fields[i].value);
         buf_put(&body, part, n);
     }
+    const char *ext = strrchr(filename, '.');
     int n = snprintf(part, sizeof(part),
                      "--%s\r\nContent-Disposition: form-data; name=\"payload\"; "
-                     "filename=\"%s\"\r\nContent-Type: image/jpeg\r\n\r\n",
-                     boundary, filename);
+                     "filename=\"%s\"\r\nContent-Type: %s\r\n\r\n",
+                     boundary, filename, ext && !strcmp(ext, ".png") ? "image/png" : "image/jpeg");
     buf_put(&body, part, n);
     buf_put(&body, data, len);
     n = snprintf(part, sizeof(part), "\r\n--%s--\r\n", boundary);

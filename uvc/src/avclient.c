@@ -7,6 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "analytics.h"
 #include "cJSON.h"
 #include "capture.h"
 #include "https.h"
@@ -18,7 +19,9 @@
 static struct config *cfg;
 static struct source *hi_src, *lo_src;
 static struct ws ws;
-static int msg_id;
+static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
+static int connected; // guarded by send_lock
+static int msg_id;    // guarded by send_lock
 static int64_t start_ms;
 static char device_id[40], guid[40];
 
@@ -50,7 +53,14 @@ static void timestamp(char *out, size_t len) {
 
 // Envelope for everything we send. statusCode and an RFC 3339 timeStamp
 // are required by Protect 7.x's device service (ds) to parse it at all.
+// Called from the protocol thread and (events) from analytics.
 static void send_msg(const char *fn, int in_response_to, cJSON *payload) {
+    pthread_mutex_lock(&send_lock);
+    if (!connected) {
+        pthread_mutex_unlock(&send_lock);
+        cJSON_Delete(payload);
+        return;
+    }
     char ts[40];
     timestamp(ts, sizeof(ts));
     cJSON *m = cJSON_CreateObject();
@@ -69,7 +79,10 @@ static void send_msg(const char *fn, int in_response_to, cJSON *payload) {
     ws_send_text(&ws, text, strlen(text));
     free(text);
     cJSON_Delete(m);
+    pthread_mutex_unlock(&send_lock);
 }
+
+void avclient_event(const char *fn, cJSON *payload) { send_msg(fn, 0, payload); }
 
 static double uptime_s(void) { return (mono_ms() - start_ms) / 1000.0; }
 
@@ -421,6 +434,7 @@ static void change_video_settings(cJSON *payload) {
 struct upload {
     char uri[512];
     char what[64];
+    char filename[64];
     int nfields;
     struct form_field fields[16];
     char *strings; // backing store for fields
@@ -428,13 +442,17 @@ struct upload {
 
 static void *upload_main(void *arg) {
     struct upload *u = arg;
-    uint8_t *jpeg;
+    uint8_t *data;
     size_t len;
-    int rc = cfg->capture ? capture_jpeg(&jpeg, &len) : read_jpeg(cfg->snapshot, &jpeg, &len);
+    const char *name = "screen.jpg";
+    // A motion event's snapshot/heatmap, else a fresh picture.
+    int rc = analytics_file(u->what, u->filename, &data, &len, &name);
+    if (rc < 0)
+        rc = cfg->capture ? capture_jpeg(&data, &len) : read_jpeg(cfg->snapshot, &data, &len);
     if (rc == 0) {
-        int status = https_post_file(u->uri, u->fields, u->nfields, "screen.jpg", jpeg, len);
-        log_debug("uploaded %s (%zu bytes): HTTP %d", u->what, len, status);
-        free(jpeg);
+        int status = https_post_file(u->uri, u->fields, u->nfields, name, data, len);
+        log_debug("uploaded %s as %s (%zu bytes): HTTP %d", u->what, name, len, status);
+        free(data);
     } else {
         log_warn("no snapshot available from %s", cfg->snapshot);
     }
@@ -453,6 +471,8 @@ static void get_request(cJSON *payload) {
     struct upload *u = calloc(1, sizeof(*u));
     snprintf(u->uri, sizeof(u->uri), "%s", uri->valuestring);
     snprintf(u->what, sizeof(u->what), "%s", cJSON_IsString(what) ? what->valuestring : "?");
+    const char *filename = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "filename"));
+    snprintf(u->filename, sizeof(u->filename), "%s", filename ? filename : "");
     cJSON *fields = cJSON_GetObjectItem(payload, "formFields");
     size_t total = 0;
     cJSON *f;
@@ -549,14 +569,20 @@ static int handle(const char *text) {
     } else if (!strcmp(fn, "Reboot")) {
         if (cfg->allow_reboot) {
             log_info("reboot requested by Protect");
+            pthread_mutex_lock(&send_lock);
+            connected = 0;
             ws_close(&ws);
+            pthread_mutex_unlock(&send_lock);
             sync();
             execl("/sbin/reboot", "reboot", (char *)NULL);
         }
         reconnect = 1;
         respond = 0;
-    } else if (!strcmp(fn, "ChangeSmartDetectSettings") || !strcmp(fn, "ChangeSmartMotionSettings")) {
-        res = cJSON_CreateObject(); // zones are stored once detection exists
+    } else if (!strcmp(fn, "ChangeSmartMotionSettings")) {
+        analytics_settings(payload);
+        res = cJSON_CreateObject();
+    } else if (!strcmp(fn, "ChangeSmartDetectSettings")) {
+        res = cJSON_CreateObject(); // zones are stored once smart detection exists
     }
     if (respond) {
         // Protect 7.x stalls ~5 s on every unanswered request, so anything
@@ -596,6 +622,9 @@ static void session(void) {
     if (ws_connect(&ws, cfg->nvr, 7442, path, headers) < 0)
         return;
     log_info("connected");
+    pthread_mutex_lock(&send_lock);
+    connected = 1;
+    pthread_mutex_unlock(&send_lock);
     send_hello();
     for (;;) {
         const char *text;
@@ -606,7 +635,10 @@ static void session(void) {
         if (r > 0 && handle(text))
             break;
     }
+    pthread_mutex_lock(&send_lock);
+    connected = 0;
     ws_close(&ws);
+    pthread_mutex_unlock(&send_lock);
     stop_streams();
 }
 

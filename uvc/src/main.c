@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "analytics.h"
 #include "avclient.h"
 #include "capture.h"
 #include "config.h"
@@ -69,6 +70,7 @@ int main(int argc, char **argv) {
         lop = &lo;
         if (capture_start(&cfg, &hi, &lo) < 0)
             return 1;
+        analytics_start(avclient_event, cfg.lo_width, cfg.lo_height);
     } else {
         source_start(&hi, cfg.hi_source, cfg.fps);
         if (strcmp(cfg.lo_source, cfg.hi_source)) {

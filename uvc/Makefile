@@ -49,7 +49,11 @@ build/uvcd-mipsel: $(CAMERA_OBJ)
 build/test_flv: test/test_flv.c $(LIB_HOST_OBJ)
 	$(HOST_CC) $(CFLAGS_COMMON) -o $@ $^ -lpthread
 
-test: build/test_flv
+build/test_motion: test/test_motion.c build/host/src/motion.o
+	$(HOST_CC) $(CFLAGS_COMMON) -o $@ $^
+
+test: build/test_flv build/test_motion
+	./build/test_motion
 	./test/run.sh
 
 clean:
