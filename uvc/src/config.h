@@ -30,6 +30,7 @@ struct config {
     int lo_width, lo_height;
     int flip_v, flip_h;
     char night_file[64]; // OpenMiko's autonight writes 0/1 here
+    char detect_model[128]; // object detector, path without .param/.bin
     int protect;         // Protect is configured (else only capture runs)
     int fps;
     int audio;

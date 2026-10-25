@@ -30,6 +30,7 @@ static void defaults(struct config *c) {
     SET(snapshot, "/dev/video4");
     SET(state_file, "/config/uvcd.state");
     SET(night_file, "/tmp/night_vision_enabled");
+    SET(detect_model, "/sdcard/uvc/models/yolo-fastest-1.1");
     c->hi_kbps = 2000;
     c->lo_kbps = 300;
     c->hi_gop = 50;
@@ -84,6 +85,7 @@ static void set_key(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "FLIP_V")) c->flip_v = atoi(v);
     else if (!strcmp(k, "FLIP_H")) c->flip_h = atoi(v);
     else if (!strcmp(k, "NIGHT_FILE")) SET(night_file, v);
+    else if (!strcmp(k, "DETECT_MODEL")) SET(detect_model, v);
     else if (!strcmp(k, "FPS")) c->fps = atoi(v);
     else if (!strcmp(k, "AUDIO")) c->audio = atoi(v);
     else if (!strcmp(k, "ALLOW_REBOOT")) c->allow_reboot = atoi(v);

@@ -12,6 +12,7 @@
 #include "capture.h"
 #include "https.h"
 #include "mbedtls/sha1.h"
+#include "objects.h"
 #include "stream.h"
 #include "util.h"
 #include "ws.h"
@@ -131,7 +132,7 @@ static cJSON *feature_flags(void) {
     static const char *const aac[] = {"aac"};
     static const char *const nature[] = {"nature"};
     cJSON *f = cJSON_CreateObject();
-    NUM(f, "mic", 1);
+    BOOL(f, "mic", 1); // Protect stores it as reader.supportMic, a boolean in ds
     cJSON_AddItemToObject(f, "aec", cJSON_CreateArray());
     cJSON_AddItemToObject(f, "videoMode", str_array(def, 1));
     cJSON_AddItemToObject(f, "motionDetect", str_array(enhanced, 1));
@@ -612,7 +613,8 @@ static int handle(const char *text) {
         analytics_settings(payload);
         res = cJSON_CreateObject();
     } else if (!strcmp(fn, "ChangeSmartDetectSettings")) {
-        res = cJSON_CreateObject(); // zones are stored once smart detection exists
+        objects_settings(payload);
+        res = cJSON_CreateObject();
     }
     if (respond) {
         // Protect 7.x stalls ~5 s on every unanswered request, so anything

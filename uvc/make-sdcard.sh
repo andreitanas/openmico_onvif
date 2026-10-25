@@ -3,7 +3,8 @@
 #   - the existing overlay from ../deploy/config/overlay (wifi, passwd, ssh key),
 #     with openmiko.conf pointed at partition 1 + a swap file, uvcd as the
 #     capture process and the RTSP server off
-#   - uvcd, its config and a per-camera client certificate under /uvc
+#   - uvcd, its config, the object detector model and a per-camera client
+#     certificate under /uvc
 #   - S90uvcd (starts uvcd) and S99probe (writes /probe.txt on boot)
 #   - demo.bin (OpenMiko image; only flashed when the setup button is held)
 #
@@ -40,6 +41,9 @@ cp sdcard/videocapture_settings.json "$CARD/config/overlay/etc/"
 } > "$CARD/config/overlay/etc/openmiko.conf"
 
 cp build/uvcd-mipsel "$CARD/uvc/uvcd"
+# Object detector for smart detections (see fetch-deps.sh).
+mkdir -p "$CARD/uvc/models"
+cp third_party/models/yolo-fastest-1.1.param third_party/models/yolo-fastest-1.1.bin "$CARD/uvc/models/"
 if [ ! -f "$CARD/uvc/uvcd.conf" ]; then
     sed "s|@NVR_HOST@|$NVR|" sdcard/uvcd.conf.template > "$CARD/uvc/uvcd.conf"
 fi

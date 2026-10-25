@@ -6,6 +6,7 @@
 
 #include "capture.h"
 #include "motion.h"
+#include "objects.h"
 #include "png.h"
 #include "util.h"
 
@@ -125,6 +126,8 @@ static void *analytics_main(void *arg) {
         }
         struct motion_report r;
         motion_feed(&motion, y, w, h, w, mono_ms(), &r);
+        if (r.active)
+            objects_motion(r.box, mono_ms());
         if (r.edge == MOTION_START)
             event_level = r.level;
         else if (motion.in_event && r.level > event_level)
@@ -189,6 +192,10 @@ void analytics_settings(const cJSON *p) {
 
 int analytics_file(const char *what, const char *filename, uint8_t **data, size_t *len,
                    const char **name) {
+    if (objects_file(filename, data, len) == 0) {
+        *name = filename;
+        return 0;
+    }
     int want_heat = (what && !strcmp(what, "motionHeatmap")) ||
                     (filename && !strcmp(filename, HEATMAP_NAME));
     int want_snap = (what && (!strcmp(what, "motionSnapshot") ||
