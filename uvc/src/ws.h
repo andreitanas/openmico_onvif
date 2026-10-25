@@ -10,6 +10,7 @@ struct ws {
     struct tls tls;
     struct buf in;  // raw bytes received, not yet parsed
     struct buf msg; // reassembly of fragmented messages
+    int peer_closed; // the peer sent its close frame
 };
 
 // headers: extra "Name: value\r\n" lines.

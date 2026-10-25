@@ -150,6 +150,9 @@ int ws_recv(struct ws *w, const char **out, size_t *len, int timeout_ms) {
             if (op == OP_PING) {
                 send_frame(w, OP_PONG, payload, plen);
             } else if (op == OP_CLOSE) {
+                if (w->peer_closed)
+                    return -1;
+                w->peer_closed = 1;
                 log_info("websocket closed by peer (code %d)",
                          plen >= 2 ? payload[0] << 8 | payload[1] : 0);
                 return -1;
@@ -183,9 +186,18 @@ int ws_recv(struct ws *w, const char **out, size_t *len, int timeout_ms) {
 
 void ws_close(struct ws *w) {
     if (w->tls.open) {
-        send_frame(w, OP_CLOSE, (const uint8_t *)"\x03\xe8", 2);
+        // Our close starts the handshake (wait briefly for the peer's), or
+        // answers the peer's.
+        if (send_frame(w, OP_CLOSE, (const uint8_t *)"\x03\xe8", 2) == 0 && !w->peer_closed) {
+            const char *text;
+            size_t len;
+            int64_t deadline = mono_ms() + 1000;
+            while (mono_ms() < deadline && ws_recv(w, &text, &len, 200) >= 0)
+                ;
+        }
         tls_close(&w->tls);
     }
     buf_free(&w->in);
     buf_free(&w->msg);
+    w->peer_closed = 0;
 }

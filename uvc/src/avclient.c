@@ -23,6 +23,12 @@ static struct ws ws;
 static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
 static int connected; // guarded by send_lock
 static int msg_id;    // guarded by send_lock
+// Shutdown: avclient_stop asks the protocol loop to close the connection
+// properly; the loop owns the TLS session, so it does the closing.
+static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t stop_cond = PTHREAD_COND_INITIALIZER;
+static volatile int stopping;
+static int stopped; // guarded by stop_lock
 static int64_t start_ms;
 static char device_id[40], guid[40];
 
@@ -662,7 +668,7 @@ static void session(void) {
         const char *text;
         size_t len;
         int r = ws_recv(&ws, &text, &len, 1000);
-        if (r < 0)
+        if (r < 0 || stopping)
             break;
         if (r > 0 && handle(text))
             break;
@@ -693,10 +699,35 @@ void avclient_run(struct config *c, struct source *hi, struct source *lo) {
     for (;;) {
         int64_t t0 = mono_ms();
         session();
+        if (stopping) {
+            pthread_mutex_lock(&stop_lock);
+            stopped = 1;
+            pthread_cond_signal(&stop_cond);
+            pthread_mutex_unlock(&stop_lock);
+            for (;;)
+                pause();
+        }
         if (mono_ms() - t0 > 60000)
             backoff = 1;
         log_info("reconnecting in %d s", backoff);
         sleep_ms(backoff * 1000);
         backoff = backoff < 30 ? backoff * 2 : 30;
     }
+}
+
+void avclient_stop(int timeout_ms) {
+    stopping = 1;
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += timeout_ms / 1000;
+    until.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
+    if (until.tv_nsec >= 1000000000) {
+        until.tv_sec++;
+        until.tv_nsec -= 1000000000;
+    }
+    pthread_mutex_lock(&stop_lock);
+    while (!stopped)
+        if (pthread_cond_timedwait(&stop_cond, &stop_lock, &until))
+            break;
+    pthread_mutex_unlock(&stop_lock);
 }

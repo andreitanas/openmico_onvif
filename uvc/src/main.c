@@ -24,13 +24,15 @@ static void usage(void) {
     exit(2);
 }
 
-// SIGTERM/SIGINT are blocked in every thread and taken here, so libimp is
-// shut down cleanly for whoever owns the camera next.
+// SIGTERM/SIGINT are blocked in every thread and taken here, so Protect
+// sees a proper disconnect and libimp is shut down cleanly for whoever owns
+// the camera next.
 static void *signal_main(void *arg) {
     sigset_t *set = arg;
     int sig;
     sigwait(set, &sig);
     log_info("signal %d: stopping", sig);
+    avclient_stop(3000);
     capture_stop();
     _exit(0);
 }

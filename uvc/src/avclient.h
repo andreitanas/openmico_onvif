@@ -11,5 +11,8 @@ void avclient_run(struct config *cfg, struct source *hi, struct source *lo);
 // Send an event (e.g. EventSmartMotion) from any thread; takes ownership of
 // payload. Dropped while not connected to Protect.
 void avclient_event(const char *function, cJSON *payload);
+// From another thread at shutdown: close the connection to Protect cleanly
+// (websocket close, streams stopped), waiting at most timeout_ms.
+void avclient_stop(int timeout_ms);
 
 #endif
