@@ -1,4 +1,4 @@
-// uvcd: makes an OpenMiko camera adopt into UniFi Protect as a native
+// uvcd: makes a Wyze Cam v2 (Ingenic T20) adopt into UniFi Protect as a native
 // UniFi camera, speaking Protect's own camera protocol on the device.
 
 #include <pthread.h>
@@ -19,7 +19,6 @@
 #include "tls.h"
 #include "util.h"
 
-#define READY_FILE "/var/run/uvcd.ready"
 #define SANE_WALL_MS 1704067200000LL // 2024-01-01
 
 static struct config cfg;
@@ -121,10 +120,6 @@ int main(int argc, char **argv) {
         log_warn("waiting for H.264 from %s / %s", hi.path, lop->path);
 
     if (cfg.capture) {
-        // Tells S60camera the v4l2loopback devices are live for the RTSP server.
-        FILE *fp = fopen(READY_FILE, "w");
-        if (fp)
-            fclose(fp);
         if (cfg.watchdog > 0)
             board_watchdog_start(cfg.watchdog, healthy);
     }

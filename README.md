@@ -1,30 +1,55 @@
 ## Wyze Cam v2 as a native UniFi Protect camera
 
-`uvc/` holds uvcd, a small static C daemon for [OpenMiko](https://github.com/openmiko/openmiko)
-firmware on Ingenic T20 Wyze cameras. It drives the camera through Ingenic's
-libimp (replacing OpenMiko's videocapture) and speaks UniFi Protect's own
-camera protocol, so the camera is adopted into Protect as a UniFi camera:
-video, snapshots and settings without RTSP, ONVIF or a bridge box.
+`uvc/` builds a firmware image for Ingenic T20 Wyze Cam v2 cameras that
+makes them adopt into UniFi Protect as UniFi cameras: video, snapshots,
+motion and smart detections (person, vehicle, animal), with no RTSP, ONVIF
+or bridge box.
 
-## Prerequisites
-Flash the OpenMiko base image (https://github.com/openmiko/openmiko/releases)
-following [its instructions](https://github.com/openmiko/openmiko).
+- `uvcd`, a static C daemon, drives the camera through Ingenic's libimp and
+  speaks Protect's own camera protocol. It runs the object detector (ncnn,
+  Yolo-Fastest) on the camera.
+- The image keeps [OpenMiko](https://github.com/openmiko/openmiko)'s kernel
+  and replaces the rest: a minimal root filesystem (busybox, dropbear,
+  wpa_supplicant, the camera and WiFi drivers) plus uvcd, in the root flash
+  partition. Settings live in the config flash partition, so the SD card is
+  optional.
 
-## Build and deploy
-- `./deploy.sh utils` and `./deploy.sh passwd` generate the camera's OpenMiko
-  overlay (`deploy/config/overlay`: wifi, `openmiko.conf`, root password, ssh
-  key). The camera copies everything under `config/` on the SD card to its
-  flash and root filesystem on every boot.
-- `cd uvc && ./fetch-deps.sh && make camera` builds `build/uvcd-mipsel`.
-- `uvc/make-sdcard.sh /Volumes/CARD [protect-host]` writes a card: the overlay,
-  uvcd, its config and a per-camera client certificate.
-- Set `ADOPTION_TOKEN` in `uvc/uvcd.conf` on the card (see the comments there),
-  boot the camera, and adopt it in Protect.
+## Build
+- `cd uvc && ./fetch-deps.sh` once, then `image/build.sh`. It produces:
+  - `build/image/root.jffs2`, the root partition;
+  - `build/image/demo.bin`, the same image in the bootloader's format, with
+    OpenMiko's kernel.
+- The base root filesystem comes from OpenMiko's `demo.bin`, expected at
+  `deploy/demo.bin` (from https://github.com/openmiko/openmiko/releases).
+- `./deploy.sh utils` and `./deploy.sh passwd` generate the camera's
+  settings: wifi, hostname, root password and ssh key, under
+  `deploy/config/overlay`.
+
+## Install
+- **New camera:**
+  1. Run `uvc/make-sdcard.sh /Volumes/CARD [protect-host]`, then set
+     `ADOPTION_TOKEN` in `config/uvc/uvcd.conf` on the card (see the comments
+     there).
+  2. Hold the setup button while powering the camera on. The bootloader
+     flashes `demo.bin`.
+  3. The camera imports `config/` from the card into its flash at every boot
+     when the card's copy differs, then appears in Protect for adoption.
+- **Camera already running this image or OpenMiko:** `uvc/image/flash.sh
+  [camera-ip]` writes `root.jffs2` over ssh. It verifies the result and puts
+  the previous image back if anything doesn't match.
+  - Coming from OpenMiko, first put `uvcd.conf`, `client.pem` (and
+    `uvcd.state` if already adopted) in `/config/uvc/`.
+  - Remove OpenMiko's init scripts and `openmiko.conf` from
+    `/config/overlay/etc/` and from the card's `config/overlay/etc/`.
 
 ## Notes
-- The RTSP server is off (`ENABLE_RTSP=0` in `openmiko.conf`); its v4l2loopback
-  buffers alone take tens of MB of the camera's 92 MB. To serve RTSP again, set
-  `ENABLE_RTSP=1` and the `*_MIRROR` devices in `uvcd.conf`. Protect's own
-  RTSPS re-share (camera settings → Advanced) is an alternative, not yet tried
-  with these cameras.
-- uvcd logs to `/sdcard/var/log/uvcd.log` on the camera.
+- On the camera:
+  - uvcd logs to `/tmp/uvcd.log`; the system log is `/var/log/messages`.
+    Both are size-capped in RAM.
+  - `/sdcard/uvc/uvcd`, if present, runs instead of the flashed uvcd (for
+    development).
+- OpenMiko's initramfs zeroes the root partition from block 274 up on every
+  boot and deletes its contents if `rootfs.tar.xz` fails to unpack. Never
+  write that partition except through `image/flash.sh` or `demo.bin`.
+- `docs/firmware-review.md` has the review of OpenMiko that led to this
+  image.

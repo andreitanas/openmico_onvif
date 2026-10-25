@@ -10,8 +10,7 @@
 // The camera pipeline through Ingenic's libimp (camera builds only): sensor
 // and ISP, a full-resolution H.264 encoder feeding hi, a low-resolution one
 // feeding lo, an on-demand JPEG encoder, and raw low-resolution frames for
-// motion detection. Replaces OpenMiko's videocapture, which must not run
-// (libimp has a single owner process).
+// motion detection. libimp has a single owner process.
 int capture_start(const struct config *c, struct source *hi, struct source *lo);
 void capture_stop(void);
 

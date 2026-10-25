@@ -1,14 +1,15 @@
 #!/bin/sh
-# Populate an OpenMiko sdcard (FAT32, partition 1) for one camera:
-#   - the existing overlay from ../deploy/config/overlay (wifi, passwd, ssh key),
-#     with openmiko.conf pointed at partition 1 + a swap file, uvcd as the
-#     capture process and the RTSP server off
-#   - uvcd, its config, the object detector model and a per-camera client
-#     certificate under /uvc
-#   - S90uvcd (starts uvcd) and S99probe (writes /probe.txt on boot)
-#   - demo.bin (OpenMiko image; only flashed when the setup button is held)
+# Prepare an SD card (FAT32, partition 1) that installs and configures one
+# camera:
+#   demo.bin            our image (image/build.sh); the Wyze bootloader
+#                       flashes it when the setup button is held at power-on
+#   config/overlay/     wifi, hostname, passwd, ssh key (../deploy, made by
+#                       ../deploy.sh), copied over the root filesystem at boot
+#   config/uvc/         uvcd.conf and a per-camera client certificate
+# The camera imports config/ into its config flash at every boot when the
+# card's copy differs; the card is optional after that.
 #
-# Usage: ./make-sdcard.sh /Volumes/WYZECAM [nvr-host]
+# Usage: ./make-sdcard.sh /Volumes/CARD [nvr-host]
 set -e
 cd "$(dirname "$0")"
 CARD=${1:?usage: $0 /Volumes/CARD [nvr-host]}
@@ -16,53 +17,32 @@ NVR=${2:-192.168.1.1}
 DEPLOY=../deploy
 
 [ -d "$CARD" ] || { echo "$CARD is not mounted"; exit 1; }
-[ -f build/uvcd-mipsel ] || make camera
+[ -d "$DEPLOY/config/overlay" ] || { echo "no $DEPLOY/config/overlay; run ../deploy.sh utils and passwd"; exit 1; }
+image/build.sh
 
-mkdir -p "$CARD/config/overlay/etc/init.d" "$CARD/uvc"
+mkdir -p "$CARD/config/overlay" "$CARD/config/uvc"
 cp -R "$DEPLOY/config/overlay/." "$CARD/config/overlay/"
-# S60camera starts uvcd in place of videocapture (VIDEO_CAPTURE=uvcd below).
-cp sdcard/S60camera sdcard/S90uvcd sdcard/S99probe "$CARD/config/overlay/etc/init.d/"
-# Only used with VIDEO_CAPTURE=videocapture (uvcd.conf CAPTURE=0): adds a
-# 640x360 H.264 encoder on /dev/video5 for Protect's video2/video3.
-cp sdcard/videocapture_settings.json "$CARD/config/overlay/etc/"
+# OpenMiko's settings file has no meaning for our image.
+rm -f "$CARD/config/overlay/etc/openmiko.conf"
+cp build/image/demo.bin "$CARD/demo.bin"
 
-# Single FAT32 partition: sdcard is p1, swap is a file on it. Log to the card
-# while bringing the camera up.
-{
-    sed -e 's|^SD_PARTITION=.*|SD_PARTITION=/dev/mmcblk0p1|' \
-        -e 's|^SWAPFILE=.*|SWAPFILE=/sdcard/swapfile|' \
-        -e 's|^ENABLE_LOGGING=.*|ENABLE_LOGGING=1|' \
-        -e '/^VIDEO_CAPTURE=/d' -e '/^ENABLE_RTSP=/d' \
-        "$DEPLOY/config/overlay/etc/openmiko.conf"
-    echo 'VIDEO_CAPTURE=uvcd'
-    # Protect gets video from uvcd; the RTSP server and its v4l2loopback
-    # buffers (~37 MB of kernel memory) are left out.
-    echo 'ENABLE_RTSP=0'
-} > "$CARD/config/overlay/etc/openmiko.conf"
-
-cp build/uvcd-mipsel "$CARD/uvc/uvcd"
-# Object detector for smart detections (see fetch-deps.sh).
-mkdir -p "$CARD/uvc/models"
-cp third_party/models/yolo-fastest-1.1.param third_party/models/yolo-fastest-1.1.bin "$CARD/uvc/models/"
-if [ ! -f "$CARD/uvc/uvcd.conf" ]; then
-    sed "s|@NVR_HOST@|$NVR|" sdcard/uvcd.conf.template > "$CARD/uvc/uvcd.conf"
+if [ ! -f "$CARD/config/uvc/uvcd.conf" ]; then
+    sed "s|@NVR_HOST@|$NVR|" image/uvcd.conf.template > "$CARD/config/uvc/uvcd.conf"
 fi
-if [ ! -f "$CARD/uvc/client.pem" ]; then
+if [ ! -f "$CARD/config/uvc/client.pem" ]; then
     # Per-camera client certificate, the shape real UniFi cameras present.
     TMP=$(mktemp -d)
     openssl ecparam -out "$TMP/k" -name prime256v1 -genkey -noout
     openssl req -new -x509 -sha256 -days 36500 -key "$TMP/k" -out "$TMP/c" \
         -subj "/C=TW/L=Taipei/O=Ubiquiti Networks Inc./OU=devint/CN=camera.ubnt.dev/emailAddress=support@ubnt.com"
-    cat "$TMP/k" "$TMP/c" > "$CARD/uvc/client.pem"
+    cat "$TMP/k" "$TMP/c" > "$CARD/config/uvc/client.pem"
     rm -rf "$TMP"
 fi
 
-[ -f "$CARD/demo.bin" ] || cp "$DEPLOY/demo.bin" "$CARD/demo.bin"
-
-# macOS litters FAT volumes with metadata files; keep the overlay clean since
-# OpenMiko copies every file under config/ into flash.
+# macOS litters FAT volumes with metadata files; the camera imports every
+# file under config/.
 find "$CARD" -name '._*' -delete 2>/dev/null || true
 find "$CARD" -name '.DS_Store' -delete 2>/dev/null || true
 sync
-echo "Card ready:"
+echo "Card ready (set ADOPTION_TOKEN in config/uvc/uvcd.conf):"
 (cd "$CARD" && find . -type f -not -path './.Spotlight*' -not -path './.fseventsd*' | sort)

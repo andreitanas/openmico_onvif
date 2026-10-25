@@ -79,9 +79,6 @@ static void set_key(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "STATE_FILE")) SET(state_file, v);
     else if (!strcmp(k, "LOG_FILE")) SET(log_file, v);
     else if (!strcmp(k, "CAPTURE")) c->capture = atoi(v);
-    else if (!strcmp(k, "HI_MIRROR")) SET(hi_mirror, v);
-    else if (!strcmp(k, "LO_MIRROR")) SET(lo_mirror, v);
-    else if (!strcmp(k, "JPEG_MIRROR")) SET(jpeg_mirror, v);
     else if (!strcmp(k, "HI_BITRATE")) c->hi_kbps = atoi(v);
     else if (!strcmp(k, "LO_BITRATE")) c->lo_kbps = atoi(v);
     else if (!strcmp(k, "HI_GOP")) c->hi_gop = atoi(v);
@@ -186,8 +183,8 @@ int config_load(struct config *c, const char *path) {
     discover(c);
     // The state file only ever records that adoption succeeded.
     parse_file(c, c->state_file, 0);
-    // Without Protect settings a capturing uvcd still owns the camera (and
-    // feeds RTSP if mirroring).
+    // Without Protect settings a capturing uvcd still owns the camera (motion
+    // detection, the watchdog) until it is configured.
     const char *missing = protect_missing(c);
     c->protect = !missing;
     if (missing) {

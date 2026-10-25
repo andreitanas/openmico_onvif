@@ -20,13 +20,10 @@ struct config {
     char snapshot[128];  // JPEG device or file
     char state_file[128];
     char log_file[128]; // empty: stderr
-    // CAPTURE=1: uvcd drives the sensor and encoders through libimp itself,
-    // replacing OpenMiko's videocapture, and optionally copies the encoded
-    // streams to these v4l2loopback devices for v4l2rtspserver.
+    // CAPTURE=1 (default): uvcd drives the sensor and encoders through
+    // libimp. CAPTURE=0 reads H.264 from HI_SOURCE/LO_SOURCE (files or v4l2
+    // devices), for tests off the camera.
     int capture;
-    char hi_mirror[64];
-    char lo_mirror[64];
-    char jpeg_mirror[64];
     int hi_kbps, lo_kbps, hi_gop, lo_gop;
     int lo_width, lo_height;
     int flip_v, flip_h;

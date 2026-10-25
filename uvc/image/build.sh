@@ -1,11 +1,13 @@
 #!/bin/sh
-# Build the camera's root flash partition image (build/image/root.jffs2):
+# Build the camera's root flash partition image (build/image/root.jffs2) and
+# a demo.bin with it (build/image/demo.bin, OpenMiko's kernel):
 #   rootfs.tar.xz    our slimmed root filesystem (build-rootfs.py), which
 #                    OpenMiko's kernel unpacks into RAM at boot
 #   uvc/uvcd         the camera daemon, run from flash (mounted at /rom)
 #   uvc/models/      the object detector
 # Base: the root filesystem inside OpenMiko's demo.bin (../deploy/demo.bin).
-# Install with image/flash.sh.
+# Install with image/flash.sh over ssh, or with demo.bin on an SD card
+# (make-sdcard.sh) and the setup button held at power-on.
 set -e
 cd "$(dirname "$0")/.."
 OUT=build/image
@@ -14,7 +16,7 @@ DEMO=${DEMO:-../deploy/demo.bin}
 # up on every boot, so the image must end before it.
 MAX=$((274 * 32768))
 
-[ -f build/uvcd-mipsel ] || make camera
+make -s camera
 [ -x build/host-tools/mkfs.jffs2 ] || tools/build-mkfs-jffs2.sh
 mkdir -p $OUT
 [ -f $OUT/openmiko-rootfs.tar.xz ] ||
@@ -41,4 +43,5 @@ fi
 # would merge nodes left over from the previous image into our files.
 build/host-tools/mkfs.jffs2 -l -s 4096 -e 0x8000 -m none -U -p$MAX -r $OUT/payload -o $OUT/root.jffs2
 (cd $OUT/payload && find . -type f | sort | xargs md5sum 2>/dev/null || find . -type f | sort | xargs md5 -r) > $OUT/payload.md5
+python3 image/demo-bin.py "$DEMO" $OUT/root.jffs2 $OUT/demo.bin
 echo "$OUT/root.jffs2: $SIZE bytes of data ($((SIZE / 32768)) of 274 blocks), padded to $MAX"

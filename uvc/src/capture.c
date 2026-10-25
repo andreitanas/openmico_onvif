@@ -6,7 +6,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/videodev2.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +26,6 @@ enum { ENC_HI = 0, ENC_LO = 1, ENC_JPEG = 2 };
 struct encoder {
     int chn;
     struct source *src;
-    const char *mirror;
     int width, height;
     pthread_t thread;
 };
@@ -36,7 +34,7 @@ static const struct config *cfg;
 static IMPSensorInfo sensor;
 static volatile int running;
 static struct encoder encoders[2];
-static pthread_t night_thread, jpeg_thread;
+static pthread_t night_thread;
 
 static pthread_mutex_t jpeg_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *jpeg;
@@ -53,7 +51,7 @@ static pthread_mutex_t raw_lock = PTHREAD_MUTEX_INITIALIZER;
         }                                                        \
     } while (0)
 
-// The sensor driver S60camera loaded reports itself as "sensor :jxf23".
+// The sensor driver S50camera loaded reports itself as "sensor :jxf23".
 static int sensor_info(IMPSensorInfo *s) {
     char line[64] = {0}, *name;
     FILE *fp = fopen("/proc/jz/sinfo/info", "r");
@@ -124,30 +122,6 @@ static int bind(int fs, int group, int on) {
     return on ? IMP_System_Bind(&src, &dst) : IMP_System_UnBind(&src, &dst);
 }
 
-// v4l2loopback output, as OpenMiko's videocapture sets it up; each write()
-// is one frame for the reader (v4l2rtspserver, mjpg_streamer, getimage).
-static int open_mirror(const char *path, int w, int h, uint32_t fourcc) {
-    int fd = open(path, O_WRONLY);
-    if (fd < 0) {
-        log_warn("capture: %s: %s", path, strerror(errno));
-        return -1;
-    }
-    struct v4l2_format fmt;
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    fmt.fmt.pix.width = w;
-    fmt.fmt.pix.height = h;
-    fmt.fmt.pix.pixelformat = fourcc;
-    fmt.fmt.pix.field = V4L2_FIELD_NONE;
-    fmt.fmt.pix.colorspace = fourcc == V4L2_PIX_FMT_MJPEG ? V4L2_COLORSPACE_JPEG : 0;
-    if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0 || ioctl(fd, VIDIOC_STREAMON, &fmt.type) < 0) {
-        log_warn("capture: %s: cannot set up v4l2 output: %s", path, strerror(errno));
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
 static size_t stream_len(const IMPEncoderStream *st) {
     size_t len = 0;
     for (uint32_t i = 0; i < st->packCount; i++)
@@ -166,7 +140,6 @@ static void stream_copy(const IMPEncoderStream *st, uint8_t *dst) {
 
 static void *encoder_main(void *arg) {
     struct encoder *e = arg;
-    int fd = *e->mirror ? open_mirror(e->mirror, e->width, e->height, V4L2_PIX_FMT_H264) : -1;
     while (running) {
         if (IMP_Encoder_PollingStream(e->chn, 1000) < 0) {
             log_warn("capture: no frame from encoder %d", e->chn);
@@ -184,16 +157,9 @@ static void *encoder_main(void *arg) {
         IMP_Encoder_ReleaseStream(e->chn, &st);
         if (!f)
             continue;
-        if (fd >= 0 && write(fd, f->data, f->len) < 0) {
-            log_warn("capture: %s: %s; no longer mirroring", e->mirror, strerror(errno));
-            close(fd);
-            fd = -1;
-        }
         source_push(e->src, f);
         frame_unref(f);
     }
-    if (fd >= 0)
-        close(fd);
     return NULL;
 }
 
@@ -237,26 +203,6 @@ int capture_jpeg(uint8_t **data, size_t *len) {
     return rc;
 }
 
-// About one JPEG a second for readers of the old MJPEG device (getimage,
-// mjpg_streamer, the RTSP server's second stream).
-static void *jpeg_main(void *arg) {
-    // MJPG, not JPEG (videocapture's choice): v4l2rtspserver only accepts MJPG.
-    int fd = open_mirror(cfg->jpeg_mirror, encoders[0].width, encoders[0].height, V4L2_PIX_FMT_MJPEG);
-    while (running && fd >= 0) {
-        uint8_t *p;
-        size_t len;
-        if (capture_jpeg(&p, &len) == 0) {
-            if (write(fd, p, len) < 0)
-                log_debug("capture: %s: %s", cfg->jpeg_mirror, strerror(errno));
-            free(p);
-        }
-        sleep_ms(1000);
-    }
-    if (fd >= 0)
-        close(fd);
-    return NULL;
-}
-
 int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) {
     IMPFrameInfo *f;
     pthread_mutex_lock(&raw_lock);
@@ -275,9 +221,8 @@ int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) {
     return n;
 }
 
-// OpenMiko's autonight switches the IR cut filter and LEDs itself and
-// writes its decision to a file for the capture process, which sets the
-// matching ISP mode (as videocapture does).
+// nightmode.sh (autonight's verdict, Protect's IR mode) switches the IR cut
+// filter and LEDs and writes the result to a file; the ISP follows it.
 static void *night_main(void *arg) {
     int prev = -1;
     while (running) {
@@ -345,9 +290,9 @@ static int isp_start(void) {
 int capture_start(const struct config *c, struct source *hi, struct source *lo) {
     cfg = c;
     // The sensor's native size; the T20's sensors here are all 1080p.
-    encoders[0] = (struct encoder){.chn = ENC_HI, .src = hi, .mirror = c->hi_mirror, .width = 1920, .height = 1080};
+    encoders[0] = (struct encoder){.chn = ENC_HI, .src = hi, .width = 1920, .height = 1080};
     encoders[1] = (struct encoder){
-        .chn = ENC_LO, .src = lo, .mirror = c->lo_mirror, .width = c->lo_width, .height = c->lo_height};
+        .chn = ENC_LO, .src = lo, .width = c->lo_width, .height = c->lo_height};
 
     if (isp_start() < 0)
         return -1;
@@ -373,15 +318,13 @@ int capture_start(const struct config *c, struct source *hi, struct source *lo) 
     for (int i = 0; i < 2; i++)
         pthread_create(&encoders[i].thread, NULL, encoder_main, &encoders[i]);
     pthread_create(&night_thread, NULL, night_main, NULL);
-    if (*c->jpeg_mirror)
-        pthread_create(&jpeg_thread, NULL, jpeg_main, NULL);
     log_info("capture: 1920x1080 @ %d kbit/s, %dx%d @ %d kbit/s, %d fps", c->hi_kbps, c->lo_width,
              c->lo_height, c->lo_kbps, c->fps);
     return 0;
 }
 
 // Tear down in the reverse order of capture_start, so the next owner of
-// libimp (a restarted uvcd, or videocapture) finds the hardware idle.
+// libimp (a restarted uvcd) finds the hardware idle.
 void capture_stop(void) {
     if (!running)
         return;
@@ -393,8 +336,6 @@ void capture_stop(void) {
     for (int i = 0; i < 2; i++)
         pthread_join(encoders[i].thread, NULL);
     pthread_join(night_thread, NULL);
-    if (*cfg->jpeg_mirror)
-        pthread_join(jpeg_thread, NULL);
     IMP_Encoder_StopRecvPic(ENC_HI);
     IMP_Encoder_StopRecvPic(ENC_LO);
     bind(FS_HI, FS_HI, 0);

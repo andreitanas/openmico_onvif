@@ -1,0 +1,32 @@
+# uvcd configuration (KEY=value). On the camera: /config/uvc/uvcd.conf,
+# imported from config/uvc/uvcd.conf on the SD card at boot when the card's
+# copy differs.
+
+# UniFi Protect host
+NVR_HOST=@NVR_HOST@
+# One-time adoption token, valid ~60 minutes. While logged in to Protect, open
+#   https://<NVR_HOST>/proxy/protect/api/cameras/manage-payload
+# and copy "mgmt.token". Not needed once adopted (/config/uvc/uvcd.state).
+ADOPTION_TOKEN=
+
+# Name shown in Protect before it is renamed there (default: hostname)
+#NAME=Wyze Cam
+
+# kbit/s and keyframe interval (frames) of the 1080p and low-res streams
+#HI_BITRATE=2000
+#HI_GOP=50
+#LO_BITRATE=300
+#LO_GOP=25
+#FPS=25
+# Mounted upside down / mirrored (Protect's flip and mirror apply on top)
+#FLIP_V=0
+#FLIP_H=0
+
+# Hardware watchdog timeout in seconds (0: off)
+#WATCHDOG=60
+# Restart camera from Protect reboots the Wyze
+#ALLOW_REBOOT=1
+
+LOG_FILE=/tmp/uvcd.log
+# 0 error, 1 warn, 2 info, 3 debug
+#LOG_LEVEL=2
