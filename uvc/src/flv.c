@@ -110,7 +110,12 @@ static void clock_sync(struct flv *f, uint32_t ts, int64_t now) {
 
 void flv_begin(struct flv *f, const char *stream_name, int width, int height, int fps, int audio) {
     memset(f, 0, sizeof(*f));
-    f->start_ms = f->last_sync_ms = mono_ms();
+    f->start_ms = mono_ms();
+    // Sync before the first frame: stream timestamps restart at 0 on every
+    // connection, and until a sync arrives Protect dates frames with the
+    // previous connection's mapping (seconds of video filed minutes in the
+    // past, which then show up in other events' playback).
+    f->last_sync_ms = f->start_ms - SYNC_INTERVAL_MS;
     f->audio = audio;
 
     static const uint8_t header[] = {'F', 'L', 'V', 1, 0x07, 0, 0, 0, 9, 0, 0, 0, 0};
