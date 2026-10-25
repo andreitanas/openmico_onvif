@@ -15,6 +15,8 @@
 #include "tls.h"
 #include "util.h"
 
+#define READY_FILE "/var/run/uvcd.ready"
+
 static void usage(void) {
     fprintf(stderr, "usage: uvcd [-c /etc/uvcd.conf] [-v]\n");
     exit(2);
@@ -78,9 +80,17 @@ int main(int argc, char **argv) {
     while (source_wait_ready(&hi, 10000) < 0 || source_wait_ready(lop, 10000) < 0)
         log_warn("waiting for H.264 from %s / %s", hi.path, lop->path);
 
+    if (cfg.capture) {
+        // Tells S60camera the v4l2loopback devices are live for the RTSP server.
+        FILE *fp = fopen(READY_FILE, "w");
+        if (fp)
+            fclose(fp);
+    }
+
     if (!cfg.protect) {
-        for (;;)
-            pause();
+        while (!config_refresh(&cfg))
+            sleep_ms(5000);
+        log_info("uvcd: ip %s, Protect %s", cfg.ip, cfg.nvr);
     }
     if (tls_init(cfg.cert) < 0)
         return 1;

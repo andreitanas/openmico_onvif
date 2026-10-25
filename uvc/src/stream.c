@@ -17,6 +17,22 @@ static int send_buf(int fd, struct buf *b) {
     return 0;
 }
 
+// Protect answers on the stream connection in a small binary protocol (a
+// 27-byte greeting, then 16-byte reports about once a second that appear to
+// carry the received byte rate). Not needed yet; drained and logged
+// (printable bytes as text, the rest as hex) to learn the format.
+static void log_replies(struct stream *s, int fd) {
+    uint8_t in[256];
+    ssize_t n = recv(fd, in, sizeof(in), MSG_DONTWAIT);
+    if (n <= 0)
+        return;
+    char text[sizeof(in) * 4 + 1];
+    size_t k = 0;
+    for (ssize_t i = 0; i < n; i++)
+        k += snprintf(text + k, sizeof(text) - k, in[i] >= 0x20 && in[i] < 0x7f ? "%c" : "\\x%02x", in[i]);
+    log_debug("%s: Protect sent %zd bytes: %s", s->channel, n, text);
+}
+
 // Sends one connection's worth of stream; returns when the socket fails or
 // the stream is stopped.
 static void session(struct stream *s, int fd) {
@@ -62,6 +78,7 @@ static void session(struct stream *s, int fd) {
             log_warn("%s: connection to %s:%d lost", s->channel, s->host, s->port);
             break;
         }
+        log_replies(s, fd);
     }
     source_unsubscribe(s->src, &s->q);
     queue_destroy(&s->q);

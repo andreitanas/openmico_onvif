@@ -1,0 +1,195 @@
+#!/bin/sh
+#
+# Start video and camera
+#
+# OpenMiko's S60camera with one addition: VIDEO_CAPTURE=uvcd in
+# openmiko.conf makes uvcd (S90uvcd) drive the camera instead of
+# videocapture. Either one feeds the v4l2loopback devices that
+# v4l2rtspserver serves.
+#
+VIDEO_CAPTURE_SETTINGS=/etc/videocapture_settings.json
+VIDEO_CAPTURE=videocapture
+ENABLE_AUDIO=0
+UVCD_READY=/var/run/uvcd.ready
+
+if [[ -f /etc/openmiko.conf ]]; then
+	. /etc/openmiko.conf
+fi
+
+# pidof matches the program name only; `ps | grep -w videocapture` also
+# matched any command line mentioning the word (a log path, an ssh command).
+running() {
+	pidof "$1" > /dev/null
+}
+
+start_capture() {
+	if [ "$VIDEO_CAPTURE" = "uvcd" ]; then
+		rm -f $UVCD_READY
+		/etc/init.d/S90uvcd start
+		# uvcd marks the loopback devices live once both streams flow.
+		i=0
+		while [ ! -f $UVCD_READY ] && [ $i -lt 30 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		[ -f $UVCD_READY ] || logger -s "uvcd did not start capturing"
+		return
+	fi
+
+	if ! running videocapture; then
+		logger -s "Starting video frame capture process"
+		if [ "$ENABLE_LOGGING" == "1" ]; then
+			/usr/bin/videocapture $VIDEO_CAPTURE_SETTINGS >> /var/log/videocapture.log 2>&1 &
+		else
+			/usr/bin/videocapture $VIDEO_CAPTURE_SETTINGS > /dev/null 2>&1 &
+		fi
+		sleep 10
+	fi
+}
+
+stop_capture() {
+	if [ "$VIDEO_CAPTURE" = "uvcd" ]; then
+		/etc/init.d/S90uvcd stop
+	fi
+	killall videocapture 2>/dev/null
+}
+
+start_camera() {
+	AUTH_PARAMS=""
+
+	if [[ -f /etc/v4l2rtspserver.conf ]]; then
+		logger -s "Reading parameters from /etc/v4l2rtspserver.conf"
+		. /etc/v4l2rtspserver.conf
+
+		AUTH_PARAMS="-U $USERNAME:$PASSWORD"
+
+		# If we have a realm, add it to AUTH_PARAMS
+		if [ ! -z "$HTTP_AUTH_REALM" ]; then
+			AUTH_PARAMS="-R $HTTP_AUTH_REALM $AUTH_PARAMS"
+		fi
+	fi
+
+	## Determine the image sensor model
+	echo "Adding necessary camera modules"
+
+	modprobe sinfo
+	echo 1 >/proc/jz/sinfo/info
+	sensor=$(grep -m1 -oE 'jxf[0-9]*$' /proc/jz/sinfo/info)
+	logger -s "Determined image sensor model as $sensor"
+
+	modprobe tx-isp isp_clk=100000000
+
+	if [ "$sensor" = "jxf23" ]; then
+	  insmod /driver/sensor_jxf23.ko data_interface=2 pwdn_gpio=-1 reset_gpio=18 sensor_gpio_func=0
+	else
+	  insmod /lib/modules/3.10.14/kernel/drivers/media/platform/sensors/jxf22/sensor_jxf22.ko data_interface=2 pwdn_gpio=-1 reset_gpio=18 sensor_gpio_func=0
+	fi
+
+	# Turn on the infared cutoff filter (normal light operation)
+	/usr/bin/nightmode.sh off
+
+	# The ALSA loopback module must be loaded before v4l2rtspserver (live555)
+	# for userspace to see the ALSA device.
+	modprobe snd-aloop index=0 pcm_substreams=2 enable=1
+	sleep 1
+
+	if [ $ENABLE_AUDIO = "1" ]; then
+		if ! ps | grep -q '[f]fmpeg -thread_queue_size' ; then
+			echo "Starting FFMPEG audio thread..."
+			ffmpeg -thread_queue_size 256 -fflags +genpts -re -nostats -nostdin -ac 1 -f oss -i /dev/dsp -codec:a copy -f alsa hw:0,0 > /dev/null 2>&1 &
+		else
+			echo "FFMPEG is already running. Skipping."
+		fi
+	else
+		echo "Audio is set to disabled in openmiko.conf. Skipping starting ffmpeg"
+	fi
+
+	# Only set the number of v4l2loopback devices that we need.
+	DEVICE_COUNT=1
+	if [ ! -z "$VIDEO_DEV_1" ]; then
+		DEVICE_COUNT="$((DEVICE_COUNT + 1))"
+	fi
+	if [ ! -z "$VIDEO_DEV_2" ]; then
+		DEVICE_COUNT="$((DEVICE_COUNT + 1))"
+	fi
+	if [ ! -z "$VIDEO_DEV_3" ]; then
+		DEVICE_COUNT="$((DEVICE_COUNT + 1))"
+	fi
+
+	echo "Setting up $DEVICE_COUNT v4l2loopback device(s)"
+
+	modprobe v4l2loopback devices=$DEVICE_COUNT
+
+	start_capture
+
+	if ! running v4l2rtspserver; then
+		logger -s "Starting v4l2rtspserver"
+		DEVICES=""
+		# Loop through devices to see if they're enabled and add them to rtspserver options
+		if [ ! -z "$VIDEO_DEV_1" ]; then
+			DEVICES="${VIDEO_DEV_1}"
+			if [ "$ENABLE_AUDIO" == 1 ]; then
+				DEVICES="${DEVICES},hw:0,1"
+			fi
+		fi
+		if [ ! -z "$VIDEO_DEV_2" ]; then
+			DEVICES="${DEVICES} ${VIDEO_DEV_2}"
+			if [ "$ENABLE_AUDIO" == 1 ]; then
+				DEVICES="${DEVICES},hw:0,1"
+			fi
+		fi
+		if [ ! -z "$VIDEO_DEV_3" ]; then
+			DEVICES="${DEVICES} ${VIDEO_DEV_3}"
+			if [ "$ENABLE_AUDIO" == 1 ]; then
+				DEVICES="${DEVICES},hw:0,1"
+			fi
+		fi
+		/usr/bin/v4l2rtspserver $AUTH_PARAMS -A 48000 -C 1 -a S16_LE -l 1 $DEVICES > /dev/null &
+	fi
+
+	# Waiting for v4l2rtpserver to start
+	sleep 5
+
+	FFMPEG_CMD="ffmpeg -nostats -nostdin"
+	RTSP_TRANSPORT="-rtsp_transport tcp -i rtsp://$USERNAME:$CLEARTEXT_PASSWORD@127.0.0.1:8554/video5_unicast"
+
+	SEGMENT_ARGS="-f segment -segment_time 600 -segment_format mp4 -segment_wrap 200"
+
+	if [ "$ENABLE_RECORDING" = "1" ]; then
+		logger -s "Starting recording using ffmpeg"
+		mkdir -p /sdcard/recordings
+		FFMPEG_CMD="$FFMPEG_CMD $RTSP_TRANSPORT -c:v copy $SEGMENT_ARGS -reset_timestamps 1 -strftime 0 -movflags frag_keyframe -c copy -map 0 /sdcard/recordings/segment-%04d.mp4"
+		echo $FFMPEG_CMD
+		$FFMPEG_CMD > /dev/null 2>&1 &
+	fi
+}
+
+stop_camera() {
+	stop_capture
+	killall v4l2rtspserver
+	killall ffmpeg
+	# Let the old RTSP server release port 8554 before a restart.
+	i=0
+	while running v4l2rtspserver && [ $i -lt 10 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+}
+
+case "$1" in
+	start)
+	start_camera
+	;;
+  stop)
+	stop_camera
+	;;
+  restart|reload)
+	stop_camera
+	start_camera
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?

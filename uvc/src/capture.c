@@ -139,7 +139,7 @@ static int open_mirror(const char *path, int w, int h, uint32_t fourcc) {
     fmt.fmt.pix.height = h;
     fmt.fmt.pix.pixelformat = fourcc;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
-    fmt.fmt.pix.colorspace = fourcc == V4L2_PIX_FMT_JPEG ? V4L2_COLORSPACE_JPEG : 0;
+    fmt.fmt.pix.colorspace = fourcc == V4L2_PIX_FMT_MJPEG ? V4L2_COLORSPACE_JPEG : 0;
     if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0 || ioctl(fd, VIDIOC_STREAMON, &fmt.type) < 0) {
         log_warn("capture: %s: cannot set up v4l2 output: %s", path, strerror(errno));
         close(fd);
@@ -240,7 +240,8 @@ int capture_jpeg(uint8_t **data, size_t *len) {
 // About one JPEG a second for readers of the old MJPEG device (getimage,
 // mjpg_streamer, the RTSP server's second stream).
 static void *jpeg_main(void *arg) {
-    int fd = open_mirror(cfg->jpeg_mirror, encoders[0].width, encoders[0].height, V4L2_PIX_FMT_JPEG);
+    // MJPG, not JPEG (videocapture's choice): v4l2rtspserver only accepts MJPG.
+    int fd = open_mirror(cfg->jpeg_mirror, encoders[0].width, encoders[0].height, V4L2_PIX_FMT_MJPEG);
     while (running && fd >= 0) {
         uint8_t *p;
         size_t len;

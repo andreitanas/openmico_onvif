@@ -39,5 +39,8 @@ struct config {
 
 int config_load(struct config *c, const char *path);
 int config_save_adopted(const struct config *c);
+// Retry MAC/IP discovery (at boot wlan0 may not have an address before the
+// camera starts). Returns c->protect.
+int config_refresh(struct config *c);
 
 #endif

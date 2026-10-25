@@ -160,6 +160,15 @@ static void discover(struct config *c) {
         SET(lo_source, c->hi_source);
 }
 
+// Why Protect cannot be used (yet), or NULL.
+static const char *protect_missing(const struct config *c) {
+    if (!*c->nvr || strlen(c->mac) != 12 || !*c->ip)
+        return "config needs NVR_HOST, and a MAC/IP (from IFACE or MAC=/IP=)";
+    if (!c->adopted && !*c->token)
+        return "not adopted yet: set ADOPTION_TOKEN (Protect: /proxy/protect/api/cameras/manage-payload)";
+    return NULL;
+}
+
 int config_load(struct config *c, const char *path) {
     defaults(c);
     if (parse_file(c, path, 1) < 0)
@@ -168,11 +177,7 @@ int config_load(struct config *c, const char *path) {
     // The state file only ever records that adoption succeeded.
     parse_file(c, c->state_file, 0);
     // Without Protect settings a capturing uvcd still feeds RTSP/ONVIF.
-    const char *missing = NULL;
-    if (!*c->nvr || strlen(c->mac) != 12 || !*c->ip)
-        missing = "config needs NVR_HOST, and a MAC/IP (from IFACE or MAC=/IP=)";
-    else if (!c->adopted && !*c->token)
-        missing = "not adopted yet: set ADOPTION_TOKEN (Protect: /proxy/protect/api/cameras/manage-payload)";
+    const char *missing = protect_missing(c);
     c->protect = !missing;
     if (missing) {
         if (!c->capture) {
@@ -182,6 +187,13 @@ int config_load(struct config *c, const char *path) {
         log_warn("%s; capturing only", missing);
     }
     return 0;
+}
+
+int config_refresh(struct config *c) {
+    if (!*c->ip)
+        discover(c);
+    c->protect = !protect_missing(c);
+    return c->protect;
 }
 
 int config_save_adopted(const struct config *c) {

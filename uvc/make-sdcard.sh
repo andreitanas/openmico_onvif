@@ -20,16 +20,22 @@ mkdir -p "$CARD/config/overlay" "$CARD/uvc"
 cp -R "$DEPLOY/config/overlay/." "$CARD/config/overlay/"
 cp ../app/onvif.py ../app/onvif_discover.py "$CARD/config/overlay/app/"
 cp ../etc/init.d/S66onvif "$CARD/config/overlay/etc/init.d/"
-cp sdcard/S90uvcd sdcard/S99probe "$CARD/config/overlay/etc/init.d/"
-# Adds a 640x360 H.264 encoder on /dev/video5 for Protect's video2/video3.
+# S60camera starts uvcd in place of videocapture (VIDEO_CAPTURE=uvcd below).
+cp sdcard/S60camera sdcard/S90uvcd sdcard/S99probe "$CARD/config/overlay/etc/init.d/"
+# Only used with VIDEO_CAPTURE=videocapture (uvcd.conf CAPTURE=0): adds a
+# 640x360 H.264 encoder on /dev/video5 for Protect's video2/video3.
 cp sdcard/videocapture_settings.json "$CARD/config/overlay/etc/"
 
 # Single FAT32 partition: sdcard is p1, swap is a file on it. Log to the card
 # while bringing the camera up.
-sed -e 's|^SD_PARTITION=.*|SD_PARTITION=/dev/mmcblk0p1|' \
-    -e 's|^SWAPFILE=.*|SWAPFILE=/sdcard/swapfile|' \
-    -e 's|^ENABLE_LOGGING=.*|ENABLE_LOGGING=1|' \
-    "$DEPLOY/config/overlay/etc/openmiko.conf" > "$CARD/config/overlay/etc/openmiko.conf"
+{
+    sed -e 's|^SD_PARTITION=.*|SD_PARTITION=/dev/mmcblk0p1|' \
+        -e 's|^SWAPFILE=.*|SWAPFILE=/sdcard/swapfile|' \
+        -e 's|^ENABLE_LOGGING=.*|ENABLE_LOGGING=1|' \
+        -e '/^VIDEO_CAPTURE=/d' \
+        "$DEPLOY/config/overlay/etc/openmiko.conf"
+    echo 'VIDEO_CAPTURE=uvcd'
+} > "$CARD/config/overlay/etc/openmiko.conf"
 
 cp build/uvcd-mipsel "$CARD/uvc/uvcd"
 if [ ! -f "$CARD/uvc/uvcd.conf" ]; then
