@@ -219,3 +219,48 @@ decision.
    from flash and the zram root goes away entirely (about 23 MB).
 8. **Later features:** real microphone audio (libimp AI and an Opus encoder), and an OSD
    timestamp.
+
+## Status (2026-10-25, later)
+
+Done; the camera runs it:
+- **Own image** (proposals 1, 3, 6 and 7). `uvc/image/` builds a root
+  partition from OpenMiko's root filesystem, filtered to busybox, dropbear,
+  wpa_supplicant, autonight and the drivers, with our init scripts.
+  - uvcd and the detector are read from flash (`/rom`) and settings are in
+    `/config`, so the SD card is optional.
+  - Logs are size-capped in RAM. wpa_supplicant runs without its debug log,
+    and there is no cron, micropython, lighttpd or bash.
+  - The zram root dropped from 23 MB of RAM to 7.5 MB. With uvcd running,
+    58 MB is available (was 40 MB).
+  - Boot to streaming takes about 36 s.
+  - `image/flash.sh` installs over ssh with verification and automatic
+    restore; `build/image/demo.bin` is for setup-button installs.
+- **Clock** (proposal 2): uvcd waits for NTP before connecting. After
+  reboots, Protect now records the low-res stream within a minute; it used
+  to be refused for about 75 s.
+- **Watchdog** (proposal 4): armed at 60 s and fed while video flows and
+  Protect was reachable within 30 min. Tested:
+  - a frozen uvcd reboots the camera in under a minute;
+  - a killed uvcd is restarted by init and re-arms it;
+  - a clean stop disarms it.
+- **Protect settings** (proposal 5): ISP settings are applied, the IR mode
+  (auto, autoFilterOnly, on, off) goes through nightmode.sh, and the status
+  LEDs are blue when connected and yellow when not.
+- **Leftovers**: the SD card was cleaned (stock Wyze recordings, OTA files,
+  bench files, swapfile). The old OpenMiko init scripts were removed from
+  the config flash.
+
+Found on the way:
+- The libimp compatibility shim overrode `mmap` for the whole binary.
+  musl's `sem_open` (64-bit offset) then mapped its semaphore at a garbage
+  offset and crashed with SIGBUS; it had only worked by luck. libimp's own
+  references are now renamed to the shim.
+
+Not done:
+- The setup button does nothing; it is no longer polled.
+- dropbear still allows password logins.
+- Real microphone audio.
+- OSD.
+- Rebuilding the kernel with squashfs, to drop the zram root entirely.
+- `demo.bin` installs are untested on hardware. The format reproduces
+  OpenMiko's file exactly, but nobody has pressed the button with ours yet.
