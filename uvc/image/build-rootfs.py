@@ -3,7 +3,7 @@
 
 OpenMiko's kernel unpacks rootfs.tar.xz from the root flash partition into a
 zram disk on every boot, so everything in it costs RAM. This keeps busybox,
-dropbear, wpa_supplicant, autonight, the camera and WiFi drivers and the
+dropbear, wpa_supplicant, the camera and WiFi drivers and the
 shared libraries those programs link, replaces the init scripts with ours
 (image/rootfs/) and drops the rest (ffmpeg, RTSP, micropython, lighttpd,
 bash, ...). uvcd is not in here: it lives next to the tarball in flash.
@@ -26,7 +26,6 @@ KEEP_PROGRAMS = {
     'bin/busybox',
     'usr/sbin/dropbear',
     'usr/sbin/wpa_supplicant',
-    'usr/bin/autonight',
 }
 # Kernel modules kept (camera, WiFi; audio for the microphone later).
 KEEP_MODULES = {

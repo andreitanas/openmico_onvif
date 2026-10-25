@@ -29,4 +29,7 @@ struct isp_params {
 };
 void capture_isp(const struct isp_params *p);
 
+// The ISP's night mode (black and white, night tuning) or day mode.
+void capture_night(int night);
+
 #endif

@@ -34,7 +34,6 @@ static const struct config *cfg;
 static IMPSensorInfo sensor;
 static volatile int running;
 static struct encoder encoders[2];
-static pthread_t night_thread;
 
 static pthread_mutex_t jpeg_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *jpeg;
@@ -221,29 +220,13 @@ int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) {
     return n;
 }
 
-// nightmode.sh (autonight's verdict, Protect's IR mode) switches the IR cut
-// filter and LEDs and writes the result to a file; the ISP follows it.
-static void *night_main(void *arg) {
-    int prev = -1;
-    while (running) {
-        int night = 0;
-        FILE *fp = fopen(cfg->night_file, "r");
-        if (fp) {
-            if (fscanf(fp, "%d", &night) != 1)
-                night = 0;
-            fclose(fp);
-        }
-        night = night != 0;
-        if (night != prev) {
-            log_info("capture: %s mode", night ? "night" : "day");
-            IMP_ISP_Tuning_SetISPRunningMode(night ? IMPISP_RUNNING_MODE_NIGHT : IMPISP_RUNNING_MODE_DAY);
-            IMP_ISP_Tuning_SetSceneMode(night ? IMPISP_SCENE_MODE_NIGHT : IMPISP_SCENE_MODE_AUTO);
-            IMP_ISP_Tuning_SetColorfxMode(night ? IMPISP_COLORFX_MODE_BW : IMPISP_COLORFX_MODE_AUTO);
-            prev = night;
-        }
-        sleep_ms(1000);
-    }
-    return NULL;
+void capture_night(int night) {
+    if (!running)
+        return;
+    log_info("capture: %s mode", night ? "night" : "day");
+    IMP_ISP_Tuning_SetISPRunningMode(night ? IMPISP_RUNNING_MODE_NIGHT : IMPISP_RUNNING_MODE_DAY);
+    IMP_ISP_Tuning_SetSceneMode(night ? IMPISP_SCENE_MODE_NIGHT : IMPISP_SCENE_MODE_AUTO);
+    IMP_ISP_Tuning_SetColorfxMode(night ? IMPISP_COLORFX_MODE_BW : IMPISP_COLORFX_MODE_AUTO);
 }
 
 // Protect's 0-100 (50 neutral) to libimp's 0-255 (128 neutral).
@@ -317,7 +300,6 @@ int capture_start(const struct config *c, struct source *hi, struct source *lo) 
     running = 1;
     for (int i = 0; i < 2; i++)
         pthread_create(&encoders[i].thread, NULL, encoder_main, &encoders[i]);
-    pthread_create(&night_thread, NULL, night_main, NULL);
     log_info("capture: 1920x1080 @ %d kbit/s, %dx%d @ %d kbit/s, %d fps", c->hi_kbps, c->lo_width,
              c->lo_height, c->lo_kbps, c->fps);
     return 0;
@@ -335,7 +317,6 @@ void capture_stop(void) {
     pthread_mutex_unlock(&jpeg_lock);
     for (int i = 0; i < 2; i++)
         pthread_join(encoders[i].thread, NULL);
-    pthread_join(night_thread, NULL);
     IMP_Encoder_StopRecvPic(ENC_HI);
     IMP_Encoder_StopRecvPic(ENC_LO);
     bind(FS_HI, FS_HI, 0);
@@ -372,5 +353,7 @@ int capture_jpeg(uint8_t **data, size_t *len) { return -1; }
 int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) { return -1; }
 
 void capture_isp(const struct isp_params *p) {}
+
+void capture_night(int night) {}
 
 #endif

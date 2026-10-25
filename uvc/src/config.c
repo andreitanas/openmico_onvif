@@ -31,8 +31,11 @@ static void defaults(struct config *c) {
     SET(hi_source, "/dev/video3");
     SET(snapshot, "/dev/video4");
     SET(state_file, "/config/uvc/uvcd.state");
-    SET(night_file, "/tmp/night_vision_enabled");
-    SET(ir_script, "/usr/bin/nightmode.sh");
+    // Measured on a jxf22 Wyze Cam v2 (see daynight.h): day mode reads
+    // ~450k in a lit room and 1.2M+ covered; night mode without IR LEDs
+    // 0.9M+ covered.
+    c->night_exposure = 1200000;
+    c->day_exposure = 800000;
     c->watchdog = 60;
     SET(detect_model, "/rom/uvc/models/yolo-fastest-1.1");
     c->capture = 1;
@@ -87,8 +90,8 @@ static void set_key(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "LO_HEIGHT")) c->lo_height = atoi(v);
     else if (!strcmp(k, "FLIP_V")) c->flip_v = atoi(v);
     else if (!strcmp(k, "FLIP_H")) c->flip_h = atoi(v);
-    else if (!strcmp(k, "NIGHT_FILE")) SET(night_file, v);
-    else if (!strcmp(k, "IR_SCRIPT")) SET(ir_script, v);
+    else if (!strcmp(k, "NIGHT_EXPOSURE")) c->night_exposure = atoi(v);
+    else if (!strcmp(k, "DAY_EXPOSURE")) c->day_exposure = atoi(v);
     else if (!strcmp(k, "WATCHDOG")) c->watchdog = atoi(v);
     else if (!strcmp(k, "DETECT_MODEL")) SET(detect_model, v);
     else if (!strcmp(k, "FPS")) c->fps = atoi(v);

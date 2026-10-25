@@ -22,6 +22,11 @@ ADOPTION_TOKEN=
 #FLIP_V=0
 #FLIP_H=0
 
+# Day/night switching points, in the ISP's exposure figure (larger is
+# darker; see /proc/jz/isp/isp_info). Protect's custom night mode moves both.
+#NIGHT_EXPOSURE=1200000
+#DAY_EXPOSURE=800000
+
 # Hardware watchdog timeout in seconds (0: off)
 #WATCHDOG=60
 # Restart camera from Protect reboots the Wyze

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Image sensor and ISP drivers, IR cut filter, day/night switching.
-# uvcd itself is started by init (inittab) once boot is done.
+# Image sensor and ISP drivers. uvcd, started by init (inittab) once boot is
+# done, drives the camera, including the IR cut filter and LEDs.
 MOD=/lib/modules/3.10.14/kernel/drivers/media/platform
 SENSOR_ARGS="data_interface=2 pwdn_gpio=-1 reset_gpio=18 sensor_gpio_func=0"
 gpio_out() {
@@ -22,11 +22,5 @@ start)
 	else
 		insmod $MOD/sensors/jxf22/sensor_jxf22.ko $SENSOR_ARGS
 	fi
-	/usr/bin/nightmode.sh off
-	autonight -S -c /usr/bin/nightmode.sh -j 3 -w 3 -1 1200000 -2 930000,14,10 -3 3000,17,8 \
-		> /dev/null 2>&1 &
-	;;
-stop)
-	killall autonight 2>/dev/null
 	;;
 esac

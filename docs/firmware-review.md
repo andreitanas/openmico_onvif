@@ -225,7 +225,7 @@ decision.
 Done; the camera runs it:
 - **Own image** (proposals 1, 3, 6 and 7). `uvc/image/` builds a root
   partition from OpenMiko's root filesystem, filtered to busybox, dropbear,
-  wpa_supplicant, autonight and the drivers, with our init scripts.
+  wpa_supplicant and the drivers, with our init scripts.
   - uvcd and the detector are read from flash (`/rom`) and settings are in
     `/config`, so the SD card is optional.
   - Logs are size-capped in RAM. wpa_supplicant runs without its debug log,
@@ -244,9 +244,24 @@ Done; the camera runs it:
   - a frozen uvcd reboots the camera in under a minute;
   - a killed uvcd is restarted by init and re-arms it;
   - a clean stop disarms it.
-- **Protect settings** (proposal 5): ISP settings are applied, the IR mode
-  (auto, autoFilterOnly, on, off) goes through nightmode.sh, and the status
+- **Protect settings** (proposal 5): ISP settings are applied, and the status
   LEDs are blue when connected and yellow when not.
+- **Day/night** (`uvc/src/daynight.c`) replaces autonight and nightmode.sh.
+  - Protect sends cameras `irLedMode` "auto" or "manual", `irLedLevel` (0:
+    no IR LEDs) and `icrSwitchMode`/`icrCustomValue` for its custom modes;
+    the UI's names (on, off, autoFilterOnly, ...) never reach the camera, so
+    the old nightmode.sh only ever ran "auto". All six modes now work.
+  - autonight's switch back to day needed an iridix (tone mapping) strength
+    below 14, which this camera never reports in night mode (~30-50), so it
+    stayed in night mode after any dark spell. With the IR LEDs on, exposure
+    can't decide either: a hand over the lens, lit by the LEDs, read ~250k,
+    brighter than the uncovered room (~445k). With the LEDs off it read
+    0.9-1.05M within 2 s.
+  - So: night when day-mode exposure stays above 1.2M for 3 s; at night,
+    turn the LEDs off for 3.5 s and go back to day if exposure stays below
+    800k. Probes start 10 s after the switch and back off (30 s doubling to
+    10 min), and come sooner when the exposure moves. Tested with a hand
+    over the lens.
 - **Leftovers**: the SD card was cleaned (stock Wyze recordings, OTA files,
   bench files, swapfile). The old OpenMiko init scripts were removed from
   the config flash.

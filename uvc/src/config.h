@@ -27,8 +27,8 @@ struct config {
     int hi_kbps, lo_kbps, hi_gop, lo_gop;
     int lo_width, lo_height;
     int flip_v, flip_h;
-    char night_file[64]; // nightmode.sh writes 0/1 here
-    char ir_script[64];  // nightmode.sh: IR LEDs and cut filter
+    // Day/night switching points in the ISP's exposure figure (daynight.h)
+    int night_exposure, day_exposure;
     char detect_model[128]; // object detector, path without .param/.bin
     int protect;         // Protect is configured (else only capture runs)
     int fps;

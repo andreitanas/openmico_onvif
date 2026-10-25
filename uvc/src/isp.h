@@ -4,10 +4,10 @@
 #include "cJSON.h"
 
 // Protect's ISP settings (ChangeIspSettings): kept as Protect sent them,
-// applied to the image (capture_isp) and the IR LEDs / IR cut filter (via
-// ir_script), and reported back.
+// applied to the image (capture_isp) and day/night switching (daynight), and
+// reported back.
 
-void isp_init(const char *ir_script);
+void isp_init(void);
 // Merge payload into the settings (reset: back to defaults first), apply
 // them, and return them for the response.
 cJSON *isp_change(const cJSON *payload, int reset);

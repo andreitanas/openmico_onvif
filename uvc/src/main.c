@@ -14,6 +14,7 @@
 #include "board.h"
 #include "capture.h"
 #include "config.h"
+#include "daynight.h"
 #include "https.h"
 #include "isp.h"
 #include "objects.h"
@@ -89,6 +90,7 @@ static void *signal_main(void *arg) {
     log_info("signal %d: stopping", sig);
     board_watchdog_stop();
     avclient_stop(3000);
+    daynight_stop();
     capture_stop();
     _exit(0);
 }
@@ -124,7 +126,7 @@ int main(int argc, char **argv) {
     pthread_create(&sig_thread, NULL, signal_main, &stop_set);
 
     board_led_connected(0);
-    isp_init(cfg.ir_script);
+    isp_init();
     struct source *lop = &hi;
     if (cfg.capture) {
         source_init(&hi, "capture:hi");
@@ -132,6 +134,7 @@ int main(int argc, char **argv) {
         lop = &lo;
         if (capture_start(&cfg, &hi, &lo) < 0)
             return 1;
+        daynight_start(&cfg);
         analytics_start(avclient_event, cfg.lo_width, cfg.lo_height);
         if (*cfg.detect_model)
             objects_start(avclient_event, cfg.detect_model, cfg.lo_width, cfg.lo_height);
