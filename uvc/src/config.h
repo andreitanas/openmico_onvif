@@ -30,13 +30,15 @@ struct config {
     int hi_kbps, lo_kbps, hi_gop, lo_gop;
     int lo_width, lo_height;
     int flip_v, flip_h;
-    char night_file[64]; // OpenMiko's autonight writes 0/1 here
+    char night_file[64]; // nightmode.sh writes 0/1 here
+    char ir_script[64];  // nightmode.sh: IR LEDs and cut filter
     char detect_model[128]; // object detector, path without .param/.bin
     int protect;         // Protect is configured (else only capture runs)
     int fps;
     int audio;
     int allow_reboot;
     int adopted;
+    int watchdog; // hardware watchdog timeout, s (0: off)
 };
 
 int config_load(struct config *c, const char *path);

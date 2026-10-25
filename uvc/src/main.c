@@ -10,8 +10,10 @@
 
 #include "analytics.h"
 #include "avclient.h"
+#include "board.h"
 #include "capture.h"
 #include "config.h"
+#include "isp.h"
 #include "objects.h"
 #include "source.h"
 #include "tls.h"
@@ -19,6 +21,32 @@
 
 #define READY_FILE "/var/run/uvcd.ready"
 #define SANE_WALL_MS 1704067200000LL // 2024-01-01
+
+static struct config cfg;
+static struct source hi, lo;
+static int64_t start_ms;
+
+// Fed to the hardware watchdog: video keeps coming, and Protect has been
+// reachable within the last half hour (a wedged WiFi driver is not
+// otherwise recovered from).
+static int healthy(void) {
+    int64_t now = mono_ms();
+    pthread_mutex_lock(&hi.lock);
+    int64_t last = hi.last_frame_ms;
+    pthread_mutex_unlock(&hi.lock);
+    if (now - last > 15000) {
+        log_warn("no video for %lld s", (long long)(now - last) / 1000);
+        return 0;
+    }
+    int64_t seen = avclient_connected_ms();
+    if (seen < start_ms)
+        seen = start_ms;
+    if (cfg.protect && now - seen > 30 * 60000) {
+        log_warn("no connection to Protect for %lld min", (long long)(now - seen) / 60000);
+        return 0;
+    }
+    return 1;
+}
 
 static void usage(void) {
     fprintf(stderr, "usage: uvcd [-c /config/uvc/uvcd.conf] [-v]\n");
@@ -33,6 +61,7 @@ static void *signal_main(void *arg) {
     int sig;
     sigwait(set, &sig);
     log_info("signal %d: stopping", sig);
+    board_watchdog_stop();
     avclient_stop(3000);
     capture_stop();
     _exit(0);
@@ -51,7 +80,7 @@ int main(int argc, char **argv) {
     }
     signal(SIGPIPE, SIG_IGN);
 
-    static struct config cfg;
+    start_ms = mono_ms();
     if (config_load(&cfg, conf) < 0)
         return 1;
     if (verbose)
@@ -68,7 +97,8 @@ int main(int argc, char **argv) {
     pthread_t sig_thread;
     pthread_create(&sig_thread, NULL, signal_main, &stop_set);
 
-    static struct source hi, lo;
+    board_led_connected(0);
+    isp_init(cfg.ir_script);
     struct source *lop = &hi;
     if (cfg.capture) {
         source_init(&hi, "capture:hi");
@@ -95,6 +125,8 @@ int main(int argc, char **argv) {
         FILE *fp = fopen(READY_FILE, "w");
         if (fp)
             fclose(fp);
+        if (cfg.watchdog > 0)
+            board_watchdog_start(cfg.watchdog, healthy);
     }
 
     if (!cfg.protect) {

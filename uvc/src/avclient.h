@@ -14,5 +14,8 @@ void avclient_event(const char *function, cJSON *payload);
 // From another thread at shutdown: close the connection to Protect cleanly
 // (websocket close, streams stopped), waiting at most timeout_ms.
 void avclient_stop(int timeout_ms);
+// Monotonic ms when last connected to Protect (now while connected; 0 if
+// never).
+int64_t avclient_connected_ms(void);
 
 #endif

@@ -301,6 +301,30 @@ static void *night_main(void *arg) {
     return NULL;
 }
 
+// Protect's 0-100 (50 neutral) to libimp's 0-255 (128 neutral).
+static unsigned char isp_level(int v) {
+    v = v < 0 ? 0 : v > 100 ? 100 : v;
+    return v <= 50 ? v * 128 / 50 : 128 + (v - 50) * 127 / 50;
+}
+
+void capture_isp(const struct isp_params *p) {
+    if (!running)
+        return;
+    IMP_ISP_Tuning_SetBrightness(isp_level(p->brightness));
+    IMP_ISP_Tuning_SetContrast(isp_level(p->contrast));
+    IMP_ISP_Tuning_SetSaturation(isp_level(p->saturation));
+    IMP_ISP_Tuning_SetSharpness(isp_level(p->sharpness));
+    // 3D noise reduction strength in percent of the tuning's, 50-150.
+    IMP_ISP_Tuning_SetTemperStrength(50 + (p->denoise < 0 ? 0 : p->denoise > 100 ? 100 : p->denoise));
+    IMP_ISP_Tuning_SetISPVflip(cfg->flip_v ^ !!p->flip ? IMPISP_TUNING_OPS_MODE_ENABLE
+                                                       : IMPISP_TUNING_OPS_MODE_DISABLE);
+    IMP_ISP_Tuning_SetISPHflip(cfg->flip_h ^ !!p->mirror ? IMPISP_TUNING_OPS_MODE_ENABLE
+                                                         : IMPISP_TUNING_OPS_MODE_DISABLE);
+    log_info("capture: image brightness %d contrast %d saturation %d sharpness %d denoise %d%s%s",
+             p->brightness, p->contrast, p->saturation, p->sharpness, p->denoise,
+             p->flip ? " flip" : "", p->mirror ? " mirror" : "");
+}
+
 static int isp_start(void) {
     if (sensor_info(&sensor) < 0)
         return -1;
@@ -405,5 +429,7 @@ void capture_stop(void) {}
 int capture_jpeg(uint8_t **data, size_t *len) { return -1; }
 
 int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) { return -1; }
+
+void capture_isp(const struct isp_params *p) {}
 
 #endif

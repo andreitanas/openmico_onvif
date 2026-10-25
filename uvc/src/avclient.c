@@ -8,9 +8,11 @@
 #include <unistd.h>
 
 #include "analytics.h"
+#include "board.h"
 #include "cJSON.h"
 #include "capture.h"
 #include "https.h"
+#include "isp.h"
 #include "mbedtls/sha1.h"
 #include "objects.h"
 #include "stream.h"
@@ -22,6 +24,8 @@ static struct source *hi_src, *lo_src;
 static struct ws ws;
 static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
 static int connected; // guarded by send_lock
+static int64_t connected_ms; // guarded by send_lock: when connected last changed
+static int led_enabled = 1;
 static int msg_id;    // guarded by send_lock
 // Shutdown: avclient_stop asks the protocol loop to close the connection
 // properly; the loop owns the TLS session, so it does the closing.
@@ -236,36 +240,6 @@ static void send_hello(void) {
 
 // --- settings payloads --------------------------------------------------
 
-static cJSON *isp_settings(void) {
-    static const struct {
-        const char *k;
-        double v;
-    } nums[] = {
-        {"aeTargetPercent", 50}, {"aggressiveAntiFlicker", 0}, {"brightness", 50},
-        {"contrast", 50}, {"criticalTmpOfProtect", 40}, {"dZoomCenterX", 50},
-        {"dZoomCenterY", 50}, {"dZoomScale", 0}, {"dZoomStreamId", 4},
-        {"darkAreaCompensateLevel", 0}, {"denoise", 50}, {"enable3dnr", 1},
-        {"enableExternalIr", 0}, {"enableMicroTmpProtect", 1}, {"enablePauseMotion", 0},
-        {"flip", 0}, {"focusPosition", 0}, {"forceFilterIrSwitchEvents", 0}, {"hue", 50},
-        {"icrLightSensorNightThd", 0}, {"icrSensitivity", 0}, {"irLedLevel", 215},
-        {"irOnStsBrightness", 0}, {"irOnStsContrast", 0}, {"irOnStsDenoise", 0},
-        {"irOnStsHue", 0}, {"irOnStsSaturation", 0}, {"irOnStsSharpness", 0},
-        {"irOnStsWdr", 0}, {"irOnValBrightness", 50}, {"irOnValContrast", 50},
-        {"irOnValDenoise", 50}, {"irOnValHue", 50}, {"irOnValSaturation", 50},
-        {"irOnValSharpness", 50}, {"irOnValWdr", 1}, {"lensDistortionCorrection", 1},
-        {"mirror", 0}, {"queryIrLedStatus", 0}, {"saturation", 50}, {"sharpness", 50},
-        {"touchFocusX", 1001}, {"touchFocusY", 1001}, {"wdr", 1}, {"zoomPosition", 0},
-    };
-    cJSON *p = cJSON_CreateObject();
-    STR(p, "aeMode", "auto");
-    STR(p, "focusMode", "ztrig");
-    STR(p, "irLedMode", "auto");
-    cJSON_AddNullToObject(p, "masks");
-    for (size_t i = 0; i < sizeof(nums) / sizeof(nums[0]); i++)
-        NUM(p, nums[i].k, nums[i].v);
-    return p;
-}
-
 static cJSON *osd_settings(void) {
     cJSON *p = cJSON_CreateObject();
     for (int i = 1; i <= 4; i++) {
@@ -305,7 +279,7 @@ static cJSON *network_status(void) {
 static cJSON *sound_led_settings(void) {
     cJSON *p = cJSON_CreateObject();
     NUM(p, "ledFaceAlwaysOnWhenManaged", 1);
-    NUM(p, "ledFaceEnabled", 1);
+    NUM(p, "ledFaceEnabled", led_enabled);
     NUM(p, "speakerEnabled", 0);
     NUM(p, "speakerVolume", 100);
     NUM(p, "systemSoundsEnabled", 0);
@@ -554,8 +528,8 @@ static int handle(const char *text) {
 
     // Fire-and-forget messages we act on even without a response.
     static const char *const unsolicited[] = {"GetRequest", "ChangeVideoSettings",
-                                              "UpdateFirmwareRequest", "Reboot",
-                                              "ubnt_avclient_hello"};
+                                              "ChangeSoundLedSettings", "UpdateFirmwareRequest",
+                                              "Reboot", "ubnt_avclient_hello"};
     int known = expected;
     for (size_t i = 0; i < sizeof(unsolicited) / sizeof(*unsolicited); i++)
         known |= !strcmp(fn, unsolicited[i]);
@@ -584,7 +558,7 @@ static int handle(const char *text) {
         res = video_settings();
         respond = 1;
     } else if (!strcmp(fn, "ResetIspSettings") || !strcmp(fn, "ChangeIspSettings")) {
-        res = isp_settings();
+        res = isp_change(payload, !strcmp(fn, "ResetIspSettings"));
     } else if (!strcmp(fn, "ChangeDeviceSettings")) {
         res = cJSON_CreateObject();
         STR(res, "name", cfg->name);
@@ -594,6 +568,12 @@ static int handle(const char *text) {
     } else if (!strcmp(fn, "NetworkStatus")) {
         res = network_status();
     } else if (!strcmp(fn, "ChangeSoundLedSettings")) {
+        // The camera's status light (Protect: ledSettings.isEnabled).
+        const cJSON *led = cJSON_GetObjectItemCaseSensitive(payload, "ledFaceEnabled");
+        if (cJSON_IsNumber(led) || cJSON_IsBool(led)) {
+            led_enabled = cJSON_IsNumber(led) ? led->valueint != 0 : cJSON_IsTrue(led);
+            board_led_enable(led_enabled);
+        }
         res = sound_led_settings();
     } else if (!strcmp(fn, "GetRequest")) {
         get_request(payload);
@@ -662,7 +642,9 @@ static void session(void) {
     log_info("connected");
     pthread_mutex_lock(&send_lock);
     connected = 1;
+    connected_ms = mono_ms();
     pthread_mutex_unlock(&send_lock);
+    board_led_connected(1);
     send_hello();
     for (;;) {
         const char *text;
@@ -675,9 +657,18 @@ static void session(void) {
     }
     pthread_mutex_lock(&send_lock);
     connected = 0;
+    connected_ms = mono_ms();
     ws_close(&ws);
     pthread_mutex_unlock(&send_lock);
+    board_led_connected(0);
     stop_streams();
+}
+
+int64_t avclient_connected_ms(void) {
+    pthread_mutex_lock(&send_lock);
+    int64_t t = connected ? mono_ms() : connected_ms;
+    pthread_mutex_unlock(&send_lock);
+    return t;
 }
 
 void avclient_run(struct config *c, struct source *hi, struct source *lo) {
