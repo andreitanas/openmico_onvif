@@ -1,0 +1,36 @@
+# uvcd configuration (KEY=value, shell style)
+
+# UniFi Protect host
+NVR_HOST=@NVR_HOST@
+# One-time adoption token, valid ~60 minutes. While logged in to Protect, open
+#   https://<NVR_HOST>/proxy/protect/api/cameras/manage-payload
+# and copy "mgmt.token". Not needed once adopted (see STATE_FILE).
+ADOPTION_TOKEN=
+
+CERT=/sdcard/uvc/client.pem
+STATE_FILE=/sdcard/uvc/uvcd.state
+
+# Name shown in Protect (default: hostname)
+#NAME=Wyze Cam
+# MAC/IP are read from wlan0. Protect identifies the camera by MAC.
+#IFACE=wlan0
+
+# H.264 from OpenMiko's videocapture (v4l2loopback). LO_SOURCE defaults to
+# HI_SOURCE until a second, low-resolution encoder is configured.
+HI_SOURCE=/dev/video3
+#LO_SOURCE=/dev/video5
+SNAPSHOT_SOURCE=/dev/video4
+FPS=25
+
+# UniFi identity (UVC G5 Pro). FW_VERSION should be the newest firmware
+# Protect's catalog has for this platform.
+#MODEL=UVC G5 Pro
+#SYSID=0xa598
+#PLATFORM=sav837gw
+#FW_VERSION=5.5.31
+#FW_BUILD=92ebf37.260724.1639
+
+# Restart camera from Protect reboots the Wyze
+#ALLOW_REBOOT=1
+# 0 error, 1 warn, 2 info, 3 debug
+#LOG_LEVEL=2
