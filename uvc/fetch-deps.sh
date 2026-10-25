@@ -18,4 +18,11 @@ if [ ! -d cjson ]; then
     mv "cJSON-$CJSON" cjson
 fi
 
+# Ingenic T20 SDK headers + libimp (prebuilt, no source), as used by
+# OpenMiko's videocapture.
+if [ ! -d ingenic ]; then
+    git clone -q https://github.com/openmiko/ingenic_videocap ingenic
+    git -C ingenic checkout -q 86c1576
+fi
+
 echo "Done."
