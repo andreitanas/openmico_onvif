@@ -1,7 +1,8 @@
 #!/bin/sh
 # Populate an OpenMiko sdcard (FAT32, partition 1) for one camera:
-#   - the existing overlay from ../deploy/config/overlay (wifi, passwd, ssh key,
-#     ONVIF hack), with openmiko.conf pointed at partition 1 + a swap file
+#   - the existing overlay from ../deploy/config/overlay (wifi, passwd, ssh key),
+#     with openmiko.conf pointed at partition 1 + a swap file, uvcd as the
+#     capture process and the RTSP server off
 #   - uvcd, its config and a per-camera client certificate under /uvc
 #   - S90uvcd (starts uvcd) and S99probe (writes /probe.txt on boot)
 #   - demo.bin (OpenMiko image; only flashed when the setup button is held)
@@ -16,10 +17,8 @@ DEPLOY=../deploy
 [ -d "$CARD" ] || { echo "$CARD is not mounted"; exit 1; }
 [ -f build/uvcd-mipsel ] || make camera
 
-mkdir -p "$CARD/config/overlay" "$CARD/uvc"
+mkdir -p "$CARD/config/overlay/etc/init.d" "$CARD/uvc"
 cp -R "$DEPLOY/config/overlay/." "$CARD/config/overlay/"
-cp ../app/onvif.py ../app/onvif_discover.py "$CARD/config/overlay/app/"
-cp ../etc/init.d/S66onvif "$CARD/config/overlay/etc/init.d/"
 # S60camera starts uvcd in place of videocapture (VIDEO_CAPTURE=uvcd below).
 cp sdcard/S60camera sdcard/S90uvcd sdcard/S99probe "$CARD/config/overlay/etc/init.d/"
 # Only used with VIDEO_CAPTURE=videocapture (uvcd.conf CAPTURE=0): adds a
@@ -32,9 +31,12 @@ cp sdcard/videocapture_settings.json "$CARD/config/overlay/etc/"
     sed -e 's|^SD_PARTITION=.*|SD_PARTITION=/dev/mmcblk0p1|' \
         -e 's|^SWAPFILE=.*|SWAPFILE=/sdcard/swapfile|' \
         -e 's|^ENABLE_LOGGING=.*|ENABLE_LOGGING=1|' \
-        -e '/^VIDEO_CAPTURE=/d' \
+        -e '/^VIDEO_CAPTURE=/d' -e '/^ENABLE_RTSP=/d' \
         "$DEPLOY/config/overlay/etc/openmiko.conf"
     echo 'VIDEO_CAPTURE=uvcd'
+    # Protect gets video from uvcd; the RTSP server and its v4l2loopback
+    # buffers (~37 MB of kernel memory) are left out.
+    echo 'ENABLE_RTSP=0'
 } > "$CARD/config/overlay/etc/openmiko.conf"
 
 cp build/uvcd-mipsel "$CARD/uvc/uvcd"

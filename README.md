@@ -1,33 +1,30 @@
-## Basic toy ONVIF service for OpenMiko
+## Wyze Cam v2 as a native UniFi Protect camera
 
-This project is a toy ONVIF service for OpenMiko opensource firmware for Wyze cameras using Ingenic T20 SoC.
+`uvc/` holds uvcd, a small static C daemon for [OpenMiko](https://github.com/openmiko/openmiko)
+firmware on Ingenic T20 Wyze cameras. It drives the camera through Ingenic's
+libimp (replacing OpenMiko's videocapture) and speaks UniFi Protect's own
+camera protocol, so the camera is adopted into Protect as a UniFi camera:
+video, snapshots and settings without RTSP, ONVIF or a bridge box.
 
 ## Prerequisites
-Use OpenMiko base image: https://github.com/openmiko/openmiko/releases and follow [the instructions](https://github.com/openmiko/openmiko) to flash the firmware, then follow the instructions below to add ONVIF service.
+Flash the OpenMiko base image (https://github.com/openmiko/openmiko/releases)
+following [its instructions](https://github.com/openmiko/openmiko).
 
-Files need to be copied to /overlay folder on the SD card. When the camera reboots, everything in the /overlay folder will be copied to the root of file system. When mounted, the card will be accessible at /config, and it will be possible to update the overlay files remotely.
-
-File structure:
-```
-/overlay
-  /app
-    onvif.py
-    onvif_discover.py
-  /etc
-    wpa_supplicant.conf --> make sure to update wifi configuration
-    openmiko.conf       --> refer to openmiko documentation
-    passwd              --> update password (use `passwd` then copy from /etc/passwd)
-    /init.d
-      S66onvif          --> script to start onvif services
-```
-
-## Deploy
-Run deploy.sh to copy files over ssh to the SD card as well as the live file system on the camera. Make sure to update the wifi configuration in `wpa_supplicant.conf` and adjust settings as necessary in `openmiko.conf`.
-
-## Usage
-After deploying the files, reboot the camera. The ONVIF service (`onvif.py`) will be available on port 8000, and the discovery service (`onvif_discover.py`) will make it discoverable by ONVIF-compatible clients. This was tested with [Onvifer](https://play.google.com/store/apps/details?id=net.biyee.onvifer) Android app and Ubiquiti Unifi Protect NVR.
+## Build and deploy
+- `./deploy.sh utils` and `./deploy.sh passwd` generate the camera's OpenMiko
+  overlay (`deploy/config/overlay`: wifi, `openmiko.conf`, root password, ssh
+  key). The camera copies everything under `config/` on the SD card to its
+  flash and root filesystem on every boot.
+- `cd uvc && ./fetch-deps.sh && make camera` builds `build/uvcd-mipsel`.
+- `uvc/make-sdcard.sh /Volumes/CARD [protect-host]` writes a card: the overlay,
+  uvcd, its config and a per-camera client certificate.
+- Set `ADOPTION_TOKEN` in `uvc/uvcd.conf` on the card (see the comments there),
+  boot the camera, and adopt it in Protect.
 
 ## Notes
-* The ONVIF service is not secure and should not be exposed to the Internet.
-  * **Authentication is not implemented**, the camera will accept any username/password.
-* The ONVIF service is very basic, only supports a subset of functions, request parsing is extremely naive and most of the responses are hardcoded, it is **not** compliant with the ONVIF standard, but it is enough to make the camera discoverable and stream video over RTSP.
+- The RTSP server is off (`ENABLE_RTSP=0` in `openmiko.conf`); its v4l2loopback
+  buffers alone take tens of MB of the camera's 92 MB. To serve RTSP again, set
+  `ENABLE_RTSP=1` and the `*_MIRROR` devices in `uvcd.conf`. Protect's own
+  RTSPS re-share (camera settings → Advanced) is an alternative, not yet tried
+  with these cameras.
+- uvcd logs to `/sdcard/var/log/uvcd.log` on the camera.

@@ -28,7 +28,7 @@ case "$1" in
 	if [ -f $PIDFILE ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
 		exit 0
 	fi
-	# A capturing uvcd runs (for RTSP) even before it is adopted.
+	# A capturing uvcd owns the camera, so it runs even before adoption.
 	if ! grep -q '^CAPTURE=1' $DIR/uvcd.conf &&
 	   ! grep -q '^ADOPTION_TOKEN=..*' $DIR/uvcd.conf && [ ! -f $DIR/uvcd.state ]; then
 		echo "uvcd: no ADOPTION_TOKEN in $DIR/uvcd.conf yet, not starting"

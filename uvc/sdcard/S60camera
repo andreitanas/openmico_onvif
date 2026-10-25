@@ -2,14 +2,17 @@
 #
 # Start video and camera
 #
-# OpenMiko's S60camera with one addition: VIDEO_CAPTURE=uvcd in
-# openmiko.conf makes uvcd (S90uvcd) drive the camera instead of
-# videocapture. Either one feeds the v4l2loopback devices that
-# v4l2rtspserver serves.
+# OpenMiko's S60camera with two additions in openmiko.conf:
+#   VIDEO_CAPTURE=uvcd  uvcd (S90uvcd) drives the camera instead of
+#                       videocapture
+#   ENABLE_RTSP=0       no v4l2rtspserver (nor ffmpeg recording, which reads
+#                       it); with uvcd also no v4l2loopback devices, whose
+#                       buffers take tens of MB of kernel memory
 #
 VIDEO_CAPTURE_SETTINGS=/etc/videocapture_settings.json
 VIDEO_CAPTURE=videocapture
 ENABLE_AUDIO=0
+ENABLE_RTSP=1
 UVCD_READY=/var/run/uvcd.ready
 
 if [[ -f /etc/openmiko.conf ]]; then
@@ -116,11 +119,19 @@ start_camera() {
 		DEVICE_COUNT="$((DEVICE_COUNT + 1))"
 	fi
 
-	echo "Setting up $DEVICE_COUNT v4l2loopback device(s)"
-
-	modprobe v4l2loopback devices=$DEVICE_COUNT
+	# videocapture always hands its streams over through v4l2loopback; uvcd
+	# only copies them there for the RTSP server.
+	if [ "$VIDEO_CAPTURE" != "uvcd" ] || [ "$ENABLE_RTSP" = "1" ]; then
+		echo "Setting up $DEVICE_COUNT v4l2loopback device(s)"
+		modprobe v4l2loopback devices=$DEVICE_COUNT
+	fi
 
 	start_capture
+
+	if [ "$ENABLE_RTSP" != "1" ]; then
+		logger -s "RTSP disabled (ENABLE_RTSP=0)"
+		return
+	fi
 
 	if ! running v4l2rtspserver; then
 		logger -s "Starting v4l2rtspserver"

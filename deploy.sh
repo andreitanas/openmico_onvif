@@ -43,31 +43,5 @@ if [ "$1" = "passwd" ]; then
     exit 0
 fi
 
-# Check if the first argument is "local"
-if [ "$1" = "local" ]; then
-    mkdir -p deploy/config/overlay/app
-    mkdir -p deploy/config/overlay/etc/init.d
-    cp app/onvif.py deploy/config/overlay/app/onvif.py
-    cp app/onvif_discover.py deploy/config/overlay/app/onvif_discover.py
-    cp etc/init.d/S66onvif deploy/config/overlay/etc/init.d/S66onvif
-    echo "Files copied to local deploy folder."
-    exit 0
-fi
-
-# Check if the first argument is "openmiko"
-if [ "$1" = "openmiko" ]; then
-    # Copy to SD card:
-    cat app/onvif.py | ssh root@openmiko "cat > /config/overlay/app/onvif.py"
-    cat app/onvif_discover.py | ssh root@openmiko "cat > /config/overlay/app/onvif_discover.py"
-    cat etc/init.d/S66onvif | ssh root@openmiko "cat > /config/overlay/etc/init.d/S66onvif"
-
-    # Copy to live system:
-    ssh root@openmiko "cp /config/overlay/app/onvif.py /app/onvif.py"
-    ssh root@openmiko "cp /config/overlay/app/onvif_discover.py /app/onvif_discover.py"
-    ssh root@openmiko "cp /config/overlay/etc/init.d/S66onvif /etc/init.d/S66onvif"
-    echo "Files copied to openmiko."
-    exit 0
-fi
-
 # Otherwise, print usage
-echo "Usage: $0 [utils|local|openmiko]"
+echo "Usage: $0 [utils|passwd]"

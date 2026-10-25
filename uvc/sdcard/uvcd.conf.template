@@ -16,12 +16,13 @@ STATE_FILE=/sdcard/uvc/uvcd.state
 #IFACE=wlan0
 
 # CAPTURE=1: uvcd drives the sensor and encoders itself (libimp) instead of
-# reading OpenMiko's videocapture, which must then not run. Encoded streams
-# are copied to the v4l2loopback devices so RTSP/ONVIF keep working.
+# reading OpenMiko's videocapture, which must then not run.
 CAPTURE=1
-HI_MIRROR=/dev/video3
-JPEG_MIRROR=/dev/video4
-LO_MIRROR=/dev/video5
+# With ENABLE_RTSP=1 in openmiko.conf, copy the streams to the v4l2loopback
+# devices v4l2rtspserver serves.
+#HI_MIRROR=/dev/video3
+#JPEG_MIRROR=/dev/video4
+#LO_MIRROR=/dev/video5
 # kbit/s and keyframe interval (frames) of the 1080p and low-res streams
 #HI_BITRATE=2000
 #HI_GOP=50

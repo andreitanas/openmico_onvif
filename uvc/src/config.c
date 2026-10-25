@@ -176,7 +176,8 @@ int config_load(struct config *c, const char *path) {
     discover(c);
     // The state file only ever records that adoption succeeded.
     parse_file(c, c->state_file, 0);
-    // Without Protect settings a capturing uvcd still feeds RTSP/ONVIF.
+    // Without Protect settings a capturing uvcd still owns the camera (and
+    // feeds RTSP if mirroring).
     const char *missing = protect_missing(c);
     c->protect = !missing;
     if (missing) {
