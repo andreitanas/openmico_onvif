@@ -20,6 +20,7 @@ static int max_w, max_h;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static struct motion_settings settings; // guarded by lock
 static int settings_changed;            // guarded by lock
+static int report = 1;                  // guarded by lock: Protect wants motion events
 static uint8_t *snap, *heat;            // guarded by lock: the last event's files
 static size_t snap_len, heat_len;
 static int snap_w = 1920, snap_h = 1080; // the full-resolution JPEG
@@ -27,6 +28,7 @@ static int snap_w = 1920, snap_h = 1080; // the full-resolution JPEG
 static struct motion motion; // detector thread only
 static uint32_t event_id;
 static int event_level;
+static int event_reported; // this event's start went to Protect
 
 #define NUM(o, k, v) cJSON_AddNumberToObject(o, k, v)
 #define STR(o, k, v) cJSON_AddStringToObject(o, k, v)
@@ -67,6 +69,13 @@ static cJSON *event_payload(const char *edge, int64_t start_ms) {
 }
 
 static void on_start(const struct motion_report *r) {
+    // With motion detection off in Protect, motion still gates smart
+    // detections but is not reported, as real cameras do.
+    pthread_mutex_lock(&lock);
+    event_reported = report;
+    pthread_mutex_unlock(&lock);
+    if (!event_reported)
+        return;
     uint8_t *jpeg;
     size_t len;
     if (capture_jpeg(&jpeg, &len) == 0) {
@@ -82,6 +91,8 @@ static void on_start(const struct motion_report *r) {
 }
 
 static void on_stop(const struct motion_report *r) {
+    if (!event_reported)
+        return;
     static uint8_t map[MOTION_GH][MOTION_GW];
     motion_heatmap(&motion, map);
     uint8_t *png;
@@ -182,10 +193,12 @@ void analytics_settings(const cJSON *p) {
             mz->y[i] = (int)cJSON_GetArrayItem(coord, 2 * i + 1)->valuedouble;
         }
     }
+    int enable = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(p, "enable"));
     log_info("motion settings: %d zone(s), start %d ms, stop %d ms, enable=%d", s.nzones,
-             s.start_ms, s.stop_ms, cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(p, "enable")));
+             s.start_ms, s.stop_ms, enable);
     pthread_mutex_lock(&lock);
     settings = s;
+    report = enable;
     settings_changed = 1;
     pthread_mutex_unlock(&lock);
 }
