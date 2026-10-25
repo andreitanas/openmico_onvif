@@ -2,6 +2,8 @@
 # make camera     static mipsel binary for the Wyze Cam v2 (Ingenic T20)
 # make test       host tests
 
+.DEFAULT_GOAL := all
+
 MBEDTLS := third_party/mbedtls
 CJSON := third_party/cjson
 INGENIC := third_party/ingenic

@@ -14,4 +14,8 @@ struct form_field {
 int https_post_file(const char *url, const struct form_field *fields, int nfields,
                     const char *filename, const uint8_t *data, size_t len);
 
+// The Date header of https://host:port/ as Unix ms, for a clock without NTP.
+// 0 on success.
+int https_date(const char *host, int port, int64_t *wall_ms);
+
 #endif

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "analytics.h"
@@ -13,6 +14,7 @@
 #include "board.h"
 #include "capture.h"
 #include "config.h"
+#include "https.h"
 #include "isp.h"
 #include "objects.h"
 #include "source.h"
@@ -45,6 +47,31 @@ static int healthy(void) {
         return 0;
     }
     return 1;
+}
+
+// Protect places video and events by our wall clock. The camera has no RTC
+// and boots in 1970 until NTP steps the clock. Without NTP (a camera network
+// with no internet access) take the time from Protect's web server.
+static void wait_for_clock(void) {
+    if (wall_ms() >= SANE_WALL_MS)
+        return;
+    log_info("waiting for the clock to be set (NTP)");
+    int64_t next_try = mono_ms() + 30000;
+    while (wall_ms() < SANE_WALL_MS) {
+        int64_t ms;
+        if (mono_ms() >= next_try) {
+            next_try = mono_ms() + 10000;
+            if (https_date(cfg.nvr, 443, &ms) == 0 && ms >= SANE_WALL_MS) {
+                struct timespec ts = {ms / 1000, 0};
+                if (clock_settime(CLOCK_REALTIME, &ts) == 0) {
+                    log_warn("no NTP; clock set from %s", cfg.nvr);
+                    return;
+                }
+            }
+        }
+        sleep_ms(500);
+    }
+    log_info("clock set");
 }
 
 static void usage(void) {
@@ -129,16 +156,9 @@ int main(int argc, char **argv) {
             sleep_ms(5000);
         log_info("uvcd: ip %s, Protect %s", cfg.ip, cfg.nvr);
     }
-    // Protect places video and events by our wall clock. The camera has no
-    // RTC and boots in 1970 until NTP steps the clock, so wait for that.
-    if (wall_ms() < SANE_WALL_MS) {
-        log_info("waiting for the clock to be set (NTP)");
-        while (wall_ms() < SANE_WALL_MS)
-            sleep_ms(500);
-        log_info("clock set");
-    }
     if (tls_init(cfg.cert) < 0)
         return 1;
+    wait_for_clock();
     avclient_run(&cfg, &hi, lop);
     return 0;
 }

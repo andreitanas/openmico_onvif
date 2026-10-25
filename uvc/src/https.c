@@ -1,8 +1,11 @@
+#define _GNU_SOURCE // strptime, timegm
 #include "https.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <time.h>
 
 #include "tls.h"
 #include "util.h"
@@ -85,4 +88,44 @@ int https_post_file(const char *url, const struct form_field *fields, int nfield
     }
     buf_free(&body);
     return status;
+}
+
+int https_date(const char *host, int port, int64_t *out) {
+    char req[256];
+    int n = snprintf(req, sizeof(req), "HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+                     host);
+    struct tls t;
+    if (n >= (int)sizeof(req) || tls_connect(&t, host, port, 5000) < 0)
+        return -1;
+    char resp[2048];
+    size_t got = 0;
+    if (tls_write_all(&t, req, n) == 0) {
+        int64_t deadline = mono_ms() + 5000;
+        while (got < sizeof(resp) - 1 && mono_ms() < deadline) {
+            int r = tls_read(&t, resp + got, sizeof(resp) - 1 - got, 1000);
+            if (r < 0)
+                break;
+            got += r;
+            resp[got] = 0;
+            if (strstr(resp, "\r\n\r\n"))
+                break;
+        }
+    }
+    tls_close(&t);
+    resp[got] = 0;
+    // Date: Sun, 25 Oct 2026 14:40:00 GMT
+    for (char *line = resp; line && *line; line = strstr(line, "\r\n") ? strstr(line, "\r\n") + 2 : NULL) {
+        if (strncasecmp(line, "Date:", 5))
+            continue;
+        struct tm tm;
+        memset(&tm, 0, sizeof(tm));
+        const char *v = line + 5;
+        while (*v == ' ')
+            v++;
+        if (!strptime(v, "%a, %d %b %Y %H:%M:%S", &tm))
+            return -1;
+        *out = (int64_t)timegm(&tm) * 1000;
+        return 0;
+    }
+    return -1;
 }
