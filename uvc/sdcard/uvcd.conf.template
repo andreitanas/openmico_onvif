@@ -15,10 +15,10 @@ STATE_FILE=/sdcard/uvc/uvcd.state
 # MAC/IP are read from wlan0. Protect identifies the camera by MAC.
 #IFACE=wlan0
 
-# H.264 from OpenMiko's videocapture (v4l2loopback). LO_SOURCE defaults to
-# HI_SOURCE until a second, low-resolution encoder is configured.
+# H.264 from OpenMiko's videocapture (v4l2loopback): HI_SOURCE (1080p) for video1,
+# LO_SOURCE (640x360, see videocapture_settings.json) for video2/video3.
 HI_SOURCE=/dev/video3
-#LO_SOURCE=/dev/video5
+LO_SOURCE=/dev/video5
 SNAPSHOT_SOURCE=/dev/video4
 FPS=25
 

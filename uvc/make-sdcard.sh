@@ -21,6 +21,8 @@ cp -R "$DEPLOY/config/overlay/." "$CARD/config/overlay/"
 cp ../app/onvif.py ../app/onvif_discover.py "$CARD/config/overlay/app/"
 cp ../etc/init.d/S66onvif "$CARD/config/overlay/etc/init.d/"
 cp sdcard/S90uvcd sdcard/S99probe "$CARD/config/overlay/etc/init.d/"
+# Adds a 640x360 H.264 encoder on /dev/video5 for Protect's video2/video3.
+cp sdcard/videocapture_settings.json "$CARD/config/overlay/etc/"
 
 # Single FAT32 partition: sdcard is p1, swap is a file on it. Log to the card
 # while bringing the camera up.
