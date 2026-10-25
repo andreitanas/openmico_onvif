@@ -5,7 +5,7 @@
     "flip_horizontal": 0,
     "timestamp_24h": 1,
     "timestamp_location": 0,
-    "show_timestamp": 1,
+    "show_timestamp": 0,
     "enable_audio": 1,
     "enable_logging": 0
   },
