@@ -9,18 +9,17 @@
 #include <stdlib.h>
 #include <sys/syscall.h>
 
-// Not from <unistd.h>: it declares the 64-bit off_t ftruncate defined below.
 long syscall(long, ...);
 
 // libimp was built with uClibc's 32-bit off_t; musl's off_t is always 64-bit
-// (time_t functions keep 32-bit compat symbols in musl, these do not). Calls
-// compiled against the 32-bit prototypes land here instead of musl's.
-// Nothing else in the binary may call mmap/ftruncate with a 64-bit offset.
-void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off) {
+// (time_t functions keep 32-bit compat symbols in musl, these do not).
+// tools/imp-rename.py points libimp's mmap/ftruncate calls here; musl's own
+// callers (sem_open, which libimp uses) keep the real ones.
+void *mm32(void *addr, size_t len, int prot, int flags, int fd, long off) {
     return (void *)syscall(SYS_mmap2, addr, len, prot, flags, fd, (unsigned long)off >> 12);
 }
 
-int ftruncate(int fd, long len) { return syscall(SYS_ftruncate, fd, len); }
+int ftrunc32(int fd, long len) { return syscall(SYS_ftruncate, fd, len); }
 
 // libalog: libimp's logging backend. Levels from imp_log.h: 4 info, 5 warn,
 // 6 error, 7 fatal.

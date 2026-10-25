@@ -16,7 +16,9 @@
 
 static void defaults(struct config *c) {
     memset(c, 0, sizeof(*c));
-    SET(cert, "/etc/uvcd/client.pem");
+    // The camera image keeps settings in the config flash partition and
+    // uvcd with its model in the read-only root partition (see image/).
+    SET(cert, "/config/uvc/client.pem");
     SET(iface, "wlan0");
     // UVC G5 Pro: an identity known to adopt with smart detections on
     // Protect 7.x. FW_VERSION should match the newest firmware Protect's
@@ -28,9 +30,10 @@ static void defaults(struct config *c) {
     SET(fw_build, "92ebf37.260724.1639");
     SET(hi_source, "/dev/video3");
     SET(snapshot, "/dev/video4");
-    SET(state_file, "/config/uvcd.state");
+    SET(state_file, "/config/uvc/uvcd.state");
     SET(night_file, "/tmp/night_vision_enabled");
-    SET(detect_model, "/sdcard/uvc/models/yolo-fastest-1.1");
+    SET(detect_model, "/rom/uvc/models/yolo-fastest-1.1");
+    c->capture = 1;
     c->hi_kbps = 2000;
     c->lo_kbps = 300;
     c->hi_gop = 50;
@@ -72,6 +75,7 @@ static void set_key(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "LO_SOURCE")) SET(lo_source, v);
     else if (!strcmp(k, "SNAPSHOT_SOURCE")) SET(snapshot, v);
     else if (!strcmp(k, "STATE_FILE")) SET(state_file, v);
+    else if (!strcmp(k, "LOG_FILE")) SET(log_file, v);
     else if (!strcmp(k, "CAPTURE")) c->capture = atoi(v);
     else if (!strcmp(k, "HI_MIRROR")) SET(hi_mirror, v);
     else if (!strcmp(k, "LO_MIRROR")) SET(lo_mirror, v);

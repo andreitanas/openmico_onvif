@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,37 @@
 #include <unistd.h>
 
 int log_level = LOG_INFO;
+
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *log_fp; // guarded by log_lock; NULL: stderr
+static char log_path[128];
+static long log_max;
+
+void log_open(const char *path, long max_bytes) {
+    pthread_mutex_lock(&log_lock);
+    snprintf(log_path, sizeof(log_path), "%s", path);
+    log_max = max_bytes;
+    log_fp = fopen(path, "a");
+    pthread_mutex_unlock(&log_lock);
+    if (!log_fp)
+        log_warn("cannot open log file %s: %s", path, strerror(errno));
+}
+
+// Keeps the log file and one older copy, each at most log_max bytes.
+static void log_write(const char *line) {
+    pthread_mutex_lock(&log_lock);
+    if (log_fp && ftell(log_fp) > log_max) {
+        char old[sizeof(log_path) + 2];
+        snprintf(old, sizeof(old), "%s.1", log_path);
+        fclose(log_fp);
+        rename(log_path, old);
+        log_fp = fopen(log_path, "a");
+    }
+    FILE *fp = log_fp ? log_fp : stderr;
+    fprintf(fp, "%s\n", line);
+    fflush(fp);
+    pthread_mutex_unlock(&log_lock);
+}
 
 void log_msg(int level, const char *fmt, ...) {
     static const char *names[] = {"E", "W", "I", "D"};
@@ -29,7 +61,7 @@ void log_msg(int level, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(line + n, sizeof(line) - n, fmt, ap);
     va_end(ap);
-    fprintf(stderr, "%s\n", line);
+    log_write(line);
 }
 
 int64_t mono_ms(void) {

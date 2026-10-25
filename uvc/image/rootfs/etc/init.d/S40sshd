@@ -1,0 +1,15 @@
+#!/bin/sh
+# dropbear with a host key kept in the config flash.
+KEY=/config/overlay/etc/dropbear/dropbear_ecdsa_host_key
+case "$1" in
+start)
+	# /etc/dropbear links to a missing /var/run/dropbear in the base image.
+	rm -f /etc/dropbear
+	mkdir -p /config/overlay/etc/dropbear /etc/dropbear
+	[ -f $KEY ] || dropbearkey -t ecdsa -f $KEY
+	dropbear -r $KEY -R
+	;;
+stop)
+	killall dropbear 2>/dev/null
+	;;
+esac

@@ -1,0 +1,36 @@
+#!/bin/sh
+# Settings live in the config flash partition (/config); uvcd and its model
+# in the read-only root partition (/rom). The SD card is optional: files
+# under /sdcard/config/ are imported into /config/ when they differ, and
+# /config/overlay/ is copied over the root filesystem (wifi, hostname,
+# passwd, ssh keys).
+case "$1" in
+start)
+	mkdir -p /config /rom /sdcard
+	mount -t jffs2 /dev/mtdblock3 /config || logger -s -t config "cannot mount /config"
+	mount -t jffs2 -o ro /dev/mtdblock2 /rom || logger -s -t config "cannot mount /rom"
+
+	if [ -b /dev/mmcblk0p1 ] && mount -t vfat -o rw,noatime,umask=0000 /dev/mmcblk0p1 /sdcard; then
+		if [ -d /sdcard/config ]; then
+			find /sdcard/config -type f | while read -r f; do
+				t=/config${f#/sdcard/config}
+				if ! cmp -s "$f" "$t"; then
+					mkdir -p "${t%/*}"
+					cp "$f" "$t"
+					logger -s -t config "imported $t"
+				fi
+			done
+		fi
+	fi
+
+	if [ -d /config/overlay ]; then
+		find /config/overlay -type f | while read -r f; do
+			install -D "$f" "${f#/config/overlay}"
+		done
+	fi
+	hostname -F /etc/hostname
+	;;
+stop)
+	sync
+	;;
+esac

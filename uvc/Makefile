@@ -76,8 +76,13 @@ build/uvcd: $(HOST_OBJ) $(NCNN_HOST)
 
 camera: build/uvcd-mipsel
 
-build/uvcd-mipsel: $(CAMERA_OBJ) $(NCNN_CAMERA)
-	$(CAMERA_CXX) -static -s -Wl,--gc-sections -o $@ $^ $(INGENIC)/lib/libimp.a -lpthread -lm
+# libimp with its mmap/ftruncate calls pointed at our 32-bit-offset shims.
+build/camera/libimp.a: $(INGENIC)/lib/libimp.a tools/imp-rename.py
+	@mkdir -p $(dir $@)
+	python3 tools/imp-rename.py $< $@
+
+build/uvcd-mipsel: $(CAMERA_OBJ) $(NCNN_CAMERA) build/camera/libimp.a
+	$(CAMERA_CXX) -static -s -Wl,--gc-sections -o $@ $^ -lpthread -lm
 	@ls -l $@
 
 build/test_flv: build/host/test/test_flv.o $(LIB_HOST_OBJ) $(NCNN_HOST)

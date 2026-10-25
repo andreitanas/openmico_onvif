@@ -1,0 +1,10 @@
+#!/bin/sh
+# No RTC: the clock starts in 1970 until ntpd steps it (uvcd waits for that).
+case "$1" in
+start)
+	ntpd -p time.google.com -p pool.ntp.org
+	;;
+stop)
+	killall ntpd 2>/dev/null
+	;;
+esac

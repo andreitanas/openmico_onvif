@@ -1,0 +1,19 @@
+#!/bin/sh
+# Logging (bounded, in RAM), device nodes, loopback.
+case "$1" in
+start)
+	syslogd -s 100 -b 1
+	klogd
+	echo /sbin/mdev > /proc/sys/kernel/hotplug
+	mdev -s
+	ifconfig lo 127.0.0.1 up
+	# Yellow until uvcd is connected to Protect.
+	echo none > /sys/class/leds/led_blue/trigger
+	echo none > /sys/class/leds/led_yellow/trigger
+	echo 0 > /sys/class/leds/led_blue/brightness
+	echo 1 > /sys/class/leds/led_yellow/brightness
+	;;
+stop)
+	killall klogd syslogd 2>/dev/null
+	;;
+esac

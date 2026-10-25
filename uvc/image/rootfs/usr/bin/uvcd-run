@@ -1,0 +1,9 @@
+#!/bin/sh
+# Started (and restarted) by init. A uvcd on the SD card overrides the one in
+# flash, for development.
+BIN=/rom/uvc/uvcd
+[ -x /sdcard/uvc/uvcd ] && BIN=/sdcard/uvc/uvcd
+logger -t uvcd-run "starting $BIN"
+"$BIN" -c /config/uvc/uvcd.conf
+logger -t uvcd-run "$BIN exited with $?, restarting in 5 s"
+sleep 5

@@ -18,9 +18,10 @@
 #include "util.h"
 
 #define READY_FILE "/var/run/uvcd.ready"
+#define SANE_WALL_MS 1704067200000LL // 2024-01-01
 
 static void usage(void) {
-    fprintf(stderr, "usage: uvcd [-c /etc/uvcd.conf] [-v]\n");
+    fprintf(stderr, "usage: uvcd [-c /config/uvc/uvcd.conf] [-v]\n");
     exit(2);
 }
 
@@ -38,7 +39,7 @@ static void *signal_main(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    const char *conf = "/etc/uvcd.conf";
+    const char *conf = "/config/uvc/uvcd.conf";
     int verbose = 0, opt;
     while ((opt = getopt(argc, argv, "c:vh")) != -1) {
         if (opt == 'c')
@@ -55,6 +56,8 @@ int main(int argc, char **argv) {
         return 1;
     if (verbose)
         log_level = LOG_DEBUG;
+    if (*cfg.log_file)
+        log_open(cfg.log_file, 256 * 1024);
     log_info("uvcd: %s mac %s ip %s, Protect %s", cfg.name, cfg.mac, cfg.ip, cfg.nvr);
 
     static sigset_t stop_set;
@@ -98,6 +101,14 @@ int main(int argc, char **argv) {
         while (!config_refresh(&cfg))
             sleep_ms(5000);
         log_info("uvcd: ip %s, Protect %s", cfg.ip, cfg.nvr);
+    }
+    // Protect places video and events by our wall clock. The camera has no
+    // RTC and boots in 1970 until NTP steps the clock, so wait for that.
+    if (wall_ms() < SANE_WALL_MS) {
+        log_info("waiting for the clock to be set (NTP)");
+        while (wall_ms() < SANE_WALL_MS)
+            sleep_ms(500);
+        log_info("clock set");
     }
     if (tls_init(cfg.cert) < 0)
         return 1;

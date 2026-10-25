@@ -1,0 +1,12 @@
+#!/bin/sh
+# Shutdown: stop uvcd first so it can say goodbye to Protect and release
+# the camera, then the rest in reverse order.
+killall uvcd 2>/dev/null
+i=0
+while pidof uvcd > /dev/null && [ $i -lt 5 ]; do
+	sleep 1
+	i=$((i + 1))
+done
+for s in $(ls -r /etc/init.d/S??*); do
+	[ -x "$s" ] && "$s" stop
+done

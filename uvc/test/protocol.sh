@@ -27,6 +27,7 @@ IP=127.0.0.1
 HI_SOURCE=$T/clip.h264
 SNAPSHOT_SOURCE=$T/snap.jpg
 STATE_FILE=$T/uvcd.state
+CAPTURE=0
 EOF
 rm -f $T/uvcd.state $T/video1.flv
 

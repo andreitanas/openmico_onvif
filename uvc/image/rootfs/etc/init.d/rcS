@@ -1,0 +1,5 @@
+#!/bin/sh
+# Boot: run /etc/init.d/S??* in order.
+for s in /etc/init.d/S??*; do
+	[ -x "$s" ] && "$s" start
+done

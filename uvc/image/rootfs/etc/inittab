@@ -1,0 +1,13 @@
+# uvcd camera image (busybox init)
+::sysinit:/bin/mkdir -p /dev/pts /dev/shm
+::sysinit:/bin/mount -a
+::sysinit:/etc/init.d/rcS
+
+# The camera daemon; uvcd-run pauses between restarts.
+::respawn:/usr/bin/uvcd-run
+
+# Shell on the serial console
+::askfirst:-/bin/sh
+
+::shutdown:/etc/init.d/rcK
+::shutdown:/bin/umount -a -r
