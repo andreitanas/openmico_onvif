@@ -21,6 +21,7 @@ static struct motion_settings settings; // guarded by lock
 static int settings_changed;            // guarded by lock
 static uint8_t *snap, *heat;            // guarded by lock: the last event's files
 static size_t snap_len, heat_len;
+static int snap_w = 1920, snap_h = 1080; // the full-resolution JPEG
 
 static struct motion motion; // detector thread only
 static uint32_t event_id;
@@ -29,10 +30,11 @@ static int event_level;
 #define NUM(o, k, v) cJSON_AddNumberToObject(o, k, v)
 #define STR(o, k, v) cJSON_AddStringToObject(o, k, v)
 
-// Protect's EventAnalytics, as real cameras send it (field set traced by
-// btsubjectdata/reolink-unifi-protect on Protect 7.x). Protect places the
-// event by clockBestWall; the motion's start is backdated to its first
-// frame, which was start_ms on the monotonic clock.
+// EventSmartMotion, the motion event of Gen5 cameras. Protect 7.3's device
+// service (ds) parses it into CameraMotionEventPayload and drops anything
+// else (older cameras' EventAnalytics included); field names are from its
+// binary. Protect places the event by clockBestWall; the motion's start is
+// backdated to its first frame, which was start_ms on the monotonic clock.
 static cJSON *event_payload(const char *edge, int64_t start_ms) {
     int64_t now = mono_ms(), wall = wall_ms();
     cJSON *p = cJSON_CreateObject();
@@ -49,7 +51,17 @@ static cJSON *event_payload(const char *edge, int64_t start_ms) {
     NUM(levels, "0", event_level);
     int stop = !strcmp(edge, "stop");
     STR(p, "motionHeatmap", stop ? HEATMAP_NAME : "");
-    STR(p, "motionSnapshot", stop ? SNAPSHOT_NAME : "");
+    NUM(p, "motionHeatmapWidth", stop ? MOTION_GW : 0);
+    NUM(p, "motionHeatmapHeight", stop ? MOTION_GH : 0);
+    pthread_mutex_lock(&lock);
+    int have_snap = stop && snap;
+    pthread_mutex_unlock(&lock);
+    STR(p, "motionSnapshot", have_snap ? SNAPSHOT_NAME : "");
+    NUM(p, "motionSnapshotWidth", have_snap ? snap_w : 0);
+    NUM(p, "motionSnapshotHeight", have_snap ? snap_h : 0);
+    STR(p, "motionSnapshotFullFoV", have_snap ? SNAPSHOT_NAME : "");
+    NUM(p, "motionSnapshotFullFoVWidth", have_snap ? snap_w : 0);
+    NUM(p, "motionSnapshotFullFoVHeight", have_snap ? snap_h : 0);
     return p;
 }
 
@@ -65,7 +77,7 @@ static void on_start(const struct motion_report *r) {
     }
     log_info("motion %u started (level %d, box %d,%d %dx%d)", event_id, r->level, r->box[0],
              r->box[1], r->box[2], r->box[3]);
-    send_event("EventAnalytics", event_payload("start", r->start_ms));
+    send_event("EventSmartMotion", event_payload("start", r->start_ms));
 }
 
 static void on_stop(const struct motion_report *r) {
@@ -81,7 +93,7 @@ static void on_stop(const struct motion_report *r) {
         pthread_mutex_unlock(&lock);
     }
     log_info("motion %u stopped after %.1f s", event_id, (mono_ms() - r->start_ms) / 1000.0);
-    send_event("EventAnalytics", event_payload("stop", r->start_ms));
+    send_event("EventSmartMotion", event_payload("stop", r->start_ms));
     event_id++;
 }
 

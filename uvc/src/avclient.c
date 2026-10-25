@@ -151,6 +151,36 @@ static cJSON *feature_flags(void) {
     BOOL(f, "hasMotionZones", 1);
     BOOL(f, "hasPrivacyMask", 0);
     BOOL(f, "isPtz", 0);
+    // Protect stores these as null unless advertised, and ds (Protect 7.3's
+    // device service) then fails to deserialize the camera's featureFlags
+    // when handling its events (hotplug is a required struct). Shapes and
+    // defaults as a real G4 Instant reports them.
+    NUM(f, "maxScaleDownLevel", 0);
+    cJSON *res = cJSON_AddArrayToObject(f, "downScaleResolutions");
+    static const int full_hd[] = {1920, 1080};
+    cJSON_AddItemToArray(res, cJSON_CreateIntArray(full_hd, 2));
+    cJSON *ex = OBJ(f, "excludeZones");
+    NUM(ex, "maxZones", 16);
+    BOOL(ex, "rectangleOnly", 1);
+    cJSON_AddItemToObject(f, "videoInputModes", cJSON_CreateArray());
+    cJSON *st = OBJ(f, "storage");
+    NUM(st, "sdSlotCount", 0);
+    NUM(st, "ssdSlotCount", 0);
+    NUM(f, "videoDeviceCount", 1);
+    cJSON *hp = OBJ(f, "hotplug");
+    cJSON_AddNullToObject(hp, "audio");
+    cJSON_AddNullToObject(hp, "video");
+    BOOL(hp, "standaloneAdoption", 0);
+    BOOL(hp, "sdCardAttached", 0);
+    cJSON *ext = OBJ(hp, "extender");
+    BOOL(ext, "isAttached", 0);
+    BOOL(ext, "hasFlash", 0);
+    cJSON_AddNullToObject(ext, "flashRange");
+    BOOL(ext, "hasIR", 0);
+    BOOL(ext, "hasRadar", 0);
+    cJSON_AddNullToObject(ext, "radarRangeMax");
+    cJSON_AddNullToObject(ext, "radarRangeMin");
+    BOOL(ext, "hasBuzzer", 0);
     return f;
 }
 
