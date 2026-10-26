@@ -18,6 +18,7 @@ struct config {
     char platform[32];
     char fw_version[32];
     char fw_build[64];
+    char fw_updated[32]; // version taken from Protect's firmware update (state file), or ""
     char hi_source[128]; // H.264 for video1
     char lo_source[128]; // H.264 for video2/video3 (may equal hi_source)
     char snapshot[128];  // JPEG device or file

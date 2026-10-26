@@ -22,8 +22,8 @@ static void defaults(struct config *c) {
     SET(iface, "wlan0");
     c->nvr_port = 7442;
     // UVC G5 Pro: an identity known to adopt with smart detections on
-    // Protect 7.x. FW_VERSION should match the newest firmware Protect's
-    // catalog has for this platform, or Protect nags/forces updates.
+    // Protect 7.x. Protect's firmware updates move FW_VERSION on
+    // (UPDATED_FW_VERSION in the state file, see avclient.c).
     SET(model, "UVC G5 Pro");
     SET(sysid, "0xa598");
     SET(platform, "sav837gw");
@@ -79,6 +79,10 @@ static void set_key(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "PLATFORM")) SET(platform, v);
     else if (!strcmp(k, "FW_VERSION")) SET(fw_version, v);
     else if (!strcmp(k, "FW_BUILD")) SET(fw_build, v);
+    else if (!strcmp(k, "UPDATED_FW_VERSION") && *v) {
+        SET(fw_updated, v);
+        SET(fw_version, v);
+    }
     else if (!strcmp(k, "HI_SOURCE")) SET(hi_source, v);
     else if (!strcmp(k, "LO_SOURCE")) SET(lo_source, v);
     else if (!strcmp(k, "SNAPSHOT_SOURCE")) SET(snapshot, v);
@@ -222,8 +226,10 @@ int config_save_state(const struct config *c) {
         log_warn("cannot write %s", tmp);
         return -1;
     }
-    fprintf(fp, "ADOPTED=%d\nNVR_HOST=%s\nNVR_PORT=%d\nADOPTION_TOKEN=%s\nPASSWORD_HASH=%s\n",
-            c->adopted, c->nvr, c->nvr_port, c->token, c->password_hash);
+    fprintf(fp,
+            "ADOPTED=%d\nNVR_HOST=%s\nNVR_PORT=%d\nADOPTION_TOKEN=%s\nPASSWORD_HASH=%s\n"
+            "UPDATED_FW_VERSION=%s\n",
+            c->adopted, c->nvr, c->nvr_port, c->token, c->password_hash, c->fw_updated);
     fflush(fp);
     fsync(fileno(fp));
     fclose(fp);

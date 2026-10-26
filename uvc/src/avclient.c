@@ -34,6 +34,7 @@ static pthread_cond_t stop_cond = PTHREAD_COND_INITIALIZER;
 static volatile int stopping;
 static int stopped; // guarded by stop_lock
 static int64_t start_ms;
+static int64_t reboot_until; // a firmware update's pretend reboot
 static char guid[40];
 
 static struct stream streams[3] = {
@@ -41,6 +42,9 @@ static struct stream streams[3] = {
     {.channel = "video2"},
     {.channel = "video3"},
 };
+
+// Offline after a firmware update, like a camera flashing and rebooting.
+#define FAKE_REBOOT_MS 45000
 
 // --- JSON helpers -------------------------------------------------------
 
@@ -476,6 +480,29 @@ static void get_request(cJSON *payload) {
     pthread_attr_destroy(&attr);
 }
 
+// UpdateFirmwareRequest: there is no firmware to install, so take the
+// version from the download URI
+//   https://<nvr>:<port>/internal/update/<platform>/<product>/<type>/<version>/<mac>
+// and come back from a pretend reboot reporting it, as a real camera does
+// after flashing. 1 if accepted.
+static int update_firmware(cJSON *payload) {
+    const char *uri = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "uri"));
+    const char *p = uri ? strstr(uri, "/internal/update/") : NULL;
+    char seg[3][64], version[32];
+    if (!p || sscanf(p, "/internal/update/%63[^/]/%63[^/]/%63[^/]/%31[^/]/", seg[0], seg[1],
+                     seg[2], version) != 4 ||
+        strspn(version, "0123456789.") != strlen(version)) {
+        log_warn("firmware update without a version in its URI, ignored");
+        return 0;
+    }
+    log_info("firmware update %s -> %s: nothing to install, reporting %s from now on",
+             cfg->fw_version, version, version);
+    snprintf(cfg->fw_version, sizeof(cfg->fw_version), "%s", version);
+    snprintf(cfg->fw_updated, sizeof(cfg->fw_updated), "%s", version);
+    config_save_state(cfg);
+    return 1;
+}
+
 // Returns 1 when the connection should be dropped and re-established.
 static int handle(const char *text) {
     cJSON *m = cJSON_Parse(text);
@@ -545,9 +572,11 @@ static int handle(const char *text) {
         res_fn = "GetRequest";
         res = cJSON_CreateObject();
     } else if (!strcmp(fn, "UpdateFirmwareRequest")) {
-        log_warn("Protect wants a firmware update; set FW_VERSION/FW_BUILD to the newest "
-                 "version Protect knows for platform %s", cfg->platform);
-        respond = 0;
+        if (update_firmware(payload)) {
+            reboot_until = mono_ms() + FAKE_REBOOT_MS;
+            reconnect = 1;
+        }
+        res = cJSON_CreateObject();
     } else if (!strcmp(fn, "UpdateUsernamePassword")) {
         // Sent at every connection; the password lets Protect re-adopt the
         // camera later (manage.h).
@@ -671,6 +700,10 @@ void avclient_run(struct config *c, struct source *hi, struct source *lo) {
         // reset there is none until then.
         if (manage_take(cfg))
             backoff = 1;
+        if (mono_ms() < reboot_until) {
+            sleep_ms(reboot_until - mono_ms());
+            start_ms = mono_ms(); // uptime as after a reboot
+        }
         int64_t t0 = mono_ms();
         int waiting = !config_refresh(cfg);
         if (!waiting)

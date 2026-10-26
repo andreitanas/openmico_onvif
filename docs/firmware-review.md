@@ -275,6 +275,12 @@ Done; the camera runs it:
     Protect with the password Protect set over `UpdateUsernamePassword` (a
     SHA-512 crypt hash), as Protect does when it re-adopts a camera that
     stays disconnected.
+- **Firmware updates** from Protect are accepted without installing
+  anything: `UpdateFirmwareRequest` names the version in its download URI
+  (`/internal/update/<platform>/<product>/<type>/<version>/<mac>`); uvcd
+  keeps it (`UPDATED_FW_VERSION` in `uvcd.state`), goes offline for 45 s as
+  if flashing, and reconnects reporting it. Protect then records the update
+  as done, so `FW_VERSION` needs no upkeep. Tested from 5.5.30 to 5.5.31.
 - **Leftovers**: the SD card was cleaned (stock Wyze recordings, OTA files,
   bench files, swapfile). The old OpenMiko init scripts were removed from
   the config flash.
