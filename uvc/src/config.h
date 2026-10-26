@@ -3,12 +3,15 @@
 
 struct config {
     char nvr[64];       // Protect host
-    char token[128];    // adoption token (manage-payload), only needed until adopted
+    int nvr_port;       // its camera port (wss)
+    char token[128];    // adoption token (manage-payload, or sent by Protect's adopt request)
+    char password_hash[128]; // crypt(3) hash of the password Protect set (UpdateUsernamePassword)
     char cert[128];     // client PEM (key + certificate)
     char name[64];      // camera name shown in Protect
     char iface[16];     // network interface for MAC/IP discovery
     char mac[32];       // normalized to 12 uppercase hex digits
     char ip[16];
+    char device_id[40]; // stable UUID from the MAC
     // Identity of the UniFi model we present as (see PROTOCOL notes).
     char model[32];
     char sysid[16];
@@ -39,7 +42,13 @@ struct config {
 };
 
 int config_load(struct config *c, const char *path);
-int config_save_adopted(const struct config *c);
+// The state file records adoption (ADOPTED) and the Protect host and token
+// it came with; it overrides uvcd.conf.
+int config_save_state(const struct config *c);
+// Protect's adopt request (manage.h): a new host and token, not adopted yet.
+void config_manage(struct config *c, const char *host, int port, const char *token);
+// Protect removed the camera: forget it and wait to be adopted again.
+void config_reset(struct config *c);
 // Retry MAC/IP discovery (at boot wlan0 may not have an address before the
 // camera starts). Returns c->protect.
 int config_refresh(struct config *c);

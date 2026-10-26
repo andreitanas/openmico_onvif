@@ -40,4 +40,9 @@ void base64_encode(const uint8_t *in, size_t len, char *out);
 int write_all(int fd, const void *data, size_t len);
 int tcp_connect(const char *host, int port, int timeout_ms);
 
+// RFC 4122 UUIDs as 36 characters plus NUL: v5 (DNS namespace) of name, and
+// random v4.
+void uuid5(const char *name, char *out);
+void uuid4(char *out);
+
 #endif

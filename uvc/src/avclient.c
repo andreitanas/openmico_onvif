@@ -13,7 +13,7 @@
 #include "capture.h"
 #include "https.h"
 #include "isp.h"
-#include "mbedtls/sha1.h"
+#include "manage.h"
 #include "objects.h"
 #include "stream.h"
 #include "util.h"
@@ -34,7 +34,7 @@ static pthread_cond_t stop_cond = PTHREAD_COND_INITIALIZER;
 static volatile int stopping;
 static int stopped; // guarded by stop_lock
 static int64_t start_ms;
-static char device_id[40], guid[40];
+static char guid[40];
 
 static struct stream streams[3] = {
     {.channel = "video1"},
@@ -98,41 +98,6 @@ void avclient_event(const char *fn, cJSON *payload) { send_msg(fn, 0, payload); 
 static double uptime_s(void) { return (mono_ms() - start_ms) / 1000.0; }
 
 // --- identity -----------------------------------------------------------
-
-static void uuid_format(const uint8_t *b, char *out) {
-    snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12],
-             b[13], b[14], b[15]);
-}
-
-// RFC 4122 v5 UUID in the DNS namespace: a stable device-id per MAC.
-static void uuid5(const char *name, char *out) {
-    static const uint8_t ns_dns[16] = {0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
-                                       0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8};
-    uint8_t in[16 + 64], hash[20];
-    size_t n = strlen(name);
-    if (n > 64)
-        n = 64;
-    memcpy(in, ns_dns, 16);
-    memcpy(in + 16, name, n);
-    mbedtls_sha1(in, 16 + n, hash);
-    hash[6] = (hash[6] & 0x0f) | 0x50;
-    hash[8] = (hash[8] & 0x3f) | 0x80;
-    uuid_format(hash, out);
-}
-
-static void uuid4(char *out) {
-    uint8_t b[16];
-    FILE *fp = fopen("/dev/urandom", "rb");
-    if (!fp || fread(b, 1, 16, fp) != 16)
-        for (int i = 0; i < 16; i++)
-            b[i] = rand();
-    if (fp)
-        fclose(fp);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    uuid_format(b, out);
-}
 
 static cJSON *feature_flags(void) {
     static const char *const smart[] = {"person", "vehicle", "animal"};
@@ -210,7 +175,7 @@ static void send_hello(void) {
     cJSON *p = cJSON_CreateObject();
     STR(p, "adoptionCode", cfg->token);
     STR(p, "connectionHost", cfg->nvr);
-    NUM(p, "connectionSecurePort", 7442);
+    NUM(p, "connectionSecurePort", cfg->nvr_port);
     STR(p, "fwVersion", cfg->fw_version);
     NUM(p, "hwrev", 19);
     NUM(p, "idleTime", 191.96);
@@ -436,7 +401,7 @@ static void change_video_settings(cJSON *payload) {
         if (!cfg->adopted) {
             // Protect only asks a managed camera for video: adoption worked.
             cfg->adopted = 1;
-            config_save_adopted(cfg);
+            config_save_state(cfg);
             log_info("adopted by %s", cfg->nvr);
         }
     }
@@ -583,6 +548,22 @@ static int handle(const char *text) {
         log_warn("Protect wants a firmware update; set FW_VERSION/FW_BUILD to the newest "
                  "version Protect knows for platform %s", cfg->platform);
         respond = 0;
+    } else if (!strcmp(fn, "UpdateUsernamePassword")) {
+        // Sent at every connection; the password lets Protect re-adopt the
+        // camera later (manage.h).
+        const char *hash = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "hashedPassword"));
+        if (hash && strlen(hash) < sizeof(cfg->password_hash) && strcmp(hash, cfg->password_hash)) {
+            snprintf(cfg->password_hash, sizeof(cfg->password_hash), "%s", hash);
+            config_save_state(cfg);
+        }
+        res = cJSON_CreateObject();
+    } else if (!strcmp(fn, "ResetToDefaults")) {
+        // Protect removed the camera: it becomes adoptable again (discovery,
+        // manage) and its old token is void.
+        log_info("removed from Protect");
+        config_reset(cfg);
+        res = cJSON_CreateObject();
+        reconnect = 1;
     } else if (!strcmp(fn, "Reboot")) {
         if (cfg->allow_reboot) {
             log_info("reboot requested by Protect");
@@ -634,10 +615,11 @@ static void session(void) {
     snprintf(headers, sizeof(headers),
              "camera-mac: %s\r\ncamera-model: 0x%04lx\r\ncamera-ip: %s\r\n"
              "camera-firmware: %s\r\ndevice-id: %s\r\nx-guid: %s\r\n",
-             cfg->mac, strtol(cfg->sysid, NULL, 0), cfg->ip, cfg->fw_version, device_id, guid);
+             cfg->mac, strtol(cfg->sysid, NULL, 0), cfg->ip, cfg->fw_version, cfg->device_id, guid);
 
-    log_info("connecting to wss://%s:7442 (%s)", cfg->nvr, cfg->adopted ? "adopted" : "adopting");
-    if (ws_connect(&ws, cfg->nvr, 7442, path, headers) < 0)
+    log_info("connecting to wss://%s:%d (%s)", cfg->nvr, cfg->nvr_port,
+             cfg->adopted ? "adopted" : "adopting");
+    if (ws_connect(&ws, cfg->nvr, cfg->nvr_port, path, headers) < 0)
         return;
     log_info("connected");
     pthread_mutex_lock(&send_lock);
@@ -650,7 +632,7 @@ static void session(void) {
         const char *text;
         size_t len;
         int r = ws_recv(&ws, &text, &len, 1000);
-        if (r < 0 || stopping)
+        if (r < 0 || stopping || manage_pending())
             break;
         if (r > 0 && handle(text))
             break;
@@ -676,9 +658,6 @@ void avclient_run(struct config *c, struct source *hi, struct source *lo) {
     hi_src = hi;
     lo_src = lo;
     start_ms = mono_ms();
-    char name[64];
-    snprintf(name, sizeof(name), "uvcd-%s", cfg->mac);
-    uuid5(name, device_id);
     uuid4(guid);
     for (int i = 0; i < 3; i++) {
         streams[i].src = i == 0 ? hi : lo;
@@ -688,8 +667,14 @@ void avclient_run(struct config *c, struct source *hi, struct source *lo) {
 
     int backoff = 1;
     for (;;) {
+        // Protect's adopt request brings a new host and token; after a
+        // reset there is none until then.
+        if (manage_take(cfg))
+            backoff = 1;
         int64_t t0 = mono_ms();
-        session();
+        int waiting = !config_refresh(cfg);
+        if (!waiting)
+            session();
         if (stopping) {
             pthread_mutex_lock(&stop_lock);
             stopped = 1;
@@ -697,6 +682,10 @@ void avclient_run(struct config *c, struct source *hi, struct source *lo) {
             pthread_mutex_unlock(&stop_lock);
             for (;;)
                 pause();
+        }
+        if (waiting || manage_pending()) {
+            sleep_ms(waiting ? 1000 : 0);
+            continue;
         }
         if (mono_ms() - t0 > 60000)
             backoff = 1;

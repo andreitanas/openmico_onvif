@@ -2,12 +2,15 @@
 # imported from config/uvc/uvcd.conf on the SD card at boot when the card's
 # copy differs.
 
-# UniFi Protect host
-NVR_HOST=@NVR_HOST@
-# One-time adoption token, valid ~60 minutes. While logged in to Protect, open
+# Protect finds the camera on the network and lists it as ready to adopt;
+# adopting it there sends the camera Protect's host and a token, kept in
+# /config/uvc/uvcd.state. Only to adopt without that (a camera on another
+# subnet, where discovery doesn't reach): the Protect host, and a one-time
+# token, valid ~60 minutes, from "mgmt.token" of
 #   https://<NVR_HOST>/proxy/protect/api/cameras/manage-payload
-# and copy "mgmt.token". Not needed once adopted (/config/uvc/uvcd.state).
-ADOPTION_TOKEN=
+# opened while logged in to Protect.
+#NVR_HOST=
+#ADOPTION_TOKEN=
 
 # Name shown in Protect before it is renamed there (default: hostname)
 #NAME=Wyze Cam

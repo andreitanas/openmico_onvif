@@ -7,13 +7,13 @@
 #                       ../deploy.sh), copied over the root filesystem at boot
 #   config/uvc/         uvcd.conf and a per-camera client certificate
 # The camera imports config/ into its config flash at every boot when the
-# card's copy differs; the card is optional after that.
+# card's copy differs; the card is optional after that. It then shows up in
+# Protect, ready to adopt.
 #
-# Usage: ./make-sdcard.sh /Volumes/CARD [nvr-host]
+# Usage: ./make-sdcard.sh /Volumes/CARD
 set -e
 cd "$(dirname "$0")"
-CARD=${1:?usage: $0 /Volumes/CARD [nvr-host]}
-NVR=${2:-192.168.1.1}
+CARD=${1:?usage: $0 /Volumes/CARD}
 DEPLOY=../deploy
 
 [ -d "$CARD" ] || { echo "$CARD is not mounted"; exit 1; }
@@ -27,7 +27,7 @@ rm -f "$CARD/config/overlay/etc/openmiko.conf"
 cp build/image/demo.bin "$CARD/demo.bin"
 
 if [ ! -f "$CARD/config/uvc/uvcd.conf" ]; then
-    sed "s|@NVR_HOST@|$NVR|" image/uvcd.conf.template > "$CARD/config/uvc/uvcd.conf"
+    cp image/uvcd.conf.template "$CARD/config/uvc/uvcd.conf"
 fi
 if [ ! -f "$CARD/config/uvc/client.pem" ]; then
     # Per-camera client certificate, the shape real UniFi cameras present.
@@ -44,5 +44,5 @@ fi
 find "$CARD" -name '._*' -delete 2>/dev/null || true
 find "$CARD" -name '.DS_Store' -delete 2>/dev/null || true
 sync
-echo "Card ready (set ADOPTION_TOKEN in config/uvc/uvcd.conf):"
+echo "Card ready:"
 (cd "$CARD" && find . -type f -not -path './.Spotlight*' -not -path './.fseventsd*' | sort)

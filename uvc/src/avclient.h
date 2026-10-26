@@ -6,7 +6,9 @@
 #include "source.h"
 
 // Speaks Protect's camera protocol (ubnt_avclient over wss://nvr:7442) and
-// drives the video streams it asks for. Never returns.
+// drives the video streams it asks for. Without a Protect (not adopted, or
+// removed from it) waits for Protect's adopt request (manage.h). Never
+// returns.
 void avclient_run(struct config *cfg, struct source *hi, struct source *lo);
 // Send an event (e.g. EventSmartMotion) from any thread; takes ownership of
 // payload. Dropped while not connected to Protect.

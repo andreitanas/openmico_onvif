@@ -15,8 +15,10 @@
 #include "capture.h"
 #include "config.h"
 #include "daynight.h"
+#include "discovery.h"
 #include "https.h"
 #include "isp.h"
+#include "manage.h"
 #include "objects.h"
 #include "source.h"
 #include "tls.h"
@@ -116,6 +118,8 @@ int main(int argc, char **argv) {
     if (*cfg.log_file)
         log_open(cfg.log_file, 256 * 1024);
     log_info("uvcd: %s mac %s ip %s, Protect %s", cfg.name, cfg.mac, cfg.ip, cfg.nvr);
+    if (!cfg.protect)
+        log_info("not adopted: waiting for Protect");
 
     static sigset_t stop_set;
     sigemptyset(&stop_set);
@@ -154,13 +158,19 @@ int main(int argc, char **argv) {
             board_watchdog_start(cfg.watchdog, healthy);
     }
 
-    if (!cfg.protect) {
-        while (!config_refresh(&cfg))
-            sleep_ms(5000);
-        log_info("uvcd: ip %s, Protect %s", cfg.ip, cfg.nvr);
-    }
     if (tls_init(cfg.cert) < 0)
         return 1;
+    // Protect finds the camera and adopts it, unless uvcd.conf names a
+    // Protect and token.
+    discovery_start(&cfg);
+    manage_start(&cfg);
+    if (!cfg.protect) {
+        while (!config_refresh(&cfg)) {
+            sleep_ms(1000);
+            manage_take(&cfg);
+        }
+        log_info("uvcd: ip %s, Protect %s", cfg.ip, cfg.nvr);
+    }
     wait_for_clock();
     avclient_run(&cfg, &hi, lop);
     return 0;

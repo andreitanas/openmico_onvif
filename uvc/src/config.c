@@ -20,6 +20,7 @@ static void defaults(struct config *c) {
     // uvcd with its model in the read-only root partition (see image/).
     SET(cert, "/config/uvc/client.pem");
     SET(iface, "wlan0");
+    c->nvr_port = 7442;
     // UVC G5 Pro: an identity known to adopt with smart detections on
     // Protect 7.x. FW_VERSION should match the newest firmware Protect's
     // catalog has for this platform, or Protect nags/forces updates.
@@ -65,7 +66,9 @@ static char *trim(char *s) {
 
 static void set_key(struct config *c, const char *k, const char *v) {
     if (!strcmp(k, "NVR_HOST")) SET(nvr, v);
+    else if (!strcmp(k, "NVR_PORT")) c->nvr_port = atoi(v);
     else if (!strcmp(k, "ADOPTION_TOKEN")) SET(token, v);
+    else if (!strcmp(k, "PASSWORD_HASH")) SET(password_hash, v);
     else if (!strcmp(k, "CERT")) SET(cert, v);
     else if (!strcmp(k, "NAME")) SET(name, v);
     else if (!strcmp(k, "IFACE")) SET(iface, v);
@@ -148,6 +151,11 @@ static void discover(struct config *c) {
         }
     }
     normalize_mac(c->mac);
+    if (!*c->device_id && strlen(c->mac) == 12) {
+        char name[32];
+        snprintf(name, sizeof(name), "uvcd-%s", c->mac);
+        uuid5(name, c->device_id);
+    }
     if (!*c->ip) {
         struct ifaddrs *ifs, *i;
         if (getifaddrs(&ifs) == 0) {
@@ -172,10 +180,10 @@ static void discover(struct config *c) {
 
 // Why Protect cannot be used (yet), or NULL.
 static const char *protect_missing(const struct config *c) {
-    if (!*c->nvr || strlen(c->mac) != 12 || !*c->ip)
-        return "config needs NVR_HOST, and a MAC/IP (from IFACE or MAC=/IP=)";
-    if (!c->adopted && !*c->token)
-        return "not adopted yet: set ADOPTION_TOKEN (Protect: /proxy/protect/api/cameras/manage-payload)";
+    if (strlen(c->mac) != 12 || !*c->ip)
+        return "no MAC/IP yet (from IFACE, or MAC=/IP=)";
+    if (!*c->nvr || (!c->adopted && !*c->token))
+        return "not adopted: waiting for Protect (or set NVR_HOST and ADOPTION_TOKEN)";
     return NULL;
 }
 
@@ -184,7 +192,6 @@ int config_load(struct config *c, const char *path) {
     if (parse_file(c, path, 1) < 0)
         return -1;
     discover(c);
-    // The state file only ever records that adoption succeeded.
     parse_file(c, c->state_file, 0);
     // Without Protect settings a capturing uvcd still owns the camera (motion
     // detection, the watchdog) until it is configured.
@@ -207,13 +214,35 @@ int config_refresh(struct config *c) {
     return c->protect;
 }
 
-int config_save_adopted(const struct config *c) {
-    FILE *fp = fopen(c->state_file, "w");
+int config_save_state(const struct config *c) {
+    char tmp[sizeof(c->state_file) + 4];
+    snprintf(tmp, sizeof(tmp), "%s.new", c->state_file);
+    FILE *fp = fopen(tmp, "w");
     if (!fp) {
-        log_warn("cannot write %s", c->state_file);
+        log_warn("cannot write %s", tmp);
         return -1;
     }
-    fprintf(fp, "ADOPTED=1\n");
+    fprintf(fp, "ADOPTED=%d\nNVR_HOST=%s\nNVR_PORT=%d\nADOPTION_TOKEN=%s\nPASSWORD_HASH=%s\n",
+            c->adopted, c->nvr, c->nvr_port, c->token, c->password_hash);
+    fflush(fp);
+    fsync(fileno(fp));
     fclose(fp);
-    return 0;
+    return rename(tmp, c->state_file);
+}
+
+void config_manage(struct config *c, const char *host, int port, const char *tok) {
+    SET(nvr, host);
+    c->nvr_port = port;
+    SET(token, tok);
+    *c->password_hash = 0;
+    c->adopted = 0;
+    config_save_state(c);
+    c->protect = !protect_missing(c);
+}
+
+void config_reset(struct config *c) {
+    *c->nvr = *c->token = *c->password_hash = 0;
+    c->adopted = 0;
+    config_save_state(c);
+    c->protect = 0;
 }

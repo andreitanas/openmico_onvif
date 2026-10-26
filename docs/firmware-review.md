@@ -262,6 +262,19 @@ Done; the camera runs it:
     800k. Probes start 10 s after the switch and back off (30 s doubling to
     10 min), and come sooner when the exposure moves. Tested with a hand
     over the lens.
+- **Adoption from the Protect UI** (`uvc/src/discovery.c`, `manage.c`), no
+  token to copy:
+  - uvcd answers Protect's discovery probes (UDP 10001, every minute) with
+    the fields a real G4 Instant sends, flagged unmanaged until adopted, and
+    Protect lists it as ready to adopt.
+  - Clicking Adopt makes Protect POST `https://<camera>/api/1.2/manage`
+    with its hosts and a token; uvcd keeps them in `uvcd.state` and
+    connects. Tested: adopted 1.4 s after the click.
+  - Removing the camera in Protect sends `ResetToDefaults`; uvcd forgets
+    that Protect and is adoptable again. Once adopted, uvcd only takes a new
+    Protect with the password Protect set over `UpdateUsernamePassword` (a
+    SHA-512 crypt hash), as Protect does when it re-adopts a camera that
+    stays disconnected.
 - **Leftovers**: the SD card was cleaned (stock Wyze recordings, OTA files,
   bench files, swapfile). The old OpenMiko init scripts were removed from
   the config flash.

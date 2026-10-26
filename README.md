@@ -27,18 +27,22 @@ or bridge box.
 
 ## Install
 - **New camera:**
-  1. Run `uvc/make-sdcard.sh /Volumes/CARD [protect-host]`, then set
-     `ADOPTION_TOKEN` in `config/uvc/uvcd.conf` on the card (see the comments
-     there).
+  1. Run `uvc/make-sdcard.sh /Volumes/CARD`.
   2. Hold the setup button while powering the camera on. The bootloader
      flashes `demo.bin`.
   3. The camera imports `config/` from the card into its flash at every boot
-     when the card's copy differs, then appears in Protect for adoption.
+     when the card's copy differs, then shows up in Protect as ready to
+     adopt (it answers Protect's discovery). Click Adopt there.
+  - Protect's discovery only reaches its own subnet. Elsewhere set `NVR_HOST`
+    and `ADOPTION_TOKEN` in `config/uvc/uvcd.conf` instead (see the comments
+    there).
 - **Camera already running this image or OpenMiko:** `uvc/image/flash.sh
   [camera-ip]` writes `root.jffs2` over ssh. It verifies the result and puts
   the previous image back if anything doesn't match.
   - Coming from OpenMiko, first put `uvcd.conf`, `client.pem` (and
     `uvcd.state` if already adopted) in `/config/uvc/`.
+- **Removing a camera** in Protect resets it: it forgets that Protect and
+  shows up as ready to adopt again.
   - Remove OpenMiko's init scripts and `openmiko.conf` from
     `/config/overlay/etc/` and from the card's `config/overlay/etc/`.
 

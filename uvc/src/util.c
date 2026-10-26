@@ -13,6 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "mbedtls/sha1.h"
+
 int log_level = LOG_INFO;
 
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -226,4 +228,39 @@ int tcp_connect(const char *host, int port, int timeout_ms) {
     }
     fcntl(fd, F_SETFL, flags);
     return fd;
+}
+
+static void uuid_format(const uint8_t *b, char *out) {
+    snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12],
+             b[13], b[14], b[15]);
+}
+
+// RFC 4122 v5 UUID in the DNS namespace: a stable device-id per MAC.
+void uuid5(const char *name, char *out) {
+    static const uint8_t ns_dns[16] = {0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
+                                       0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8};
+    uint8_t in[16 + 64], hash[20];
+    size_t n = strlen(name);
+    if (n > 64)
+        n = 64;
+    memcpy(in, ns_dns, 16);
+    memcpy(in + 16, name, n);
+    mbedtls_sha1(in, 16 + n, hash);
+    hash[6] = (hash[6] & 0x0f) | 0x50;
+    hash[8] = (hash[8] & 0x3f) | 0x80;
+    uuid_format(hash, out);
+}
+
+void uuid4(char *out) {
+    uint8_t b[16];
+    FILE *fp = fopen("/dev/urandom", "rb");
+    if (!fp || fread(b, 1, 16, fp) != 16)
+        for (int i = 0; i < 16; i++)
+            b[i] = rand();
+    if (fp)
+        fclose(fp);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    uuid_format(b, out);
 }
