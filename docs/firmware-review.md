@@ -281,6 +281,12 @@ Done; the camera runs it:
   keeps it (`UPDATED_FW_VERSION` in `uvcd.state`), goes offline for 45 s as
   if flashing, and reconnects reporting it. Protect then records the update
   as done, so `FW_VERSION` needs no upkeep. Tested from 5.5.30 to 5.5.31.
+- **Protect's device login**: Protect sends every camera the console's device
+  credentials at each connection (`UpdateUsernamePassword`: username `ui`
+  and a SHA-512 crypt hash). uvcd adds them to `/etc/passwd` as a root
+  login next to the card's, and drops it when the camera is removed from
+  Protect. Protect's `StopService {service: "ssh"}` (Device SSH off in the
+  console) is ignored, so SSH stays available.
 - **Leftovers**: the SD card was cleaned (stock Wyze recordings, OTA files,
   bench files, swapfile). The old OpenMiko init scripts were removed from
   the config flash.

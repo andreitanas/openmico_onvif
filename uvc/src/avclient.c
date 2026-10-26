@@ -581,8 +581,11 @@ static int handle(const char *text) {
         // Sent at every connection; the password lets Protect re-adopt the
         // camera later (manage.h).
         const char *hash = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "hashedPassword"));
-        if (hash && strlen(hash) < sizeof(cfg->password_hash) && strcmp(hash, cfg->password_hash)) {
+        const char *user = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "username"));
+        if (hash && strlen(hash) < sizeof(cfg->password_hash) &&
+            (strcmp(hash, cfg->password_hash) || (user && strcmp(user, cfg->username)))) {
             snprintf(cfg->password_hash, sizeof(cfg->password_hash), "%s", hash);
+            snprintf(cfg->username, sizeof(cfg->username), "%s", user ? user : "");
             config_save_state(cfg);
         }
         res = cJSON_CreateObject();

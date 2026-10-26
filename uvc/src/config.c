@@ -32,6 +32,7 @@ static void defaults(struct config *c) {
     SET(hi_source, "/dev/video3");
     SET(snapshot, "/dev/video4");
     SET(state_file, "/config/uvc/uvcd.state");
+    SET(passwd_file, "/etc/passwd");
     // Measured on a jxf22 Wyze Cam v2 (see daynight.h): day mode reads
     // ~450k in a lit room and 1.2M+ covered; night mode without IR LEDs
     // 0.9M+ covered.
@@ -69,6 +70,7 @@ static void set_key(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "NVR_PORT")) c->nvr_port = atoi(v);
     else if (!strcmp(k, "ADOPTION_TOKEN")) SET(token, v);
     else if (!strcmp(k, "PASSWORD_HASH")) SET(password_hash, v);
+    else if (!strcmp(k, "USERNAME")) SET(username, v);
     else if (!strcmp(k, "CERT")) SET(cert, v);
     else if (!strcmp(k, "NAME")) SET(name, v);
     else if (!strcmp(k, "IFACE")) SET(iface, v);
@@ -87,6 +89,7 @@ static void set_key(struct config *c, const char *k, const char *v) {
     else if (!strcmp(k, "LO_SOURCE")) SET(lo_source, v);
     else if (!strcmp(k, "SNAPSHOT_SOURCE")) SET(snapshot, v);
     else if (!strcmp(k, "STATE_FILE")) SET(state_file, v);
+    else if (!strcmp(k, "PASSWD_FILE")) SET(passwd_file, v);
     else if (!strcmp(k, "LOG_FILE")) SET(log_file, v);
     else if (!strcmp(k, "CAPTURE")) c->capture = atoi(v);
     else if (!strcmp(k, "HI_BITRATE")) c->hi_kbps = atoi(v);
@@ -197,6 +200,7 @@ int config_load(struct config *c, const char *path) {
         return -1;
     discover(c);
     parse_file(c, c->state_file, 0);
+    config_apply_login(c);
     // Without Protect settings a capturing uvcd still owns the camera (motion
     // detection, the watchdog) until it is configured.
     const char *missing = protect_missing(c);
@@ -228,12 +232,70 @@ int config_save_state(const struct config *c) {
     }
     fprintf(fp,
             "ADOPTED=%d\nNVR_HOST=%s\nNVR_PORT=%d\nADOPTION_TOKEN=%s\nPASSWORD_HASH=%s\n"
-            "UPDATED_FW_VERSION=%s\n",
-            c->adopted, c->nvr, c->nvr_port, c->token, c->password_hash, c->fw_updated);
+            "USERNAME=%s\nUPDATED_FW_VERSION=%s\n",
+            c->adopted, c->nvr, c->nvr_port, c->token, c->password_hash, c->username,
+            c->fw_updated);
     fflush(fp);
     fsync(fileno(fp));
     fclose(fp);
+    config_apply_login(c);
     return rename(tmp, c->state_file);
+}
+
+// Protect's device credentials as a root login (uid 0, as on UniFi
+// cameras), next to the ones from the SD card: its line in passwd_file is
+// marked "Protect" in the comment field and rewritten (or dropped) to match.
+// The camera's /etc lives in RAM, so uvcd applies it at every start.
+static int protect_line(const char *line) {
+    const char *f = line;
+    for (int i = 0; i < 4 && f; i++)
+        f = strchr(f + 1, ':');
+    return f && !strncmp(f, ":Protect:", 9);
+}
+
+void config_apply_login(const struct config *c) {
+    const char *u = c->username, *h = c->password_hash;
+    char want[256] = "", tmp[sizeof(c->passwd_file) + 4], line[512];
+    if (*u && strcmp(u, "root") && strspn(u, "abcdefghijklmnopqrstuvwxyz0123456789_-") == strlen(u) &&
+        *h == '$' && !strpbrk(h, ":\n"))
+        snprintf(want, sizeof(want), "%s:%s:0:0:Protect:/root:/bin/sh\n", u, h);
+    FILE *in = *c->passwd_file ? fopen(c->passwd_file, "r") : NULL;
+    if (!in)
+        return;
+    snprintf(tmp, sizeof(tmp), "%s.new", c->passwd_file);
+    FILE *out = fopen(tmp, "w");
+    if (!out) {
+        fclose(in);
+        return;
+    }
+    int have = 0, changed = 0;
+    size_t ulen = strlen(u);
+    while (fgets(line, sizeof(line), in)) {
+        if (protect_line(line)) {
+            if (*want && !have && !strcmp(line, want)) {
+                have = 1;
+                fputs(line, out);
+            } else {
+                changed = 1; // outdated or a duplicate: dropped
+            }
+            continue;
+        }
+        if (*want && !strncmp(line, u, ulen) && line[ulen] == ':') {
+            log_warn("login %s exists already; Protect's not added", u);
+            *want = 0;
+        }
+        fputs(line, out);
+    }
+    if (*want && !have) {
+        fputs(want, out);
+        changed = 1;
+    }
+    fclose(in);
+    fclose(out);
+    if (changed && rename(tmp, c->passwd_file) == 0)
+        log_info("login %s from Protect %s", u, *want ? "set" : "removed");
+    else
+        unlink(tmp);
 }
 
 void config_manage(struct config *c, const char *host, int port, const char *tok) {
@@ -247,7 +309,7 @@ void config_manage(struct config *c, const char *host, int port, const char *tok
 }
 
 void config_reset(struct config *c) {
-    *c->nvr = *c->token = *c->password_hash = 0;
+    *c->nvr = *c->token = *c->password_hash = *c->username = 0;
     c->adopted = 0;
     config_save_state(c);
     c->protect = 0;
