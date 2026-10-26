@@ -6,7 +6,6 @@ struct config {
     int nvr_port;       // its camera port (wss)
     char token[128];    // adoption token (manage-payload, or sent by Protect's adopt request)
     char password_hash[128]; // crypt(3) hash of the password Protect set (UpdateUsernamePassword)
-    char username[32];       // and its username: a login on the camera (passwd_file)
     char cert[128];     // client PEM (key + certificate)
     char name[64];      // camera name shown in Protect
     char iface[16];     // network interface for MAC/IP discovery
@@ -24,7 +23,6 @@ struct config {
     char lo_source[128]; // H.264 for video2/video3 (may equal hi_source)
     char snapshot[128];  // JPEG device or file
     char state_file[128];
-    char passwd_file[128]; // where Protect's login goes; empty: nowhere
     char log_file[128]; // empty: stderr
     // CAPTURE=1 (default): uvcd drives the sensor and encoders through
     // libimp. CAPTURE=0 reads H.264 from HI_SOURCE/LO_SOURCE (files or v4l2
@@ -47,9 +45,7 @@ struct config {
 int config_load(struct config *c, const char *path);
 // The state file records adoption (ADOPTED) and the Protect host and token
 // it came with; it overrides uvcd.conf.
-// Also keeps Protect's login (username, password_hash) in passwd_file.
 int config_save_state(const struct config *c);
-void config_apply_login(const struct config *c);
 // Protect's adopt request (manage.h): a new host and token, not adopted yet.
 void config_manage(struct config *c, const char *host, int port, const char *token);
 // Protect removed the camera: forget it and wait to be adopted again.

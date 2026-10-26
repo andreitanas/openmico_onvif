@@ -5,6 +5,8 @@
 #                    OpenMiko's kernel unpacks into RAM at boot
 #   uvc/uvcd         the camera daemon, run from flash (mounted at /rom)
 #   uvc/models/      the object detector
+# The tarball gets our dropbear (tools/build-dropbear.sh) next to
+# image/rootfs/.
 # Base: the root filesystem inside OpenMiko's demo.bin (../deploy/demo.bin).
 # Install with image/flash.sh over ssh, or with demo.bin on an SD card
 # (make-sdcard.sh) and the setup button held at power-on.
@@ -22,9 +24,16 @@ mkdir -p $OUT
 [ -f $OUT/openmiko-rootfs.tar.xz ] ||
     python3 image/jffs2-extract.py "$DEMO" rootfs.tar.xz $OUT/openmiko-rootfs.tar.xz
 
+[ -x build/dropbear/dropbearmulti ] || tools/build-dropbear.sh
+rm -rf $OUT/overlay
+cp -R image/rootfs $OUT/overlay
+mkdir -p $OUT/overlay/usr/sbin $OUT/overlay/usr/bin
+cp build/dropbear/dropbearmulti $OUT/overlay/usr/sbin/dropbear
+ln -s ../sbin/dropbear $OUT/overlay/usr/bin/dropbearkey
+
 rm -rf $OUT/payload
 mkdir -p $OUT/payload/uvc/models
-python3 image/build-rootfs.py $OUT/openmiko-rootfs.tar.xz image/rootfs $OUT/payload/rootfs.tar.xz
+python3 image/build-rootfs.py $OUT/openmiko-rootfs.tar.xz $OUT/overlay $OUT/payload/rootfs.tar.xz
 cp build/uvcd-mipsel $OUT/payload/uvc/uvcd
 chmod 755 $OUT/payload/uvc/uvcd
 cp third_party/models/yolo-fastest-1.1.param third_party/models/yolo-fastest-1.1.bin \

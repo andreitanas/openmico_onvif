@@ -281,12 +281,15 @@ Done; the camera runs it:
   keeps it (`UPDATED_FW_VERSION` in `uvcd.state`), goes offline for 45 s as
   if flashing, and reconnects reporting it. Protect then records the update
   as done, so `FW_VERSION` needs no upkeep. Tested from 5.5.30 to 5.5.31.
-- **Protect's device login**: Protect sends every camera the console's device
-  credentials at each connection (`UpdateUsernamePassword`: username `ui`
-  and a SHA-512 crypt hash). uvcd adds them to `/etc/passwd` as a root
-  login next to the card's, and drops it when the camera is removed from
-  Protect. Protect's `StopService {service: "ssh"}` (Device SSH off in the
-  console) is ignored, so SSH stays available.
+- **Credentials from Protect** (`UpdateUsernamePassword`, at every
+  connection) are not the console's device SSH password: Protect makes a
+  random 20-character password per camera (`getUpdatedPassword`) and sends
+  its SHA-512 crypt hash. uvcd keeps the hash only to check Protect's
+  re-adopt requests, which carry the plain password. `StopService` for ssh
+  (Device SSH off in the console) is ignored.
+- **dropbear 2026.94** (`tools/build-dropbear.sh`, static musl) replaces
+  OpenMiko's v2015.71: plain `ssh` works without `+ssh-rsa`, and root's
+  PATH includes `/sbin`. The host key in `/config` is kept.
 - **Leftovers**: the SD card was cleaned (stock Wyze recordings, OTA files,
   bench files, swapfile). The old OpenMiko init scripts were removed from
   the config flash.

@@ -9,6 +9,9 @@ MBEDTLS=3.6.4
 CJSON=1.7.18
 NCNN=20260526
 STB=003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5
+DROPBEAR=2026.94
+# Signed by the Dropbear release key F734 7EF2 EE2E 07A2 6762 8CA9 4493 1494 F29C 6773
+DROPBEAR_SHA256=e098034a843699200c8c977a991fff73159735bf795d5f72ef672c41a6b1ae81
 
 if [ ! -d mbedtls ]; then
     curl -fsSL "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$MBEDTLS/mbedtls-$MBEDTLS.tar.bz2" | tar xj
@@ -37,6 +40,16 @@ fi
 if [ ! -d stb ]; then
     mkdir stb
     curl -fsSL "https://raw.githubusercontent.com/nothings/stb/$STB/stb_image_write.h" -o stb/stb_image_write.h
+fi
+
+# The camera's SSH server (built by tools/build-dropbear.sh): the base
+# image's is from 2015 and its libcrypt has no SHA-512 crypt.
+if [ ! -d dropbear ]; then
+    curl -fsSL "https://matt.ucc.asn.au/dropbear/releases/dropbear-$DROPBEAR.tar.bz2" -o dropbear.tar.bz2
+    echo "$DROPBEAR_SHA256  dropbear.tar.bz2" | shasum -a 256 -c - >/dev/null
+    tar xjf dropbear.tar.bz2
+    rm dropbear.tar.bz2
+    mv "dropbear-$DROPBEAR" dropbear
 fi
 
 # Yolo-Fastest 1.1 (COCO, ncnn format). Its detection layer's built-in
