@@ -3,12 +3,14 @@
 # camera:
 #   demo.bin            our image (image/build.sh); the Wyze bootloader
 #                       flashes it when the setup button is held at power-on
-#   config/overlay/     wifi, hostname, passwd, ssh key (../deploy, made by
+#   config/overlay/     wifi, passwd, ssh key (../deploy, made by
 #                       ../deploy.sh), copied over the root filesystem at boot
-#   config/uvc/         uvcd.conf and a per-camera client certificate
+#   config/uvc/         uvcd.conf
 # The camera imports config/ into its config flash at every boot when the
 # card's copy differs; the card is optional after that. It then shows up in
-# Protect, ready to adopt.
+# Protect, ready to adopt. Nothing on the card is per camera, so one card
+# sets up any number: each camera names itself after its MAC (wyze-2BE8)
+# and makes its own certificate.
 #
 # Usage: ./make-sdcard.sh /Volumes/CARD
 set -e
@@ -22,22 +24,17 @@ image/build.sh
 
 mkdir -p "$CARD/config/overlay" "$CARD/config/uvc"
 cp -R "$DEPLOY/config/overlay/." "$CARD/config/overlay/"
-# OpenMiko's settings file has no meaning for our image.
-rm -f "$CARD/config/overlay/etc/openmiko.conf"
+# OpenMiko's settings file has no meaning for our image, and a hostname
+# would be the same on every camera.
+rm -f "$CARD/config/overlay/etc/openmiko.conf" "$CARD/config/overlay/etc/hostname"
 cp build/image/demo.bin "$CARD/demo.bin"
 
 if [ ! -f "$CARD/config/uvc/uvcd.conf" ]; then
     cp image/uvcd.conf.template "$CARD/config/uvc/uvcd.conf"
 fi
-if [ ! -f "$CARD/config/uvc/client.pem" ]; then
-    # Per-camera client certificate, the shape real UniFi cameras present.
-    TMP=$(mktemp -d)
-    openssl ecparam -out "$TMP/k" -name prime256v1 -genkey -noout
-    openssl req -new -x509 -sha256 -days 36500 -key "$TMP/k" -out "$TMP/c" \
-        -subj "/C=TW/L=Taipei/O=Ubiquiti Networks Inc./OU=devint/CN=camera.ubnt.dev/emailAddress=support@ubnt.com"
-    cat "$TMP/k" "$TMP/c" > "$CARD/config/uvc/client.pem"
-    rm -rf "$TMP"
-fi
+# Cards made before cameras made their own certificates carry one, which
+# every camera set up from the card would share.
+rm -f "$CARD/config/uvc/client.pem"
 
 # macOS litters FAT volumes with metadata files; the camera imports every
 # file under config/.

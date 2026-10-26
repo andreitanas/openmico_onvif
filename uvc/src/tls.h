@@ -11,7 +11,8 @@
 // Load the client certificate + key (one PEM file) used for every TLS
 // connection to Protect. Protect does not validate our chain, and we do not
 // validate its self-signed certificate. The same certificate serves
-// Protect's requests to the camera (tls_accept).
+// Protect's requests to the camera (tls_accept). Made on the camera if
+// pem_path does not exist.
 int tls_init(const char *pem_path);
 
 struct tls {

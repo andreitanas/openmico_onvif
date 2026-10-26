@@ -2,7 +2,10 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include "mbedtls/ecp.h"
 #include "mbedtls/error.h"
 #include "mbedtls/x509_crt.h"
 #include "psa/crypto.h"
@@ -20,6 +23,64 @@ static void tls_err(const char *what, int rc) {
     log_warn("%s: %s (-0x%04x)", what, msg, -rc);
 }
 
+// A camera set up without a certificate makes its own: an EC P-256 key and
+// a self-signed certificate in the shape real UniFi cameras present, written
+// to pem_path (key, then certificate). The validity is fixed, as the clock
+// may still be in 1970 at first boot.
+static int make_cert(const char *pem_path) {
+    mbedtls_pk_context k;
+    mbedtls_x509write_cert crt;
+    static unsigned char pem[4096];
+    unsigned char serial[16];
+    char tmp[256];
+    int rc;
+    mbedtls_pk_init(&k);
+    mbedtls_x509write_crt_init(&crt);
+    if ((rc = mbedtls_pk_setup(&k, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY))) ||
+        (rc = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(k),
+                                  mbedtls_ctr_drbg_random, &drbg)) ||
+        (rc = mbedtls_ctr_drbg_random(&drbg, serial, sizeof(serial))))
+        goto out;
+    serial[0] &= 0x7f; // positive
+    static const char subject[] = "C=TW,L=Taipei,O=Ubiquiti Networks Inc.,OU=devint,"
+                                  "CN=camera.ubnt.dev,emailAddress=support@ubnt.com";
+    mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
+    mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
+    mbedtls_x509write_crt_set_subject_key(&crt, &k);
+    mbedtls_x509write_crt_set_issuer_key(&crt, &k);
+    if ((rc = mbedtls_x509write_crt_set_subject_name(&crt, subject)) ||
+        (rc = mbedtls_x509write_crt_set_issuer_name(&crt, subject)) ||
+        (rc = mbedtls_x509write_crt_set_serial_raw(&crt, serial, sizeof(serial))) ||
+        (rc = mbedtls_x509write_crt_set_validity(&crt, "20250101000000", "21241231235959")))
+        goto out;
+    snprintf(tmp, sizeof(tmp), "%s.new", pem_path);
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) {
+        log_warn("cannot write %s", tmp);
+        rc = -1;
+        goto out;
+    }
+    fchmod(fileno(fp), 0600);
+    if (!(rc = mbedtls_pk_write_key_pem(&k, pem, sizeof(pem))))
+        fputs((char *)pem, fp);
+    if (!rc && !(rc = mbedtls_x509write_crt_pem(&crt, pem, sizeof(pem), mbedtls_ctr_drbg_random,
+                                                &drbg)))
+        fputs((char *)pem, fp);
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+    if (!rc && rename(tmp, pem_path))
+        rc = -1;
+out:
+    if (rc)
+        tls_err("certificate", rc);
+    else
+        log_info("made a certificate: %s", pem_path);
+    mbedtls_x509write_crt_free(&crt);
+    mbedtls_pk_free(&k);
+    return rc ? -1 : 0;
+}
+
 int tls_init(const char *pem_path) {
     int rc;
     psa_crypto_init();
@@ -32,6 +93,8 @@ int tls_init(const char *pem_path) {
     }
     mbedtls_x509_crt_init(&cert);
     mbedtls_pk_init(&key);
+    if (access(pem_path, F_OK) < 0 && make_cert(pem_path) < 0)
+        return -1;
     // The PEM holds both the key and the certificate; each parser picks
     // out its own block.
     if ((rc = mbedtls_x509_crt_parse_file(&cert, pem_path)) < 0 || !cert.raw.len) {

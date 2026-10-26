@@ -27,7 +27,9 @@ or bridge box.
 
 ## Install
 - **New camera:**
-  1. Run `uvc/make-sdcard.sh /Volumes/CARD`.
+  1. Run `uvc/make-sdcard.sh /Volumes/CARD`. The card has nothing per
+     camera: each camera names itself after its MAC (`wyze-2BE8`) and makes
+     its own certificate, so one card sets up any number of cameras.
   2. Hold the setup button while powering the camera on. The bootloader
      flashes `demo.bin`.
   3. The camera imports `config/` from the card into its flash at every boot
