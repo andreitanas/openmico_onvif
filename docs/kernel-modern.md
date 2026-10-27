@@ -145,8 +145,8 @@ registers as the vendor `gpio_set_func`), `ispmem_base`/`ispmem_size`,
 
 | | Today (OpenMiko 3.10.14) | Linux 6.18 |
 |---|---|---|
-| uImage | (in a 2048 KiB partition, with the initramfs) | 1,706,816 bytes of 2,097,152 (81 %) |
-| Unpacked image | | 5,016,992 bytes of 5,242,880 |
+| uImage | (in a 2048 KiB partition, with the initramfs) | 1,707,911 bytes of 2,097,152 (81 %) |
+| Unpacked image | | 5,016,976 bytes of 5,242,880 |
 | Kernel code | 3877k | 3621k |
 | Data | 1205k | 1112k "rwdata" (of which 924k read-only), 67k bss |
 | Init, freed after boot | | 188k |
