@@ -21,7 +21,7 @@ run on a camera yet: everything below "builds" is untested on hardware. Read
 | I2C (sensor bus) | mainline `i2c-jz4780` | builds |
 | WiFi, RTL8189FS on MSC1 | jwrdegoede/rtl8189ES_linux (out of tree), cfg80211 module | builds |
 | Squashfs root on mtdblock2 | `image/build-modern.sh`, `image/flash-modern.sh` | written, not run (needs OpenMiko's `demo.bin` as the base) |
-| ISP (tx-isp) | open-tx-isp T20 | **missing**: port started, blocked on the 3.10 V4L2 core (below) |
+| ISP (tx-isp) | open-tx-isp T20 | **missing**: port started, 272 compile errors left (below) |
 | Sensor JXF22/JXF23 | ingenic-sdk `sensor-src/t20` | **missing**: same framework as the ISP |
 | H.264 encoder (VPU, IPU) | vendor `soc_vpu`/`jz_nvpu`/`jz_ipu_v13` (GPL, 3.10 tree) | **missing**: not started |
 | Audio | ingenic-sdk `audio/t20/oss2` | **missing**: not started |
@@ -226,21 +226,21 @@ not a port. The cost of this choice is that the drivers keep vendor-style
 interfaces in a modern kernel (`t20-compat.ko`, below), outside mainline.
 
 **ISP port, state.** `t20-compat.ko` supplies the arch interfaces and
-`compat/include` the vendor headers; with those, open-tx-isp's T20 module gets
-through its includes on 6.18. What stops it is the V4L2 core: the vendor drivers
-are written against the 3.10 `struct v4l2_subdev`, `v4l2_device` and
-`media_entity`, which 6.18 has changed beyond a header shim (removed ops, renamed
-media bus codes, entity functions and pads reworked). The plan is to build a
-private copy of the 3.10 V4L2 subdev/device/media-entity core into the module
-(about 2k lines from 3.10's `drivers/media/v4l2-core` and `media-entity.c`, with
-3.10's headers searched first through `NOSTDINC_FLAGS`), which is possible because
-our kernel has no V4L2 or media support of its own to clash with; then the
-remaining 3.10-isms: `set_fs`/`vfs_read` → `kernel_read`, `f_dentry` →
-`f_path.dentry`, `PDE_DATA` → `pde_data`, proc `file_operations` → `proc_ops`,
-`dma_cache_sync` → `dma_cache_wback_inv`, and the recovered firmware unit's own
-prototypes for kernel functions. The build errors of the first attempt are listed in
-`uvc/kernel/compat/README`. Expected order after that: ISP + sensor (video out
-through the closed libimp), VPU/IPU (encoder), OpenIMP in uvcd, audio.
+`compat/include` the vendor headers; the kernel has V4L2 and the media
+controller as modules (`videodev.ko` 290 KB, `mc.ko` 49 KB, not in the kernel
+image), because the ISP registers subdevices, video nodes and controls with them
+and already uses the `v4l2_ctrl` framework. With that, open-tx-isp's T20 module
+compiles to 272 errors, listed by cause in `uvc/kernel/compat/README`: mostly the
+renamed media bus codes and V4L2 ioctls and ops removed since 3.10 (mechanical),
+then videobuf2 and dma-buf changes in the frame channels, which are the
+interface libimp reads frames from and must keep their ABI exactly (the
+real work), plus `set_fs` in the tuning-file loader and include-order
+constants. A private copy of the whole 3.10 V4L2 core in the module was the
+alternative; the ISP also uses video nodes, videobuf2, priorities and controls
+from it, about 12k lines of 3.10 code, more than porting the callers. Order
+after the ISP builds: load it with the closed libimp first (same ioctls, so
+uvcd unchanged) to get video out, then the sensor drivers (same subdev changes),
+VPU/IPU (encoder), OpenIMP in uvcd, audio.
 
 ### uvcd's libimp calls against OpenIMP (T20)
 

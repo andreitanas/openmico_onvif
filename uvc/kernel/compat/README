@@ -13,20 +13,36 @@ Build (after kernel/build.sh):
   make -C build/kernel/obj M=$PWD/kernel/compat ARCH=mips \
       CROSS_COMPILE=mipsel-linux-gnu- modules
 
-open-tx-isp driver/t20 against 6.18, first attempt (2026-10-27, open-tx-isp
-b4d8eae, ingenic-sdk 5e5d7d2), with KCPPFLAGS=-I$PWD/kernel/compat/include.
-Remaining errors, by cause:
-  - 3.10 V4L2 core: v4l2_subdev_core_ops has no g_chip_ident/g_ctrl/s_ctrl,
-    v4l2_subdev has no entity, V4L2_MBUS_FMT_* are now MEDIA_BUS_FMT_*
-    (tx-isp-csi.c, tx-isp-vic.c, tx-isp-video-in.c, tx-isp-common.h).
-    Plan: a private copy of 3.10's v4l2-device/v4l2-subdev/media-entity in
-    the module, its headers first through NOSTDINC_FLAGS.
-  - tx-isp-load-parameters.c: mm_segment_t/set_fs/KERNEL_DS, f_dentry
-    (use kernel_read, f_path.dentry).
-  - system_chardev.c, tx-isp-debug.c: misc_deregister() returns void now.
-  - sensor-common.h wants txx-funcs.h (the private_* wrappers of newer SDKs;
-    the T20 build needs none of them, an empty header with the
-    private_jzgpio_set_func define is enough).
-  - tx-isp-vic.c: VIC_* register names come from a header the 3.10 build
-    found in the SDK include path; check the include order.
-  - printk.h:482: a vendor macro redefines a printk helper.
+open-tx-isp driver/t20 against 6.18 (2026-10-27, open-tx-isp b4d8eae,
+ingenic-sdk 5e5d7d2), with kernel/config's V4L2 and media controller
+modules and KCPPFLAGS=-I$PWD/kernel/compat/include (plus an empty
+txx-funcs.h in the SDK include directory): 272 errors, by cause:
+
+  - Media bus codes renamed: V4L2_MBUS_FMT_* -> MEDIA_BUS_FMT_* (most of
+    the count; tx-isp-core.c, tx-isp-core-tuning.c, tx-isp-vic.c,
+    tx-isp-common.h). A table of #defines.
+  - Removed V4L2 interfaces: v4l2_subdev_core_ops .g_ctrl/.s_ctrl/
+    .g_chip_ident; v4l2_ioctl_ops .vidioc_g/s_ctrl, g/s_priority, g/s_crop,
+    cropcap; VFL_TYPE_GRABBER (now VFL_TYPE_VIDEO); V4L2_FL_USE_FH_PRIO;
+    video_device.debug; media_device.link_notify (now in media_device_ops);
+    media_entity_init/media_entity_create_link (now media_entity_pads_init,
+    media_create_pad_link). Controls already use the v4l2_ctrl framework.
+  - videobuf2 (tx-isp-frame-channel.c, tx-isp-videobuf.c, the frame
+    channels libimp reads): vb2_buffer.v4l2_buf is now vb2_v4l2_buffer,
+    vb2_queue.timestamp_type is timestamp_flags, vb2_qbuf() takes a media
+    device, and the module's own vb2 memory allocator uses the 3.10
+    dma_buf_ops (kmap/kmap_atomic gone, dma_buf_export takes an info
+    struct) and sets vma->vm_flags directly (vm_flags_set()). The largest
+    piece: the frame channel ABI libimp expects must stay identical.
+  - tx-isp-load-parameters.c: mm_segment_t/set_fs/KERNEL_DS and f_dentry
+    (kernel_read, f_path.dentry).
+  - misc_deregister() returns void (system_chardev.c, tx-isp-debug.c,
+    tx-isp-vic.c, tx-isp-core.c).
+  - Constants the 3.10 build found through its include order (VIC_*
+    registers, TX_ISP_INPUT_PORT_MAX_*, TX_ISP_DS1_CHANNEL_MAX_*,
+    TX_ISP_EXIST_FR_CHANNEL, isp_clk): include path, not API.
+  - struct timespec on the stack (timespec64).
+
+Not reached yet: link errors (the recovered firmware unit declares kernel
+functions with its own prototypes) and the sensor drivers, which use the
+same subdev interfaces.
