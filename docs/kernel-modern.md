@@ -21,11 +21,11 @@ run on a camera yet: everything below "builds" is untested on hardware. Read
 | I2C (sensor bus) | mainline `i2c-jz4780` | builds |
 | WiFi, RTL8189FS on MSC1 | jwrdegoede/rtl8189ES_linux (out of tree), cfg80211 module | builds |
 | Squashfs root on mtdblock2 | `image/build-modern.sh`, `image/flash-modern.sh` | written, not run (needs OpenMiko's `demo.bin` as the base) |
-| ISP (tx-isp) | open-tx-isp T20 | **missing**: port started, 272 compile errors left (below) |
-| Sensor JXF22/JXF23 | ingenic-sdk `sensor-src/t20` | **missing**: same framework as the ISP |
-| H.264 encoder (VPU, IPU) | vendor `soc_vpu`/`jz_nvpu`/`jz_ipu_v13` (GPL, 3.10 tree) | **missing**: not started |
-| Audio | ingenic-sdk `audio/t20/oss2` | **missing**: not started |
-| uvcd | unchanged, libimp | runs without video on the new kernel (S50camera skips the camera modules) |
+| Sensor JX-F22/JX-F23 | ours, `jxf2x` (patch 0011; register tables from Ingenic's GPL sensor drivers) | builds |
+| ISP | ours, `t20-isp` (patch 0012), from [`t20-isp-hardware.md`](t20-isp-hardware.md) | first version builds: NV12, no 3A or tuning |
+| H.264 encoder (VPU) | ours, to write | **missing**: not started |
+| Audio | ALSA, to write | **missing**: not started |
+| uvcd | unchanged, closed libimp | runs without video on the new kernel; needs our libimp over V4L2 (below) |
 
 So the new kernel is a bring-up kernel: shell on the serial console, flash, SD card,
 GPIOs and LEDs, WiFi and SSH, no camera. The image scripts keep OpenMiko's kernel
@@ -109,19 +109,9 @@ an `mmc-pwrseq-simple` reset line.
 `linux-led.patch`, so `/sys/class/leds/led_blue` and `led_yellow` exist as uvcd and
 S01system expect.
 
-**Memory**. The kernel gets the low 96 MB as with `mem=96M@0x0`; 0x6000000 to
-0x8000000 stays outside Linux for the ISP (`ispmem`, 8 MB) and the encoder
-(`rmem`, 24 MB), which libimp maps through `/dev/mem` (`CONFIG_DEVMEM=y`).
-
-**Vendor interfaces** (`uvc/kernel/compat/`). `t20-compat.ko` provides what
-Ingenic's 3.10 arch code gives the camera drivers: `/proc/jz` with
-`get_jz_proc_root`/`jz_proc_mkdir`, `jzgpio_set_func` (written to the GPIO
-registers as the vendor `gpio_set_func`), `ispmem_base`/`ispmem_size`,
-`t20_intc_irq()` (Linux number of an INTC line), and the tx-isp platform devices
-(`tx-isp`, `tx-isp-csi`, `tx-isp-vic`, `tx-isp-core`, copied from the vendor
-`platform.c`). `compat/include/` has the vendor headers those drivers include
-(`mach/tx_isp.h`, `soc/base.h`, `soc/gpio.h`, `soc/irq.h`, `jz_proc.h`,
-`media/v4l2-chip-ident.h`). The module builds; it is not in the image yet.
+**Memory**. Linux keeps the low 96 MB as with `mem=96M@0x0`; 0x6000000 to
+0x8000000 (today's `ispmem` and `rmem`) is a reserved pool for the camera's frame
+buffers, used by the ISP driver through the DMA API.
 
 ## Boot with the vendor U-Boot
 
@@ -194,84 +184,57 @@ Not run: `build-modern.sh` needs OpenMiko's `demo.bin` (`deploy/demo.bin`) like
 separately (`build-rootfs.py` with extra overlays, `demo-bin.py` with a uImage,
 `sqfstar` from squashfs-tools 4.6).
 
-## Camera stack: gap analysis
+## Camera stack
 
-Today: uvcd links Ingenic's closed `libimp.a` statically; libimp talks to
-`tx-isp.ko` (ioctls on `/dev/tx-isp`, `/dev/isp-m0`, frame channels
-`/dev/framechan*`), to the VPU through `/dev/soc_vpu` and the IPU through
-`/dev/ipu`, and maps ispmem/rmem through `/dev/mem`; `sinfo.ko` probes the sensor
-and `sensor_jxf22.ko`/`sensor_jxf23.ko` drive it over I2C. All of those modules
-are built for 3.10.14 only.
+**Decision (owner, 2026-10-27): mainline-style kernel drivers, clean-room code.**
+The camera hardware gets V4L2 drivers in the kernel, like other SoCs' camera
+pipelines in mainline (the closest model is ARM's Mali-C55, a later ISP of the
+same Apical family). No code is taken from open-tx-isp (GPLv3), OpenIMP (mostly
+unlicensed) or the unlicensed parts of Ingenic's SDK; they serve as
+documentation, and what is used from them is recorded as hardware facts in
+[`t20-isp-hardware.md`](t20-isp-hardware.md). Ingenic's GPL-2.0+ sources (the
+sensor drivers, the 3.10 kernel) can be used directly. On top, uvcd gets our own
+implementation of the libimp calls it makes, over V4L2, so uvcd's code stays as
+it is; the closed libimp, `tools/imp-rename.py` and the `mm32`/`ftrunc32` shims
+go.
 
-What exists in the open:
-
-| Piece | Open code | Depends on 3.10 how | Work |
+| Piece | Kernel | Userspace (our libimp) | Status |
 |---|---|---|---|
-| ISP | open-tx-isp `driver/t20` (2026-10-27, "fully open" on T20 with stock libimp and with OpenIMP; 39k lines with the ingenic-sdk T20 sources it builds) | the 3.10 V4L2 subdev and media-entity core (`v4l2_subdev_core_ops.g_ctrl/s_ctrl/g_chip_ident`, `v4l2_subdev.entity`, `V4L2_MBUS_FMT_*`), `set_fs`/`f_dentry` to load the tuning file, `PDE_DATA`, vendor arch exports | port (in progress, below) |
-| Sensor JXF22/JXF23, sinfo | ingenic-sdk `3.10.14/sensor-src`, open-tx-isp `tx_isp_sinfo.c` | same V4L2 subdev core, `jzgpio_set_func` for the DVP pins and MCLK | port with the ISP |
-| Encoder | vendor `drivers/video/soc_vpu` (`soc_vpu.c`, `jz_nvpu.c`) and `drivers/video/jz_ipu` (`jz_ipu_v13.c`), GPL, about 5k lines; the H.264 encoder itself runs in libimp/OpenIMP on the VPU | 3.10 driver APIs (misc device, `dma_cache_*`, vendor CPM registers) | port, not started |
-| libimp | OpenIMP (T20 "release": all 44 IMP functions uvcd calls are implemented and device-tested on T20, table below) | none in the library; it needs the same kernel interfaces as libimp | build for musl, link into uvcd |
-| Audio | ingenic-sdk `3.10.14/audio/t20/oss2` | OSS-style 3.10 driver, vendor DMA | port, not started |
+| Sensor JX-F22/JX-F23 | `jxf2x` (patch 0011): V4L2 subdevice, exposure, analog gain, frame length; both sensors, told apart by chip ID | `IMP_ISP_AddSensor`, `EnableSensor`; exposure and gain from our AE | builds |
+| ISP | `t20-isp` (patch 0012): VIC + ISP core, NV12 out of DS1 at sensor size, one video node | FrameSource channels | first version builds |
+| Auto exposure, white balance | statistics node (to do; the statistics layout is not known yet) | our AE/AWB, from statistics or from the frames | AE on frame luma in `capture/v4l2grab.c`; AWB not started |
+| Image tuning (gamma, noise reduction, shading, sharpness) | parameters node (to do; the tables' formats are not known yet) | `IMP_ISP_Tuning_*` | not started; those blocks are bypassed, so the picture is linear (dark, flat) |
+| Second stream | DS2 path (to do) | detector channel | not started |
+| H.264 encoder | VPU at 0x13200000 (register map in Ingenic's GPL `jzm_vpu.h`); V4L2 stateful encoder (to do) | `IMP_Encoder_*` | not started: the encoding itself (motion search, mode decision, entropy coding, rate control) is in the closed libimp; a clean-room encoder for this VPU is the largest piece left |
+| JPEG | the VPU's JPEG codec block (`JPGC`, documented in `jzm_vpu.h`) | snapshot channel | not started |
+| Audio | ALSA (the AIC and the internal codec; mainline has related Ingenic drivers) | not used by uvcd yet | not started |
 
-**Decision: uvcd keeps the libimp API, through OpenIMP, and the kernel provides
-the vendor interfaces.** Reasons: open-tx-isp and OpenIMP are device-tested on the
-T20 as a pair and against stock libimp, so the ISP port can be checked against
-the closed libimp first (same ioctls) and OpenIMP swapped in afterwards; the
-picture quality (AE, AWB, noise reduction, the sensor tuning file) lives in that
-pair and would have to be rewritten for V4L2; the encoder on the T20 is mostly
-userspace firmware driven through `/dev/soc_vpu`, for which there is no V4L2
-driver anywhere; and uvcd's 44 IMP calls (below) stay as they are. A V4L2 driver
-would be the cleaner long-term interface, but it is a new ISP and encoder driver,
-not a port. The cost of this choice is that the drivers keep vendor-style
-interfaces in a modern kernel (`t20-compat.ko`, below), outside mainline.
+What `t20-isp` does today: VIC set up for the 10-bit parallel bus, the ISP core's
+geometry and Bayer order, every block that needs a memory table bypassed (white
+balance, demosaic, colour matrix and the DS1 colour space converter at their reset
+values: gains 1.0, identity matrix, BT.601), the DS1 Y and UV writers in NV12 from
+32 MB of reserved memory, frames completed on the DS1 output-end interrupt
+(source 50, the one source number the SDK shows). No crop, scaling, mirroring,
+statistics or tuning. Unknowns are listed in `t20-isp-hardware.md`.
 
-**ISP port, state.** `t20-compat.ko` supplies the arch interfaces and
-`compat/include` the vendor headers; the kernel has V4L2 and the media
-controller as modules (`videodev.ko` 290 KB, `mc.ko` 49 KB, not in the kernel
-image), because the ISP registers subdevices, video nodes and controls with them
-and already uses the `v4l2_ctrl` framework. With that, open-tx-isp's T20 module
-compiles to 272 errors, listed by cause in `uvc/kernel/compat/README`: mostly the
-renamed media bus codes and V4L2 ioctls and ops removed since 3.10 (mechanical),
-then videobuf2 and dma-buf changes in the frame channels, which are the
-interface libimp reads frames from and must keep their ABI exactly (the
-real work), plus `set_fs` in the tuning-file loader and include-order
-constants. A private copy of the whole 3.10 V4L2 core in the module was the
-alternative; the ISP also uses video nodes, videobuf2, priorities and controls
-from it, about 12k lines of 3.10 code, more than porting the callers. Order
-after the ISP builds: load it with the closed libimp first (same ioctls, so
-uvcd unchanged) to get video out, then the sensor drivers (same subdev changes),
-VPU/IPU (encoder), OpenIMP in uvcd, audio.
+### uvcd's libimp calls
 
-### uvcd's libimp calls against OpenIMP (T20)
+uvcd calls 44 libimp functions (all in `src/capture.c`; `IMP_Log_Get_Option` is
+uvcd's own, in `imp_compat.c`). Our implementation maps them onto the drivers:
 
-From `uvc/src` (all in `capture.c`, plus `IMP_Log_Get_Option`, which uvcd itself
-provides in `imp_compat.c`). OpenIMP status from its `docs/FEATURE_MATRIX.md`
-(RC2, 2026-10-25): ✅ = implemented, device-tested on T20 and audited.
+| Calls | Over |
+|---|---|
+| `IMP_System_Init`, `Exit`, `Bind`, `UnBind`, `RebaseTimeStamp` | opening the media device and video nodes; binding is the fixed ISP → encoder path |
+| `IMP_ISP_Open`, `Close`, `AddSensor`, `DelSensor`, `EnableSensor`, `DisableSensor`, `EnableTuning`, `DisableTuning` | the sensor subdevice and the ISP |
+| `IMP_ISP_Tuning_SetISPRunningMode` | day/night: AE target and colour (with the IR cut filter, which uvcd drives itself) |
+| `IMP_ISP_Tuning_SetISPHflip`, `SetISPVflip` | ISP mirror and sensor flip (to do in the drivers) |
+| `IMP_ISP_Tuning_SetBrightness`, `SetContrast`, `SetSaturation`, `SetSharpness`, `SetTemperStrength`, `SetSceneMode`, `SetColorfxMode`, `SetWDRAttr` | ISP parameters (to do) |
+| `IMP_FrameSource_CreateChn`, `DestroyChn`, `SetChnAttr`, `EnableChn`, `DisableChn`, `SetFrameDepth`, `GetFrame`, `ReleaseFrame` | the DS1 and DS2 video nodes |
+| `IMP_Encoder_CreateGroup`, `DestroyGroup`, `CreateChn`, `DestroyChn`, `RegisterChn`, `UnRegisterChn`, `StartRecvPic`, `StopRecvPic`, `PollingStream`, `GetStream`, `ReleaseStream` | the encoder's V4L2 node, frames passed as dma-bufs from the ISP |
 
-| Call | Use in uvcd | OpenIMP T20 |
-|---|---|---|
-| `IMP_System_Init`, `IMP_System_Exit` | start, stop | ✅ |
-| `IMP_System_Bind`, `IMP_System_UnBind` | frame source → encoder group | ✅ |
-| `IMP_System_RebaseTimeStamp` | timestamps on the monotonic clock | ✅ |
-| `IMP_ISP_Open`, `IMP_ISP_Close` | ISP session | ✅ |
-| `IMP_ISP_AddSensor`, `IMP_ISP_DelSensor`, `IMP_ISP_EnableSensor`, `IMP_ISP_DisableSensor` | JXF22/JXF23 | ✅ |
-| `IMP_ISP_EnableTuning`, `IMP_ISP_DisableTuning` | tuning session | ✅ |
-| `IMP_ISP_Tuning_SetISPRunningMode` | day/night | ✅ |
-| `IMP_ISP_Tuning_SetISPHflip`, `IMP_ISP_Tuning_SetISPVflip` | image flip | ✅ |
-| `IMP_ISP_Tuning_SetBrightness`, `SetContrast`, `SetSaturation`, `SetSharpness` | image settings | ✅ |
-| `IMP_ISP_Tuning_SetTemperStrength` | temporal noise reduction | ✅ |
-| `IMP_ISP_Tuning_SetSceneMode`, `SetColorfxMode`, `SetWDRAttr` | defaults | ✅ |
-| `IMP_FrameSource_CreateChn`, `DestroyChn`, `SetChnAttr`, `EnableChn`, `DisableChn`, `SetFrameDepth` | main and detector channels | ✅ |
-| `IMP_FrameSource_GetFrame`, `ReleaseFrame` | detector frames (NV12) | ✅ |
-| `IMP_Encoder_CreateGroup`, `DestroyGroup`, `CreateChn`, `DestroyChn`, `RegisterChn`, `UnRegisterChn` | H.264 and JPEG channels | ✅ |
-| `IMP_Encoder_StartRecvPic`, `StopRecvPic`, `PollingStream`, `GetStream`, `ReleaseStream` | encoded stream | ✅ |
-| `IMP_Log_Get_Option` | libalog hook | uvcd's own (`imp_compat.c`) |
-
-Moving to OpenIMP also removes the two workarounds for the closed library:
-`tools/imp-rename.py` and the `mm32`/`ftrunc32` shims exist because libimp was
-built with uClibc's 32-bit `off_t`; OpenIMP built with zig cc for musl does not
-need them. The ispmem/rmem mapping stays (OpenIMP maps rmem through `/dev/mem`
-too, at the address our device tree keeps free).
+Order from here: test the sensor and ISP on hardware with `v4l2grab` (below),
+then statistics and our AE/AWB, the DS2 stream, the encoder, our libimp in uvcd,
+then audio.
 
 ## Hardware test plan
 
@@ -306,7 +269,17 @@ but see the JFFS2 risk below.
 5. **WiFi**: `modprobe 8189fs`, `ip link` shows wlan0 with the camera's MAC, S20wifi
    associates, DHCP, `ssh` in. Then the watchdog: uvcd arms it; `killall -STOP uvcd`
    must reboot the camera.
-6. **Back to OpenMiko's kernel** once (`image/flash.sh` writes only the root
+6. **Camera** (with SSH up, since a mistake here can hang the SoC):
+   `modprobe jxf2x`, then `dmesg` shows `jxf22` or `jxf23`; `modprobe t20-isp`,
+   then `/dev/video0` and two `/dev/v4l-subdev*` exist. `v4l2grab
+   /sdcard/f.nv12 100` streams 100 frames: it should report about 25 fps and a
+   mean Y that settles near 110 as its auto exposure works. Convert the saved
+   frame with `ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -i f.nv12 f.png`:
+   expect a dark, flat, unbalanced picture (no gamma, white balance or noise
+   reduction yet). Failures to report: no frame in 2 s (interrupt routing or
+   the input port), DMA alarms, a green or striped picture (writer format or
+   Bayer order), a hang (register access with a clock off).
+7. **Back to OpenMiko's kernel** once (`image/flash.sh` writes only the root
    partition and leaves our kernel in place, so use demo.bin) to prove the way back.
 
 **First-boot risks**, most likely first:
@@ -332,8 +305,9 @@ but see the JFFS2 risk below.
   shows whether the card enumerates. Without serial the only way back is demo.bin.
 - **Init**: OpenMiko's busybox and uClibc on a 6.18 kernel (system calls are
   compatible; not seen to run). `/sbin/init` is the kernel's default.
-- **No camera**: expected. uvcd starts, finds no `/proc/jz/sinfo/info`, logs it and
-  keeps restarting every 5 s; WiFi, SSH and the LEDs work.
+- **No camera in uvcd**: expected. uvcd starts, finds no `/proc/jz/sinfo/info`,
+  logs it and keeps restarting every 5 s; WiFi, SSH and the LEDs work. The
+  camera drivers are not loaded at boot (step 6 loads them by hand).
 
 ## Building
 

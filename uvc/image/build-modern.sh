@@ -34,6 +34,10 @@ ln -s ../sbin/dropbear $OUT/overlay/usr/bin/dropbearkey
 mkdir -p $OUT/payload/rom/uvc/models
 cp build/uvcd-mipsel $OUT/payload/rom/uvc/uvcd
 chmod 755 $OUT/payload/rom/uvc/uvcd
+# Camera driver test (docs/kernel-modern.md, hardware test plan)
+mkdir -p $OUT/payload/usr/bin
+zig cc -target mipsel-linux-musleabihf -mcpu=mips32r2 -Os -static -s \
+    -o $OUT/payload/usr/bin/v4l2grab capture/v4l2grab.c
 cp third_party/models/yolo-fastest-1.1.param third_party/models/yolo-fastest-1.1.bin \
     $OUT/payload/rom/uvc/models/
 

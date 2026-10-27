@@ -11,11 +11,10 @@ gpio_out() {
 case "$1" in
 start)
 	if [ ! -d /lib/modules/3.10.14 ]; then
-		# Our kernel: V4L2 drivers for the sensor (either model) and the
-		# ISP, video on /dev/video0. uvcd does not read it yet
-		# (docs/kernel-modern.md).
-		modprobe jxf2x
-		modprobe t20-isp
+		# Our kernel: the sensor (jxf2x) and ISP (t20-isp) drivers are
+		# loaded by hand until they are tested (docs/kernel-modern.md,
+		# hardware test plan); uvcd does not read them yet.
+		logger -s -t camera "camera drivers not loaded on $(uname -r)"
 		exit 0
 	fi
 	# USB power (some board revisions need it)
