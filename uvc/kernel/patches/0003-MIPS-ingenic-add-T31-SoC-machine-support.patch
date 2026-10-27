@@ -1,0 +1,81 @@
+From 4863b2cdc7b3deba472f63e07a4f702c0dfb5b87 Mon Sep 17 00:00:00 2001
+From: Alfonso Gamboa <gtxent@gmail.com>
+Date: Sun, 3 May 2026 08:38:52 -0700
+Subject: [PATCH 3/9] MIPS: ingenic: add T31 SoC machine support
+
+Add MACH_T31 Kconfig option, MACH_INGENIC_T31 enum, the system_type
+mapping, the 'ingenic,t31' OF match, and a dtb build entry for the
+thingino-t31 board.
+
+Signed-off-by: Alfonso Gamboa <gtxent@gmail.com>
+---
+ arch/mips/boot/dts/ingenic/Makefile | 1 +
+ arch/mips/generic/board-ingenic.c   | 3 +++
+ arch/mips/include/asm/bootinfo.h    | 1 +
+ arch/mips/ingenic/Kconfig           | 7 +++++++
+ 4 files changed, 12 insertions(+)
+
+diff --git a/arch/mips/boot/dts/ingenic/Makefile b/arch/mips/boot/dts/ingenic/Makefile
+index 6e674f1a3..a34b37723 100644
+--- a/arch/mips/boot/dts/ingenic/Makefile
++++ b/arch/mips/boot/dts/ingenic/Makefile
+@@ -5,3 +5,4 @@ dtb-$(CONFIG_JZ4770_GCW0)	+= gcw0.dtb
+ dtb-$(CONFIG_JZ4780_CI20)	+= ci20.dtb
+ dtb-$(CONFIG_X1000_CU1000_NEO)	+= cu1000-neo.dtb
+ dtb-$(CONFIG_X1830_CU1830_NEO)	+= cu1830-neo.dtb
++dtb-$(CONFIG_MACH_T31)		+= thingino-t31.dtb
+diff --git a/arch/mips/generic/board-ingenic.c b/arch/mips/generic/board-ingenic.c
+index 1f4906875..8a70232dd 100644
+--- a/arch/mips/generic/board-ingenic.c
++++ b/arch/mips/generic/board-ingenic.c
+@@ -24,6 +24,8 @@
+ static __init char *ingenic_get_system_type(unsigned long machtype)
+ {
+ 	switch (machtype) {
++	case MACH_INGENIC_T31:
++		return "T31";
+ 	case MACH_INGENIC_X2100:
+ 		return "X2100";
+ 	case MACH_INGENIC_X2000H:
+@@ -151,6 +153,7 @@ static const struct of_device_id ingenic_of_match[] __initconst = {
+ 	{ .compatible = "ingenic,x2000e", .data = (void *)MACH_INGENIC_X2000E },
+ 	{ .compatible = "ingenic,x2000h", .data = (void *)MACH_INGENIC_X2000H },
+ 	{ .compatible = "ingenic,x2100", .data = (void *)MACH_INGENIC_X2100 },
++	{ .compatible = "ingenic,t31", .data = (void *)MACH_INGENIC_T31 },
+ 	{}
+ };
+ 
+diff --git a/arch/mips/include/asm/bootinfo.h b/arch/mips/include/asm/bootinfo.h
+index 2128ba903..198f00594 100644
+--- a/arch/mips/include/asm/bootinfo.h
++++ b/arch/mips/include/asm/bootinfo.h
+@@ -86,6 +86,7 @@ enum ingenic_machine_type {
+ 	MACH_INGENIC_X2000E,
+ 	MACH_INGENIC_X2000H,
+ 	MACH_INGENIC_X2100,
++	MACH_INGENIC_T31,
+ };
+ 
+ extern char *system_type;
+diff --git a/arch/mips/ingenic/Kconfig b/arch/mips/ingenic/Kconfig
+index f595b339a..e04358673 100644
+--- a/arch/mips/ingenic/Kconfig
++++ b/arch/mips/ingenic/Kconfig
+@@ -9,6 +9,7 @@ config MACH_INGENIC_GENERIC
+ 	select MACH_JZ4780
+ 	select MACH_X1000
+ 	select MACH_X1830
++	select MACH_T31
+ 
+ choice
+ 	prompt "Machine type"
+@@ -76,3 +77,9 @@ config MACH_X1830
+ 	select MIPS_CPU_SCACHE
+ 	select SYS_HAS_CPU_MIPS32_R2
+ 	select SYS_SUPPORTS_HIGHMEM
++
++config MACH_T31
++	bool
++	select MIPS_CPU_SCACHE
++	select SYS_HAS_CPU_MIPS32_R2
++	select SYS_SUPPORTS_HIGHMEM

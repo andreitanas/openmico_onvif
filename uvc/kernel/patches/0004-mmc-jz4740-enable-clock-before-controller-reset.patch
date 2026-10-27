@@ -1,0 +1,32 @@
+From 57f97561528a302459dd9f03b31d7badc8333479 Mon Sep 17 00:00:00 2001
+From: Alfonso Gamboa <gtxent@gmail.com>
+Date: Sun, 3 May 2026 08:38:52 -0700
+Subject: [PATCH 4/9] mmc: jz4740: enable clock before controller reset
+
+On T31 the MSC clock is gated at boot. Calling jz4740_mmc_reset()
+before clk_prepare_enable() writes to ungated registers and the
+controller never comes out of reset; the SD card never enumerates.
+Enable the clock first.
+
+Signed-off-by: Alfonso Gamboa <gtxent@gmail.com>
+---
+ drivers/mmc/host/jz4740_mmc.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/mmc/host/jz4740_mmc.c b/drivers/mmc/host/jz4740_mmc.c
+index 6a0d0250d..1b205c2bd 100644
+--- a/drivers/mmc/host/jz4740_mmc.c
++++ b/drivers/mmc/host/jz4740_mmc.c
+@@ -947,11 +947,11 @@ static void jz4740_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 
+ 	switch (ios->power_mode) {
+ 	case MMC_POWER_UP:
++		clk_prepare_enable(host->clk);
+ 		jz4740_mmc_reset(host);
+ 		if (!IS_ERR(mmc->supply.vmmc))
+ 			mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, ios->vdd);
+ 		host->cmdat |= JZ_MMC_CMDAT_INIT;
+-		clk_prepare_enable(host->clk);
+ 		break;
+ 	case MMC_POWER_ON:
+ 		if (!IS_ERR(mmc->supply.vqmmc) && !host->vqmmc_enabled) {

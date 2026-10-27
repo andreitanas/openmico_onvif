@@ -1,0 +1,61 @@
+From e831675bd265cd141569cc5f104ec6b4c41daf84 Mon Sep 17 00:00:00 2001
+From: Alfonso Gamboa <gtxent@gmail.com>
+Date: Sun, 3 May 2026 08:38:52 -0700
+Subject: [PATCH 2/9] irqchip/clocksource/serial: ingenic: add T31 SoC
+ compatibles
+
+Add 'ingenic,t31-intc', 'ingenic,t31-ost' and 'ingenic,t31-uart'
+matches. The hardware is identical to existing fallbacks (jz4780
+intc, jz4760b ost, x1000 uart), so all three can reuse the existing
+configuration data.
+
+Signed-off-by: Alfonso Gamboa <gtxent@gmail.com>
+---
+ drivers/clocksource/ingenic-ost.c      | 1 +
+ drivers/irqchip/irq-ingenic.c          | 1 +
+ drivers/tty/serial/8250/8250_ingenic.c | 4 ++++
+ 3 files changed, 6 insertions(+)
+
+diff --git a/drivers/clocksource/ingenic-ost.c b/drivers/clocksource/ingenic-ost.c
+index e0ec33307..4a032eb25 100644
+--- a/drivers/clocksource/ingenic-ost.c
++++ b/drivers/clocksource/ingenic-ost.c
+@@ -170,6 +170,7 @@ static const struct of_device_id ingenic_ost_of_match[] = {
+ 	{ .compatible = "ingenic,jz4725b-ost", .data = &jz4725b_ost_soc_info, },
+ 	{ .compatible = "ingenic,jz4760b-ost", .data = &jz4760b_ost_soc_info, },
+ 	{ .compatible = "ingenic,jz4770-ost", .data = &jz4760b_ost_soc_info, },
++	{ .compatible = "ingenic,t31-ost", .data = &jz4760b_ost_soc_info, },
+ 	{ }
+ };
+ 
+diff --git a/drivers/irqchip/irq-ingenic.c b/drivers/irqchip/irq-ingenic.c
+index 52393724f..a27e9e7af 100644
+--- a/drivers/irqchip/irq-ingenic.c
++++ b/drivers/irqchip/irq-ingenic.c
+@@ -158,3 +158,4 @@ IRQCHIP_DECLARE(jz4760_intc, "ingenic,jz4760-intc", intc_2chip_of_init);
+ IRQCHIP_DECLARE(jz4770_intc, "ingenic,jz4770-intc", intc_2chip_of_init);
+ IRQCHIP_DECLARE(jz4775_intc, "ingenic,jz4775-intc", intc_2chip_of_init);
+ IRQCHIP_DECLARE(jz4780_intc, "ingenic,jz4780-intc", intc_2chip_of_init);
++IRQCHIP_DECLARE(t31_intc, "ingenic,t31-intc", intc_2chip_of_init);
+diff --git a/drivers/tty/serial/8250/8250_ingenic.c b/drivers/tty/serial/8250/8250_ingenic.c
+index 94542fc14..4a713c0f6 100644
+--- a/drivers/tty/serial/8250/8250_ingenic.c
++++ b/drivers/tty/serial/8250/8250_ingenic.c
+@@ -168,6 +168,9 @@ OF_EARLYCON_DECLARE(jz4780_uart, "ingenic,jz4780-uart",
+ OF_EARLYCON_DECLARE(x1000_uart, "ingenic,x1000-uart",
+ 		    ingenic_early_console_setup);
+ 
++OF_EARLYCON_DECLARE(t31_uart, "ingenic,t31-uart",
++		    ingenic_early_console_setup);
++
+ static void ingenic_uart_serial_out(struct uart_port *p, unsigned int offset, u32 value)
+ {
+ 	u32 ier;
+@@ -351,6 +354,7 @@ static const struct of_device_id of_match[] = {
+ 	{ .compatible = "ingenic,jz4775-uart", .data = &jz4760_uart_config },
+ 	{ .compatible = "ingenic,jz4780-uart", .data = &jz4780_uart_config },
+ 	{ .compatible = "ingenic,x1000-uart", .data = &x1000_uart_config },
++	{ .compatible = "ingenic,t31-uart", .data = &x1000_uart_config },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, of_match);

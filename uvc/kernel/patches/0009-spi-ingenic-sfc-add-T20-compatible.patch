@@ -1,0 +1,22 @@
+From 728a46fe79dd81ed1089b95fb4dca874a7402f62 Mon Sep 17 00:00:00 2001
+From: openmico_onvif <andrei.tanas@gmail.com>
+Date: Tue, 27 Oct 2026 01:20:39 +0000
+Subject: [PATCH 9/9] spi: ingenic-sfc: add T20 compatible
+
+Same registers as the X1000's SFC (vendor drivers/mtd/devices/jz_sfc.h).
+---
+ drivers/spi/spi-ingenic-sfc.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/spi/spi-ingenic-sfc.c b/drivers/spi/spi-ingenic-sfc.c
+index dde5feb64..4de18ec8b 100644
+--- a/drivers/spi/spi-ingenic-sfc.c
++++ b/drivers/spi/spi-ingenic-sfc.c
+@@ -698,6 +698,7 @@ static const struct of_device_id ingenic_sfc_of_matches[] = {
+ 	{ .compatible = "ingenic,x1600-sfc", .data = &x1600_soc_info },
+ 	{ .compatible = "ingenic,x1700-sfc", .data = &x1600_soc_info },
+ 	{ .compatible = "ingenic,x1830-sfc", .data = &x1000_soc_info },
++	{ .compatible = "ingenic,t20-sfc", .data = &x1000_soc_info },
+ 	{ .compatible = "ingenic,t31-sfc", .data = &x1000_soc_info },
+ 	{ .compatible = "ingenic,x2000-sfc", .data = &x2000_soc_info },
+ 	{ .compatible = "ingenic,x2500-sfc", .data = &x2000_soc_info },
