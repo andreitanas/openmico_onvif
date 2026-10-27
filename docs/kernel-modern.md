@@ -31,6 +31,26 @@ So the new kernel is a bring-up kernel: shell on the serial console, flash, SD c
 GPIOs and LEDs, WiFi and SSH, no camera. The image scripts keep OpenMiko's kernel
 as the default (`image/build.sh`, `image/flash.sh` are unchanged in behaviour).
 
+## Where this stopped
+
+Work paused here, on branch `kernel-modern`, with the owner to test on hardware:
+
+- Built and checked here (clean rebuild from `kernel/build.sh`): the kernel,
+  the device tree, the WiFi module, `jxf2x`, `t20-isp`, `capture/v4l2grab`.
+- Written, not run: `image/build-modern.sh` and `image/flash-modern.sh` (they
+  need OpenMiko's `deploy/demo.bin`, which is not in this environment).
+- Not started: ISP statistics and AE/AWB in the driver, ISP tuning tables, the
+  DS2 stream, mirror and flip, the H.264 and JPEG encoders, our libimp, audio.
+- Next, in order: hardware test steps 1-5 (boot, flash, SD, WiFi), then step 6
+  (the camera with `v4l2grab`); what comes back decides the ISP work. The
+  encoder is the largest open piece and the riskiest: the VPU's registers are
+  documented (Ingenic's GPL `jzm_vpu.h`), the encoding algorithm is not. Start
+  with JPEG, the smaller block.
+- Top first-boot risks: see "First-boot risks" in the [Hardware test plan](#hardware-test-plan). In short, a
+  wrong clock or pin setting can leave the camera without console output and,
+  since serial U-Boot is not set up, recovery is the SD card `demo.bin` only;
+  if WiFi does not come up there is no SSH.
+
 ## Sources
 
 All pinned in `uvc/kernel/build.sh`:
@@ -135,14 +155,16 @@ buffers, used by the ISP driver through the DMA API.
 
 | | Today (OpenMiko 3.10.14) | Linux 6.18 |
 |---|---|---|
-| uImage | (in a 2048 KiB partition, with the initramfs) | 1,707,911 bytes of 2,097,152 (81 %) |
-| Unpacked image | | 5,016,976 bytes of 5,242,880 |
+| uImage | (in a 2048 KiB partition, with the initramfs) | 1,716,688 bytes of 2,097,152 (82 %) |
+| Unpacked image | | 5,050,772 bytes of 5,242,880 (192 KB left) |
 | Kernel code | 3877k | 3621k |
 | Data | 1205k | 1112k "rwdata" (of which 924k read-only), 67k bss |
 | Init, freed after boot | | 188k |
 | Modules loaded for WiFi | 8189fs (cfg80211 built in) | cfg80211 504k, ipv6 555k, 8189fs (2.2 MB file, stripped), firmware_class, libsha1 |
 | Root filesystem | `rootfs.tar.xz` unpacked into RAM (zram) on every boot | squashfs read from flash, page cache only |
 
+The code and data figures are from the build before the camera drivers; the
+media core added about 34 KB since (the camera drivers themselves are modules).
 Kernel figures as the kernel prints them at boot ("Memory: ... kernel code,
 rwdata, rodata, init, bss"), from `System.map`. The resident kernel is a little
 smaller than today's; cfg80211 and IPv6 move from built-in to modules, so with
