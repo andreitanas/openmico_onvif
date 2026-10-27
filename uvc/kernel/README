@@ -16,7 +16,8 @@ patches/      applied in order to Linux v6.18.59:
               builds.
   0009        SFC: T20 compatible (X1000 registers). Ours; builds.
   0010        spi-nor: erase in 32 KiB blocks. Ours; builds.
-compat/       vendor 3.10 interfaces for the ported camera drivers (README)
+  0011        JX-F22/JX-F23 sensor, V4L2 subdevice. Ours (register tables
+              from Ingenic's GPL-2.0+ sensor drivers); builds.
 Out of tree:  rtl8189fs (WiFi), jwrdegoede/rtl8189ES_linux 13bbdbc; builds.
 
 Nothing has run on a camera yet.

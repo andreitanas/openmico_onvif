@@ -127,14 +127,18 @@ CONFIG_I2C=y
 CONFIG_I2C_CHARDEV=y
 CONFIG_I2C_JZ4780=y
 
-## V4L2 and the media controller, as modules: the ISP driver (open-tx-isp,
-## being ported) registers subdevices, video nodes and controls with them
+## V4L2 and the media controller, as modules (not in the kernel image): the
+## sensor and ISP drivers are V4L2 subdevices and video nodes
 CONFIG_MEDIA_SUPPORT=m
 CONFIG_MEDIA_SUPPORT_FILTER=y
 CONFIG_MEDIA_PLATFORM_SUPPORT=y
+CONFIG_MEDIA_CAMERA_SUPPORT=y
 CONFIG_VIDEO_DEV=m
 CONFIG_MEDIA_CONTROLLER=y
 CONFIG_MEDIA_SUBDRV_AUTOSELECT=n
+# Image sensor: JX-F22 or JX-F23 (our patch 0011), on the ISP's parallel input
+CONFIG_VIDEO_CAMERA_SENSOR=y
+CONFIG_VIDEO_JXF2X=m
 
 ## Filesystems: squashfs root, JFFS2 config partition, vfat SD card
 CONFIG_MISC_FILESYSTEMS=y

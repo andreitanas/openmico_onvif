@@ -1,0 +1,645 @@
+From: openmico_onvif <andrei.tanas@gmail.com>
+Subject: [PATCH] media: i2c: add SOI JX-F22/JX-F23 sensor driver
+
+V4L2 sensor subdevice for the Wyze Cam v2 image sensors (1080p, 10-bit
+Bayer on a parallel bus). One driver for both: it reads the chip ID. Register
+tables, gain table and reset timing from Ingenic's GPL-2.0+ T20 sensor
+drivers; the V4L2 side is new.
+---
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index cdd7ba5da..030bef632 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -137,6 +137,16 @@ config VIDEO_HI847
+           To compile this driver as a module, choose M here: the
+           module will be called hi847.
+ 
++config VIDEO_JXF2X
++	tristate "SOI JX-F22 and JX-F23 sensor support"
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the SOI JX-F22 and
++	  JX-F23 1080p image sensors (Wyze Cam v2).
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called jxf2x.
++
+ config VIDEO_IMX208
+ 	tristate "Sony IMX208 sensor support"
+ 	help
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index 57cdd8dc9..d716c6823 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -46,6 +46,7 @@ obj-$(CONFIG_VIDEO_HI556) += hi556.o
+ obj-$(CONFIG_VIDEO_HI846) += hi846.o
+ obj-$(CONFIG_VIDEO_HI847) += hi847.o
+ obj-$(CONFIG_VIDEO_I2C) += video-i2c.o
++obj-$(CONFIG_VIDEO_JXF2X) += jxf2x.o
+ obj-$(CONFIG_VIDEO_IMX208) += imx208.o
+ obj-$(CONFIG_VIDEO_IMX214) += imx214.o
+ obj-$(CONFIG_VIDEO_IMX219) += imx219.o
+diff --git a/drivers/media/i2c/jxf2x.c b/drivers/media/i2c/jxf2x.c
+new file mode 100644
+index 000000000..2884ebe77
+--- /dev/null
++++ b/drivers/media/i2c/jxf2x.c
+@@ -0,0 +1,598 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * SOI JX-F22 and JX-F23 image sensors (1920x1080, 10-bit Bayer, parallel
++ * bus), as on the Wyze Cam v2: both 0x40 on I2C, told apart by their chip
++ * ID, which this driver reads.
++ *
++ * Register tables, the analog gain table, the exposure and frame length
++ * registers and the reset timing are from Ingenic's T20 sensor drivers
++ * (sensor-src/t20/jxf22.c and jxf23.c, Copyright (C) 2012 Ingenic
++ * Semiconductor Co., Ltd., GPL-2.0+). The V4L2 side is new.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++#define JXF2X_REG_AGAIN		CCI_REG8(0x00)
++#define JXF2X_REG_EXPO_L	CCI_REG8(0x01)
++#define JXF2X_REG_EXPO_H	CCI_REG8(0x02)
++#define JXF2X_REG_PID		CCI_REG8(0x0a)
++#define JXF2X_REG_VER		CCI_REG8(0x0b)
++#define JXF2X_REG_SYS		CCI_REG8(0x12)
++#define JXF2X_SYS_SLEEP		0x40
++#define JXF2X_REG_GROUP		CCI_REG8(0x1f)
++#define JXF2X_GROUP_LATCH	0x80
++#define JXF2X_REG_HTS_L		CCI_REG8(0x20)
++#define JXF2X_REG_HTS_H		CCI_REG8(0x21)
++#define JXF2X_REG_VTS_L		CCI_REG8(0x22)
++#define JXF2X_REG_VTS_H		CCI_REG8(0x23)
++/* Group write: register number and value pairs, latched by GROUP bit 7 */
++#define JXF2X_REG_GRP_ADDR0	CCI_REG8(0xc0)
++#define JXF2X_REG_GRP_DATA0	CCI_REG8(0xc1)
++#define JXF2X_REG_GRP_ADDR1	CCI_REG8(0xc2)
++#define JXF2X_REG_GRP_DATA1	CCI_REG8(0xc3)
++
++#define JXF2X_WIDTH		1920
++#define JXF2X_HEIGHT		1080
++#define JXF2X_VTS_DEFAULT	1350
++#define JXF2X_VTS_MAX		0xffff
++#define JXF2X_EXPO_MIN		2
++#define JXF2X_EXPO_MARGIN	4
++#define JXF2X_XCLK		24000000
++#define JXF2X_DELAY		0xfe
++
++struct jxf2x_reg {
++	u8 reg;
++	u8 val;
++};
++
++static const struct jxf2x_reg jxf22_1080p25_dvp[] = {
++	{ 0x12, 0x40 }, { 0x0e, 0x11 }, { 0x0f, 0x00 }, { 0x10, 0x36 },
++	{ 0x11, 0x80 }, { 0x5f, 0x01 }, { 0x60, 0x0a }, { 0x19, 0x20 },
++	{ 0x48, 0x05 }, { 0x20, 0xb0 }, { 0x21, 0x04 }, { 0x22, 0x46 },
++	{ 0x23, 0x05 }, { 0x24, 0xc0 }, { 0x25, 0x38 }, { 0x26, 0x43 },
++	{ 0x27, 0xcc }, { 0x28, 0x18 }, { 0x29, 0x01 }, { 0x2a, 0xc0 },
++	{ 0x2b, 0x21 }, { 0x2c, 0x04 }, { 0x2d, 0x01 }, { 0x2e, 0x15 },
++	{ 0x2f, 0x44 }, { 0x41, 0xcc }, { 0x42, 0x03 }, { 0x39, 0x90 },
++	{ 0x1d, 0xff }, { 0x1e, 0x9f }, { 0x6c, 0x90 }, { 0x30, 0x8c },
++	{ 0x31, 0x0c }, { 0x32, 0xf0 }, { 0x33, 0x0c }, { 0x34, 0x1f },
++	{ 0x35, 0xe3 }, { 0x36, 0x0e }, { 0x37, 0x34 }, { 0x38, 0x13 },
++	{ 0x3a, 0x08 }, { 0x3b, 0x30 }, { 0x3c, 0xc0 }, { 0x3d, 0x00 },
++	{ 0x3e, 0x00 }, { 0x3f, 0x00 }, { 0x40, 0x00 }, { 0x6f, 0x03 },
++	{ 0x0d, 0x14 }, { 0x56, 0x32 }, { 0x5a, 0x20 }, { 0x5b, 0xb3 },
++	{ 0x5c, 0xf7 }, { 0x5d, 0xf0 }, { 0x62, 0x80 }, { 0x63, 0x80 },
++	{ 0x64, 0x00 }, { 0x67, 0x75 }, { 0x68, 0x04 }, { 0x6a, 0x4d },
++	{ 0x8f, 0x18 }, { 0x91, 0x04 }, { 0x0c, 0x00 }, { 0x59, 0x97 },
++	{ 0x4a, 0x05 }, { 0x49, 0x10 }, { 0x50, 0x02 }, { 0x47, 0x22 },
++	{ 0x7e, 0xcd }, { 0x7f, 0x52 }, { 0x7b, 0x57 }, { 0x7c, 0x28 },
++	{ 0x80, 0x00 }, { 0x13, 0x81 }, { 0x93, 0x5c }, { 0x45, 0x89 },
++	{ JXF2X_DELAY, 250 },
++	{ JXF2X_DELAY, 250 },
++	{ 0x45, 0x09 }, { 0x1f, 0x01 },
++};
++
++static const struct jxf2x_reg jxf23_1080p25_dvp[] = {
++	{ 0x0e, 0x11 }, { 0x0f, 0x14 }, { 0x10, 0x40 }, { 0x11, 0x80 },
++	{ 0x48, 0x05 }, { 0x96, 0xaa }, { 0x94, 0xc0 }, { 0x97, 0x8d },
++	{ 0x96, 0x00 }, { 0x12, 0x40 }, { 0x0e, 0x11 }, { 0x0f, 0x14 },
++	{ 0x10, 0x48 }, { 0x11, 0x80 }, { 0x0d, 0x50 }, { 0x5f, 0x41 },
++	{ 0x60, 0x20 }, { 0x58, 0x12 }, { 0x57, 0x60 }, { 0x9d, 0x00 },
++	{ 0x20, 0x00 }, { 0x21, 0x05 }, { 0x22, 0x46 }, { 0x23, 0x05 },
++	{ 0x24, 0xc0 }, { 0x25, 0x38 }, { 0x26, 0x43 }, { 0x27, 0xc3 },
++	{ 0x28, 0x19 }, { 0x29, 0x04 }, { 0x2c, 0x00 }, { 0x2d, 0x00 },
++	{ 0x2e, 0x18 }, { 0x2f, 0x44 }, { 0x41, 0xc9 }, { 0x42, 0x13 },
++	{ 0x46, 0x00 }, { 0x76, 0x60 }, { 0x77, 0x09 }, { 0x1d, 0xff },
++	{ 0x1e, 0x9f }, { 0x6c, 0xc0 }, { 0x2a, 0xb1 }, { 0x2b, 0x24 },
++	{ 0x31, 0x08 }, { 0x32, 0x4f }, { 0x33, 0x20 }, { 0x34, 0x5e },
++	{ 0x35, 0x5e }, { 0x3a, 0xaf }, { 0x56, 0x32 }, { 0x59, 0xbf },
++	{ 0x5a, 0x04 }, { 0x85, 0x5a }, { 0x8a, 0x04 }, { 0x8f, 0x90 },
++	{ 0x91, 0x13 }, { 0x5b, 0xa0 }, { 0x5c, 0xf0 }, { 0x5d, 0xf4 },
++	{ 0x5e, 0x1f }, { 0x62, 0x04 }, { 0x63, 0x0f }, { 0x64, 0xc0 },
++	{ 0x66, 0x44 }, { 0x67, 0x73 }, { 0x69, 0x7c }, { 0x6a, 0x28 },
++	{ 0x7a, 0xc0 }, { 0x4a, 0x05 }, { 0x7e, 0xcd }, { 0x49, 0x10 },
++	{ 0x50, 0x02 }, { 0x7b, 0x4a }, { 0x7c, 0x0c }, { 0x7f, 0x57 },
++	{ 0x90, 0x00 }, { 0x8e, 0x00 }, { 0x8c, 0xff }, { 0x8d, 0xc7 },
++	{ 0x8b, 0x01 }, { 0x0c, 0x40 }, { 0x65, 0x02 }, { 0x80, 0x1a },
++	{ 0x81, 0xc0 }, { 0x19, 0x20 }, { 0x12, 0x00 }, { 0x48, 0x85 },
++	{ JXF2X_DELAY, 250 },
++	{ JXF2X_DELAY, 250 },
++	{ 0x48, 0x05 }, { 0x1f, 0x01 }, { 0x99, 0x0f }, { 0x9b, 0x0f },
++};
++
++/* Analog gain code n is log2(gain) * 65536 = jxf2x_again_log2[n] */
++static const u32 jxf2x_again_log2[] = {
++	0, 5731, 11136, 16248, 21097, 25710, 30109, 34312,
++	38336, 42195, 45904, 49472, 52910, 56228, 59433, 62534,
++	65536, 71267, 76672, 81784, 86633, 91246, 95645, 99848,
++	103872, 107731, 111440, 115008, 118446, 121764, 124969, 128070,
++	131072, 136803, 142208, 147320, 152169, 156782, 161181, 165384,
++	169408, 173267, 176976, 180544, 183982, 187300, 190505, 193606,
++	196608, 202339, 207744, 212856, 217705, 222318, 226717, 230920,
++	234944, 238803, 242512, 246080, 249518, 252836, 256041, 259142,
++	262144, 267875, 273280, 278392, 283241, 287854, 292253, 296456,
++	300480, 304339, 308048, 311616, 315054, 318372, 321577, 324678,
++};
++
++struct jxf2x_model {
++	const char *name;
++	u16 chip_id;
++	const struct jxf2x_reg *regs;
++	unsigned int num_regs;
++	/* Line length in pixel clocks (HTS register x 2) */
++	unsigned int hts;
++};
++
++static const struct jxf2x_model jxf2x_models[] = {
++	{ "jxf22", 0x0f22, jxf22_1080p25_dvp, ARRAY_SIZE(jxf22_1080p25_dvp), 2400 },
++	{ "jxf23", 0x0f23, jxf23_1080p25_dvp, ARRAY_SIZE(jxf23_1080p25_dvp), 2560 },
++};
++
++struct jxf2x {
++	struct device *dev;
++	struct regmap *regmap;
++	struct clk *xclk;
++	struct gpio_desc *reset;
++	const struct jxf2x_model *model;
++
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	struct v4l2_ctrl_handler ctrls;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *vblank;
++};
++
++static inline struct jxf2x *to_jxf2x(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct jxf2x, sd);
++}
++
++/* 25 frames per second with the default frame length */
++static u64 jxf2x_pixel_rate(const struct jxf2x_model *m)
++{
++	return (u64)m->hts * JXF2X_VTS_DEFAULT * 25;
++}
++
++static int jxf2x_write_table(struct jxf2x *s, const struct jxf2x_reg *regs,
++			     unsigned int n)
++{
++	unsigned int i;
++	int ret = 0;
++
++	for (i = 0; i < n && !ret; i++) {
++		if (regs[i].reg == JXF2X_DELAY)
++			msleep(regs[i].val);
++		else
++			cci_write(s->regmap, CCI_REG8(regs[i].reg), regs[i].val, &ret);
++	}
++	return ret;
++}
++
++static int jxf2x_set_vts(struct jxf2x *s, u32 vts)
++{
++	u64 sys;
++	int ret = 0;
++
++	cci_read(s->regmap, JXF2X_REG_SYS, &sys, &ret);
++	if (ret)
++		return ret;
++	if (sys & JXF2X_SYS_SLEEP) {
++		cci_write(s->regmap, JXF2X_REG_VTS_L, vts & 0xff, &ret);
++		cci_write(s->regmap, JXF2X_REG_VTS_H, vts >> 8, &ret);
++		return ret;
++	}
++	/* Streaming: through the group registers, latched at a frame boundary */
++	cci_write(s->regmap, JXF2X_REG_GRP_ADDR0, 0x22, &ret);
++	cci_write(s->regmap, JXF2X_REG_GRP_DATA0, vts & 0xff, &ret);
++	cci_write(s->regmap, JXF2X_REG_GRP_ADDR1, 0x23, &ret);
++	cci_write(s->regmap, JXF2X_REG_GRP_DATA1, vts >> 8, &ret);
++	cci_update_bits(s->regmap, JXF2X_REG_GROUP, JXF2X_GROUP_LATCH,
++			JXF2X_GROUP_LATCH, &ret);
++	return ret;
++}
++
++static int jxf2x_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct jxf2x *s = container_of(ctrl->handler, struct jxf2x, ctrls);
++	int ret = 0;
++
++	if (ctrl->id == V4L2_CID_VBLANK) {
++		u32 vts = JXF2X_HEIGHT + ctrl->val;
++
++		__v4l2_ctrl_modify_range(s->exposure, JXF2X_EXPO_MIN,
++					 vts - JXF2X_EXPO_MARGIN, 1,
++					 min_t(s32, s->exposure->val,
++					       vts - JXF2X_EXPO_MARGIN));
++	}
++
++	/* Written when powered; pm_runtime_resume applies them all */
++	if (!pm_runtime_get_if_in_use(s->dev))
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		cci_write(s->regmap, JXF2X_REG_EXPO_L, ctrl->val & 0xff, &ret);
++		cci_write(s->regmap, JXF2X_REG_EXPO_H, (ctrl->val >> 8) & 0xff, &ret);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		cci_write(s->regmap, JXF2X_REG_AGAIN, ctrl->val & 0x7f, &ret);
++		break;
++	case V4L2_CID_VBLANK:
++		ret = jxf2x_set_vts(s, JXF2X_HEIGHT + ctrl->val);
++		break;
++	default:
++		ret = -EINVAL;
++	}
++
++	pm_runtime_put(s->dev);
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops jxf2x_ctrl_ops = {
++	.s_ctrl = jxf2x_s_ctrl,
++};
++
++static int jxf2x_init_ctrls(struct jxf2x *s)
++{
++	struct v4l2_ctrl_handler *h = &s->ctrls;
++	u32 hblank = s->model->hts - JXF2X_WIDTH;
++	u32 vblank = JXF2X_VTS_DEFAULT - JXF2X_HEIGHT;
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl *c;
++	int ret;
++
++	v4l2_ctrl_handler_init(h, 8);
++
++	c = v4l2_ctrl_new_std(h, NULL, V4L2_CID_PIXEL_RATE,
++			      jxf2x_pixel_rate(s->model), jxf2x_pixel_rate(s->model),
++			      1, jxf2x_pixel_rate(s->model));
++	if (c)
++		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	c = v4l2_ctrl_new_std(h, NULL, V4L2_CID_HBLANK, hblank, hblank, 1, hblank);
++	if (c)
++		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	s->vblank = v4l2_ctrl_new_std(h, &jxf2x_ctrl_ops, V4L2_CID_VBLANK, vblank,
++				      JXF2X_VTS_MAX - JXF2X_HEIGHT, 1, vblank);
++	s->exposure = v4l2_ctrl_new_std(h, &jxf2x_ctrl_ops, V4L2_CID_EXPOSURE,
++					JXF2X_EXPO_MIN,
++					JXF2X_VTS_DEFAULT - JXF2X_EXPO_MARGIN, 1,
++					JXF2X_VTS_DEFAULT - JXF2X_EXPO_MARGIN);
++	/* Register codes; jxf2x_again_log2[] gives the gain of each */
++	v4l2_ctrl_new_std(h, &jxf2x_ctrl_ops, V4L2_CID_ANALOGUE_GAIN, 0,
++			  ARRAY_SIZE(jxf2x_again_log2) - 1, 1, 0);
++
++	ret = v4l2_fwnode_device_parse(s->dev, &props);
++	if (!ret)
++		v4l2_ctrl_new_fwnode_properties(h, &jxf2x_ctrl_ops, &props);
++
++	if (h->error) {
++		ret = h->error;
++		v4l2_ctrl_handler_free(h);
++		return ret;
++	}
++	s->sd.ctrl_handler = h;
++	return 0;
++}
++
++static int jxf2x_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct jxf2x *s = to_jxf2x(sd);
++	int ret;
++
++	ret = clk_prepare_enable(s->xclk);
++	if (ret)
++		return ret;
++	/* Vendor sequence: high 5 ms, low 15 ms, high 5 ms (reset is low) */
++	gpiod_set_value_cansleep(s->reset, 0);
++	usleep_range(5000, 6000);
++	gpiod_set_value_cansleep(s->reset, 1);
++	usleep_range(15000, 16000);
++	gpiod_set_value_cansleep(s->reset, 0);
++	usleep_range(5000, 6000);
++	return 0;
++}
++
++static int jxf2x_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct jxf2x *s = to_jxf2x(sd);
++
++	gpiod_set_value_cansleep(s->reset, 1);
++	clk_disable_unprepare(s->xclk);
++	return 0;
++}
++
++static int jxf2x_enable_streams(struct v4l2_subdev *sd,
++				struct v4l2_subdev_state *state, u32 pad,
++				u64 streams_mask)
++{
++	struct jxf2x *s = to_jxf2x(sd);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(s->dev);
++	if (ret)
++		return ret;
++
++	/* The table leaves the sensor asleep (SYS bit 6) */
++	ret = jxf2x_write_table(s, s->model->regs, s->model->num_regs);
++	if (!ret)
++		ret = __v4l2_ctrl_handler_setup(&s->ctrls);
++	if (!ret)
++		ret = cci_write(s->regmap, JXF2X_REG_SYS, 0x00, NULL);
++	if (ret)
++		pm_runtime_put(s->dev);
++	return ret;
++}
++
++static int jxf2x_disable_streams(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state, u32 pad,
++				 u64 streams_mask)
++{
++	struct jxf2x *s = to_jxf2x(sd);
++	int ret;
++
++	ret = cci_write(s->regmap, JXF2X_REG_SYS, JXF2X_SYS_SLEEP, NULL);
++	pm_runtime_put(s->dev);
++	return ret;
++}
++
++static void jxf2x_fill_fmt(struct v4l2_mbus_framefmt *fmt)
++{
++	fmt->width = JXF2X_WIDTH;
++	fmt->height = JXF2X_HEIGHT;
++	fmt->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++	fmt->field = V4L2_FIELD_NONE;
++	fmt->colorspace = V4L2_COLORSPACE_RAW;
++	fmt->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
++}
++
++static int jxf2x_enum_mbus_code(struct v4l2_subdev *sd,
++				struct v4l2_subdev_state *state,
++				struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index)
++		return -EINVAL;
++	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++	return 0;
++}
++
++static int jxf2x_enum_frame_size(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
++		return -EINVAL;
++	fse->min_width = fse->max_width = JXF2X_WIDTH;
++	fse->min_height = fse->max_height = JXF2X_HEIGHT;
++	return 0;
++}
++
++/* One mode: setting the format returns it */
++static int jxf2x_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
++			 struct v4l2_subdev_format *fmt)
++{
++	jxf2x_fill_fmt(&fmt->format);
++	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
++	return 0;
++}
++
++static int jxf2x_get_selection(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_state *state,
++			       struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = JXF2X_WIDTH;
++		sel->r.height = JXF2X_HEIGHT;
++		return 0;
++	}
++	return -EINVAL;
++}
++
++static int jxf2x_init_state(struct v4l2_subdev *sd, struct v4l2_subdev_state *state)
++{
++	jxf2x_fill_fmt(v4l2_subdev_state_get_format(state, 0));
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops jxf2x_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_pad_ops jxf2x_pad_ops = {
++	.enum_mbus_code = jxf2x_enum_mbus_code,
++	.enum_frame_size = jxf2x_enum_frame_size,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = jxf2x_set_fmt,
++	.get_selection = jxf2x_get_selection,
++	.enable_streams = jxf2x_enable_streams,
++	.disable_streams = jxf2x_disable_streams,
++};
++
++static const struct v4l2_subdev_ops jxf2x_subdev_ops = {
++	.video = &jxf2x_video_ops,
++	.pad = &jxf2x_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops jxf2x_internal_ops = {
++	.init_state = jxf2x_init_state,
++};
++
++static int jxf2x_identify(struct jxf2x *s)
++{
++	u64 pid = 0, ver = 0;
++	unsigned int i;
++	int ret = 0;
++
++	cci_read(s->regmap, JXF2X_REG_PID, &pid, &ret);
++	cci_read(s->regmap, JXF2X_REG_VER, &ver, &ret);
++	if (ret)
++		return dev_err_probe(s->dev, ret, "no sensor on I2C\n");
++
++	for (i = 0; i < ARRAY_SIZE(jxf2x_models); i++) {
++		if (jxf2x_models[i].chip_id == (pid << 8 | ver)) {
++			s->model = &jxf2x_models[i];
++			dev_info(s->dev, "%s\n", s->model->name);
++			return 0;
++		}
++	}
++	return dev_err_probe(s->dev, -ENODEV, "unknown chip id 0x%02llx%02llx\n",
++			     pid, ver);
++}
++
++/* The bus must be parallel (BT.601 style: HREF and VSYNC), 10 bits */
++static int jxf2x_check_endpoint(struct jxf2x *s)
++{
++	struct v4l2_fwnode_endpoint ep = { .bus_type = V4L2_MBUS_PARALLEL };
++	struct fwnode_handle *fw;
++	int ret;
++
++	fw = fwnode_graph_get_next_endpoint(dev_fwnode(s->dev), NULL);
++	if (!fw)
++		return dev_err_probe(s->dev, -EINVAL, "no endpoint\n");
++	ret = v4l2_fwnode_endpoint_parse(fw, &ep);
++	fwnode_handle_put(fw);
++	if (ret)
++		return dev_err_probe(s->dev, ret, "endpoint is not a parallel bus\n");
++	if (ep.bus.parallel.bus_width != 10)
++		dev_warn(s->dev, "bus-width %u, the sensor sends 10 bits\n",
++			 ep.bus.parallel.bus_width);
++	return 0;
++}
++
++static int jxf2x_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct jxf2x *s;
++	int ret;
++
++	s = devm_kzalloc(dev, sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++	s->dev = dev;
++
++	ret = jxf2x_check_endpoint(s);
++	if (ret)
++		return ret;
++
++	s->regmap = devm_cci_regmap_init_i2c(client, 8);
++	if (IS_ERR(s->regmap))
++		return dev_err_probe(dev, PTR_ERR(s->regmap), "regmap\n");
++
++	s->xclk = devm_clk_get(dev, NULL);
++	if (IS_ERR(s->xclk))
++		return dev_err_probe(dev, PTR_ERR(s->xclk), "no clock\n");
++	ret = clk_set_rate(s->xclk, JXF2X_XCLK);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot set the clock to 24 MHz\n");
++
++	s->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(s->reset))
++		return dev_err_probe(dev, PTR_ERR(s->reset), "reset gpio\n");
++
++	v4l2_i2c_subdev_init(&s->sd, client, &jxf2x_subdev_ops);
++	s->sd.internal_ops = &jxf2x_internal_ops;
++
++	ret = jxf2x_power_on(dev);
++	if (ret)
++		return ret;
++	ret = jxf2x_identify(s);
++	if (ret)
++		goto err_power;
++
++	ret = jxf2x_init_ctrls(s);
++	if (ret)
++		goto err_power;
++
++	s->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	s->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	s->pad.flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&s->sd.entity, 1, &s->pad);
++	if (ret)
++		goto err_ctrls;
++
++	s->sd.state_lock = s->ctrls.lock;
++	ret = v4l2_subdev_init_finalize(&s->sd);
++	if (ret)
++		goto err_entity;
++
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	ret = v4l2_async_register_subdev_sensor(&s->sd);
++	if (ret)
++		goto err_pm;
++
++	pm_runtime_idle(dev);
++	return 0;
++
++err_pm:
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++	v4l2_subdev_cleanup(&s->sd);
++err_entity:
++	media_entity_cleanup(&s->sd.entity);
++err_ctrls:
++	v4l2_ctrl_handler_free(&s->ctrls);
++err_power:
++	jxf2x_power_off(dev);
++	return ret;
++}
++
++static void jxf2x_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct jxf2x *s = to_jxf2x(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(&s->ctrls);
++	pm_runtime_disable(s->dev);
++	if (!pm_runtime_status_suspended(s->dev))
++		jxf2x_power_off(s->dev);
++	pm_runtime_set_suspended(s->dev);
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(jxf2x_pm_ops, jxf2x_power_off, jxf2x_power_on, NULL);
++
++/* Either compatible probes both sensors: units ship with one or the other */
++static const struct of_device_id jxf2x_of_match[] = {
++	{ .compatible = "soi,jxf22" },
++	{ .compatible = "soi,jxf23" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, jxf2x_of_match);
++
++static struct i2c_driver jxf2x_driver = {
++	.driver = {
++		.name = "jxf2x",
++		.of_match_table = jxf2x_of_match,
++		.pm = pm_ptr(&jxf2x_pm_ops),
++	},
++	.probe = jxf2x_probe,
++	.remove = jxf2x_remove,
++};
++module_i2c_driver(jxf2x_driver);
++
++MODULE_DESCRIPTION("SOI JX-F22/JX-F23 image sensor driver");
++MODULE_LICENSE("GPL");
