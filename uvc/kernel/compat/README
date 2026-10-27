@@ -1,0 +1,32 @@
+Vendor (Ingenic 3.10.14) interfaces for camera drivers ported to Linux 6.18.
+
+t20-compat.c   /proc/jz, jzgpio_set_func(), ispmem_base/size, t20_intc_irq(),
+               the tx-isp platform devices (from soc-t20/common/platform.c).
+               Builds; not in the image yet (nothing uses it until the ISP
+               driver builds).
+include/       Vendor headers the drivers include: mach/tx_isp.h and
+               media/v4l2-chip-ident.h copied from the 3.10.14 tree, soc/base.h
+               (SoC addresses) copied, soc/gpio.h, soc/irq.h, jz_proc.h,
+               mach/platform.h written for this layer.
+
+Build (after kernel/build.sh):
+  make -C build/kernel/obj M=$PWD/kernel/compat ARCH=mips \
+      CROSS_COMPILE=mipsel-linux-gnu- modules
+
+open-tx-isp driver/t20 against 6.18, first attempt (2026-10-27, open-tx-isp
+b4d8eae, ingenic-sdk 5e5d7d2), with KCPPFLAGS=-I$PWD/kernel/compat/include.
+Remaining errors, by cause:
+  - 3.10 V4L2 core: v4l2_subdev_core_ops has no g_chip_ident/g_ctrl/s_ctrl,
+    v4l2_subdev has no entity, V4L2_MBUS_FMT_* are now MEDIA_BUS_FMT_*
+    (tx-isp-csi.c, tx-isp-vic.c, tx-isp-video-in.c, tx-isp-common.h).
+    Plan: a private copy of 3.10's v4l2-device/v4l2-subdev/media-entity in
+    the module, its headers first through NOSTDINC_FLAGS.
+  - tx-isp-load-parameters.c: mm_segment_t/set_fs/KERNEL_DS, f_dentry
+    (use kernel_read, f_path.dentry).
+  - system_chardev.c, tx-isp-debug.c: misc_deregister() returns void now.
+  - sensor-common.h wants txx-funcs.h (the private_* wrappers of newer SDKs;
+    the T20 build needs none of them, an empty header with the
+    private_jzgpio_set_func define is enough).
+  - tx-isp-vic.c: VIC_* register names come from a header the 3.10 build
+    found in the SDK include path; check the include order.
+  - printk.h:482: a vendor macro redefines a printk helper.

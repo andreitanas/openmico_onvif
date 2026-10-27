@@ -1,0 +1,22 @@
+Linux 6.18 LTS for the Wyze Cam v2 (Ingenic T20). See docs/kernel-modern.md.
+
+build.sh      fetches the pinned sources and toolchain into third_party/kernel/,
+              builds build/kernel/out/{uImage,modules/,wyze-cam-v2.dtb,...}
+config        kernel options on top of tinyconfig, grouped and commented
+mkuimage.py   legacy U-Boot header for the LZMA kernel
+dts/          T20 SoC and Wyze Cam v2 device trees (copied into the tree)
+patches/      applied in order to Linux v6.18.59:
+  0001-0005   gtxaspec/thingino-linux ingenic-7.1-rc1 (T31 on mainline):
+              pinctrl and machine plumbing, the SFC SPI flash controller
+              driver, an MMC clock fix. Unchanged; build.
+  0006        T20 machine, Wyze Cam v2 board option. Ours; builds.
+  0007        T20 CGU (clocks), from the vendor soc-t20/common/clk. Ours;
+              builds.
+  0008        T20 pinctrl, from the vendor soc-t20 gpio.c/platform.h. Ours;
+              builds.
+  0009        SFC: T20 compatible (X1000 registers). Ours; builds.
+  0010        spi-nor: erase in 32 KiB blocks. Ours; builds.
+compat/       vendor 3.10 interfaces for the ported camera drivers (README)
+Out of tree:  rtl8189fs (WiFi), jwrdegoede/rtl8189ES_linux 13bbdbc; builds.
+
+Nothing has run on a camera yet.
