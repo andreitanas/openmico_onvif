@@ -64,10 +64,10 @@ index 000000000..20fb6f785
 +obj-$(CONFIG_VIDEO_INGENIC_T20_ISP) += t20-isp.o
 diff --git a/drivers/media/platform/ingenic/t20-isp.c b/drivers/media/platform/ingenic/t20-isp.c
 new file mode 100644
-index 000000000..a6aca88ac
+index 000000000..076de7775
 --- /dev/null
 +++ b/drivers/media/platform/ingenic/t20-isp.c
-@@ -0,0 +1,843 @@
+@@ -0,0 +1,849 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Ingenic T20 camera input (VIC) and ISP core, first version: a parallel
@@ -394,7 +394,13 @@ index 000000000..a6aca88ac
 +	unsigned long flags;
 +
 +	spin_lock_irqsave(&isp->buf_lock, flags);
-+	list_add_tail(&buf->list, &isp->pending);
++	if (vb2_start_streaming_called(vb->vb2_queue) && !isp->active) {
++		/* Writes were off for lack of buffers: on again from next frame */
++		isp->active = buf;
++		t20_isp_set_buffer(isp, buf);
++	} else {
++		list_add_tail(&buf->list, &isp->pending);
++	}
 +	spin_unlock_irqrestore(&isp->buf_lock, flags);
 +}
 +

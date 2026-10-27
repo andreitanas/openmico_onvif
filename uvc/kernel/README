@@ -18,6 +18,8 @@ patches/      applied in order to Linux v6.18.59:
   0010        spi-nor: erase in 32 KiB blocks. Ours; builds.
   0011        JX-F22/JX-F23 sensor, V4L2 subdevice. Ours (register tables
               from Ingenic's GPL-2.0+ sensor drivers); builds.
+  0012        T20 camera input and ISP, V4L2 (NV12 out, no 3A yet), and the
+              DVP pin group. Ours, from docs/t20-isp-hardware.md; builds.
 Out of tree:  rtl8189fs (WiFi), jwrdegoede/rtl8189ES_linux 13bbdbc; builds.
 
 Nothing has run on a camera yet.
