@@ -283,6 +283,22 @@
 		status = "disabled";
 	};
 
+	/* Camera input (VIC), ISP interrupt controller, ISP core */
+	isp: isp@13300000 {
+		compatible = "ingenic,t20-isp";
+		reg = <0x13300000 0x10000>, <0x13320000 0x10000>,
+		      <0x13380000 0x80000>;
+		reg-names = "vic", "irq", "core";
+
+		interrupt-parent = <&intc>;
+		interrupts = <29>;
+
+		clocks = <&cgu T20_CLK_ISP_GATE>, <&cgu T20_CLK_ISP>;
+		clock-names = "isp", "core";
+
+		status = "disabled";
+	};
+
 	sfc: spi@13440000 {
 		compatible = "ingenic,t20-sfc", "ingenic,x1000-sfc";
 		reg = <0x13440000 0x10000>;

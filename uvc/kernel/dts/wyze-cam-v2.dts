@@ -29,14 +29,25 @@
 		bootargs = "console=ttyS1,115200n8 earlycon root=/dev/mtdblock2 rootfstype=squashfs ro panic=10";
 	};
 
-	/*
-	 * Linux gets the low 96 MB as today (mem=96M@0x0). 0x6000000-0x8000000
-	 * stays outside it for the ISP (8 MB, "ispmem") and the encoder's
-	 * reserved memory (24 MB, "rmem"), which libimp maps through /dev/mem.
-	 */
 	memory@0 {
 		device_type = "memory";
-		reg = <0x0 0x6000000>;
+		reg = <0x0 0x8000000>;
+	};
+
+	/*
+	 * Linux keeps the low 96 MB as today (mem=96M@0x0). The top 32 MB
+	 * (today's ispmem and rmem) hold the camera's frame buffers.
+	 */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		camera_mem: camera@6000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x6000000 0x2000000>;
+			no-map;
+		};
 	};
 
 	leds {
@@ -160,7 +171,7 @@
 	};
 };
 
-/* Image sensor (JXF22/JXF23); used once the ISP driver is ported */
+/* Image sensor: JX-F22 or JX-F23 (the driver reads which) */
 &i2c0 {
 	clock-frequency = <100000>;
 
@@ -168,6 +179,43 @@
 	pinctrl-0 = <&pins_i2c0>;
 
 	status = "okay";
+
+	sensor@40 {
+		compatible = "soi,jxf22";
+		reg = <0x40>;
+
+		clocks = <&cgu T20_CLK_CIM>;
+		reset-gpios = <&gpa 18 GPIO_ACTIVE_LOW>;
+
+		port {
+			sensor_out: endpoint {
+				remote-endpoint = <&isp_in>;
+				bus-width = <10>;
+				hsync-active = <1>;
+				vsync-active = <1>;
+				pclk-sample = <1>;
+			};
+		};
+	};
+};
+
+&isp {
+	memory-region = <&camera_mem>;
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&pins_dvp>;
+
+	status = "okay";
+
+	port {
+		isp_in: endpoint {
+			remote-endpoint = <&sensor_out>;
+			bus-width = <10>;
+			hsync-active = <1>;
+			vsync-active = <1>;
+			pclk-sample = <1>;
+		};
+	};
 };
 
 &pinctrl {
@@ -189,6 +237,12 @@
 	pins_msc1: msc1 {
 		function = "mmc1";
 		groups = "mmc1-1bit", "mmc1-4bit";
+	};
+
+	/* Sensor data, sync and pixel clock in, MCLK (24 MHz) out */
+	pins_dvp: dvp {
+		function = "cim";
+		groups = "dvp-10bit", "cim-mclk";
 	};
 
 	pins_i2c0: i2c0 {

@@ -11,9 +11,11 @@ gpio_out() {
 case "$1" in
 start)
 	if [ ! -d /lib/modules/3.10.14 ]; then
-		# Our kernel: the ISP and sensor drivers are not ported yet
-		# (docs/kernel-modern.md); uvcd starts without video.
-		logger -s -t camera "no camera drivers for $(uname -r)"
+		# Our kernel: V4L2 drivers for the sensor (either model) and the
+		# ISP, video on /dev/video0. uvcd does not read it yet
+		# (docs/kernel-modern.md).
+		modprobe jxf2x
+		modprobe t20-isp
 		exit 0
 	fi
 	# USB power (some board revisions need it)

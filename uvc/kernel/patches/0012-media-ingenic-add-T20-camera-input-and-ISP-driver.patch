@@ -1,0 +1,945 @@
+From: openmico_onvif <andrei.tanas@gmail.com>
+Subject: [PATCH] media: ingenic: add T20 camera input and ISP driver
+
+First version: parallel Bayer sensor in through the VIC, NV12 out of the
+ISP's DS1 path with the table-driven blocks bypassed, one video node,
+frames completed on the DS1 output-end interrupt. Also the T20 DVP pin
+group. Written from docs/t20-isp-hardware.md; not run on hardware.
+---
+diff --git a/drivers/media/platform/Kconfig b/drivers/media/platform/Kconfig
+index 9287faafd..629f95550 100644
+--- a/drivers/media/platform/Kconfig
++++ b/drivers/media/platform/Kconfig
+@@ -71,6 +71,7 @@ source "drivers/media/platform/broadcom/Kconfig"
+ source "drivers/media/platform/cadence/Kconfig"
+ source "drivers/media/platform/chips-media/Kconfig"
+ source "drivers/media/platform/imagination/Kconfig"
++source "drivers/media/platform/ingenic/Kconfig"
+ source "drivers/media/platform/intel/Kconfig"
+ source "drivers/media/platform/marvell/Kconfig"
+ source "drivers/media/platform/mediatek/Kconfig"
+diff --git a/drivers/media/platform/Makefile b/drivers/media/platform/Makefile
+index 6fd7db054..208ec5e4f 100644
+--- a/drivers/media/platform/Makefile
++++ b/drivers/media/platform/Makefile
+@@ -14,6 +14,7 @@ obj-y += broadcom/
+ obj-y += cadence/
+ obj-y += chips-media/
+ obj-y += imagination/
++obj-y += ingenic/
+ obj-y += intel/
+ obj-y += marvell/
+ obj-y += mediatek/
+diff --git a/drivers/media/platform/ingenic/Kconfig b/drivers/media/platform/ingenic/Kconfig
+new file mode 100644
+index 000000000..90d823c50
+--- /dev/null
++++ b/drivers/media/platform/ingenic/Kconfig
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++comment "Ingenic media platform drivers"
++
++config VIDEO_INGENIC_T20_ISP
++	tristate "Ingenic T20 camera input and ISP"
++	depends on V4L_PLATFORM_DRIVERS
++	depends on VIDEO_DEV && OF
++	depends on MACH_INGENIC || COMPILE_TEST
++	select MEDIA_CONTROLLER
++	select VIDEO_V4L2_SUBDEV_API
++	select VIDEOBUF2_DMA_CONTIG
++	select V4L2_FWNODE
++	help
++	  The camera input (VIC) and image signal processor of the Ingenic
++	  T20 SoC: a parallel Bayer sensor in, NV12 frames out.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called t20-isp.
+diff --git a/drivers/media/platform/ingenic/Makefile b/drivers/media/platform/ingenic/Makefile
+new file mode 100644
+index 000000000..20fb6f785
+--- /dev/null
++++ b/drivers/media/platform/ingenic/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_VIDEO_INGENIC_T20_ISP) += t20-isp.o
+diff --git a/drivers/media/platform/ingenic/t20-isp.c b/drivers/media/platform/ingenic/t20-isp.c
+new file mode 100644
+index 000000000..a6aca88ac
+--- /dev/null
++++ b/drivers/media/platform/ingenic/t20-isp.c
+@@ -0,0 +1,843 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Ingenic T20 camera input (VIC) and ISP core, first version: a parallel
++ * Bayer sensor in, NV12 out of the DS1 path (the T20's main stream; the SoC
++ * has no full-resolution writer), with the image processing blocks that need
++ * memory tables bypassed. No statistics or parameters yet.
++ *
++ * Written from docs/t20-isp-hardware.md (openmico_onvif), which records the
++ * register map and sequences used here.
++ */
++
++#include <linux/clk.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include <media/media-device.h>
++#include <media/v4l2-async.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mc.h>
++#include <media/v4l2-subdev.h>
++#include <media/videobuf2-dma-contig.h>
++
++/* VIC */
++#define VIC_CONTROL		0x00
++#define VIC_CONTROL_START	BIT(0)
++#define VIC_CONTROL_REG_ENABLE	BIT(1)
++#define VIC_CONTROL_SAFE_RESET	BIT(3)
++#define VIC_RESOLUTION		0x04
++#define VIC_INTF_TYPE		0x0c
++#define VIC_INTF_DVP		3
++#define VIC_DB_CFG		0x10
++#define VIC_DB_VSYNC_LOW	BIT(0)
++#define VIC_DB_HSYNC_LOW	BIT(1)
++#define VIC_DB_RAW10		(1 << 17)
++#define VIC_GLOBAL_CFG		0x50
++
++/* ISP interrupt controller */
++#define IRQC_CLEAR		0x04
++#define IRQC_STATUS		0x0c
++#define IRQC_ENABLE		0x14
++#define IRQC_MASK		0x1c
++
++/* ISP core */
++#define ISP_ACTIVE_WIDTH	0x010
++#define ISP_ACTIVE_HEIGHT	0x014
++#define ISP_RGGB_START		0x018
++#define ISP_RGGB_BGGR		3
++#define ISP_CONFIG_BUFFER_MODE	0x030
++#define ISP_CONFIG_IN_VBLANK	2
++#define ISP_BYPASS_LOW		0x040
++#define ISP_BYPASS_HIGH		0x044
++#define ISP_IRQ_SOURCE(n)	(0x080 + 4 * ((n) / 2))
++#define ISP_IRQ_SOURCE_SHIFT(n)	(((n) & 1) ? 16 : 0)
++#define ISP_IRQ_STATUS		0x0a0
++#define ISP_IRQ_CLEAR		0x0a4
++#define ISP_INPUT_PORT		0x100
++#define ISP_INPUT_PORT_DVP	0x00100001
++#define ISP_INPUT_MODE		0x130
++#define ISP_INPUT_SAFE_STOP	0
++#define ISP_INPUT_SAFE_START	1
++#define ISP_DS1_CSC_ENABLE	0x6b0
++#define ISP_CSC_MATRIX		BIT(0)
++#define ISP_CSC_FILTER		BIT(1)
++#define ISP_CSC_HDOWN		BIT(2)
++#define ISP_CSC_VDOWN		BIT(3)
++
++/* Video DMA writers: DS1 Y and UV */
++#define ISP_DS1_Y_WRITER	0xc00
++#define ISP_DS1_UV_WRITER	0xc80
++#define WRITER_FORMAT		0x00
++#define WRITER_NV12		13
++#define WRITER_PLANE_UV		(1 << 6)
++#define WRITER_FRAME_WRITE	BIT(9)
++#define WRITER_SIZE		0x04
++#define WRITER_BANK0		0x08
++#define WRITER_BANKS		0x1c
++#define WRITER_LINE_OFFSET	0x20
++#define WRITER_AXI		0x24
++#define WRITER_AXI_ENABLE	BIT(1)
++
++/* Interrupt line the DS1 output end is routed to, and its source */
++#define ISP_LINE_DS1_DONE	13
++#define ISP_SRC_DS1_DONE	50
++
++/*
++ * Bypassed: mirror, sensor offset, digital gain, frontend LUT, RAW frontend,
++ * defect pixel, frame stitch, sinter, temper, radial and mesh shading,
++ * Iridix, the whole FR path, and on DS1 crop, scaler, gamma, sharpen, logo.
++ * Kept: white balance, demosaic, colour matrix, DS1 colour space converter.
++ * Bit 8 keeps its reset value. The DS2 path is bypassed.
++ */
++#define ISP_BYPASS_LOW_MIN	(GENMASK(7, 1) | BIT(8) | GENMASK(10, 9) | \
++				 GENMASK(15, 13) | GENMASK(22, 18) | GENMASK(28, 24))
++#define ISP_BYPASS_HIGH_MIN	GENMASK(6, 1)
++
++#define T20_ISP_CLK_RATE	100000000
++#define T20_ISP_MIN_BUFFERS	2
++
++enum { T20_ISP_PAD_SINK, T20_ISP_PAD_SOURCE, T20_ISP_PADS };
++
++struct t20_isp_buffer {
++	struct vb2_v4l2_buffer vb;
++	struct list_head list;
++};
++
++struct t20_isp {
++	struct device *dev;
++	void __iomem *vic;
++	void __iomem *irqc;
++	void __iomem *core;
++	struct clk *clk_isp;
++	struct clk *clk_core;
++	int irq;
++
++	struct media_device mdev;
++	struct v4l2_device v4l2_dev;
++	struct v4l2_async_notifier notifier;
++	struct v4l2_fwnode_endpoint ep;
++	struct v4l2_subdev *sensor;
++	u16 sensor_pad;
++
++	struct v4l2_subdev sd;
++	struct media_pad pads[T20_ISP_PADS];
++
++	struct video_device vdev;
++	struct media_pad vpad;
++	struct vb2_queue queue;
++	struct mutex lock;		/* video device and queue */
++	struct v4l2_pix_format pix;
++
++	spinlock_t buf_lock;		/* the fields below */
++	struct list_head pending;
++	struct t20_isp_buffer *active;	/* being written by the hardware */
++	u32 sequence;
++};
++
++static void isp_write(struct t20_isp *isp, u32 reg, u32 val)
++{
++	writel(val, isp->core + reg);
++}
++
++static u32 isp_read(struct t20_isp *isp, u32 reg)
++{
++	return readl(isp->core + reg);
++}
++
++static void isp_update(struct t20_isp *isp, u32 reg, u32 mask, u32 val)
++{
++	isp_write(isp, reg, (isp_read(isp, reg) & ~mask) | (val & mask));
++}
++
++/* Hardware programming */
++
++static void t20_isp_set_buffer(struct t20_isp *isp, struct t20_isp_buffer *buf)
++{
++	dma_addr_t y;
++
++	if (!buf) {
++		isp_update(isp, ISP_DS1_Y_WRITER + WRITER_FORMAT, WRITER_FRAME_WRITE, 0);
++		isp_update(isp, ISP_DS1_UV_WRITER + WRITER_FORMAT, WRITER_FRAME_WRITE, 0);
++		return;
++	}
++	y = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
++	isp_write(isp, ISP_DS1_Y_WRITER + WRITER_BANK0, y);
++	isp_write(isp, ISP_DS1_UV_WRITER + WRITER_BANK0,
++		  y + isp->pix.bytesperline * isp->pix.height);
++	isp_update(isp, ISP_DS1_Y_WRITER + WRITER_FORMAT, WRITER_FRAME_WRITE,
++		   WRITER_FRAME_WRITE);
++	isp_update(isp, ISP_DS1_UV_WRITER + WRITER_FORMAT, WRITER_FRAME_WRITE,
++		   WRITER_FRAME_WRITE);
++}
++
++static void t20_isp_hw_start(struct t20_isp *isp)
++{
++	u32 w = isp->pix.width, h = isp->pix.height, cfg = VIC_DB_RAW10;
++	unsigned int flags = isp->ep.bus.parallel.flags;
++	u32 base;
++
++	/* VIC: parallel RAW10 in */
++	if (flags & V4L2_MBUS_VSYNC_ACTIVE_LOW)
++		cfg |= VIC_DB_VSYNC_LOW;
++	if (flags & V4L2_MBUS_HSYNC_ACTIVE_LOW)
++		cfg |= VIC_DB_HSYNC_LOW;
++	writel(VIC_INTF_DVP, isp->vic + VIC_INTF_TYPE);
++	writel(cfg, isp->vic + VIC_DB_CFG);
++	writel(w << 16 | h, isp->vic + VIC_RESOLUTION);
++	writel(0, isp->vic + VIC_GLOBAL_CFG);
++	writel(VIC_CONTROL_REG_ENABLE, isp->vic + VIC_CONTROL);
++	writel(VIC_CONTROL_START, isp->vic + VIC_CONTROL);
++
++	/* Core: geometry, minimal pipeline */
++	isp_write(isp, ISP_CONFIG_BUFFER_MODE, ISP_CONFIG_IN_VBLANK);
++	isp_write(isp, ISP_INPUT_PORT, ISP_INPUT_PORT_DVP);
++	isp_write(isp, ISP_ACTIVE_WIDTH, w);
++	isp_write(isp, ISP_ACTIVE_HEIGHT, h);
++	isp_write(isp, ISP_RGGB_START, ISP_RGGB_BGGR);
++	isp_write(isp, ISP_BYPASS_LOW, ISP_BYPASS_LOW_MIN);
++	isp_write(isp, ISP_BYPASS_HIGH, ISP_BYPASS_HIGH_MIN);
++	isp_write(isp, ISP_DS1_CSC_ENABLE, ISP_CSC_MATRIX | ISP_CSC_FILTER |
++		  ISP_CSC_HDOWN | ISP_CSC_VDOWN);
++
++	/* DS1 writers: NV12, one bank, reprogrammed every frame */
++	for (base = ISP_DS1_Y_WRITER; base <= ISP_DS1_UV_WRITER; base += 0x80) {
++		isp_write(isp, base + WRITER_FORMAT, WRITER_NV12 |
++			  (base == ISP_DS1_UV_WRITER ? WRITER_PLANE_UV : 0));
++		isp_write(isp, base + WRITER_SIZE, w | h << 16);
++		isp_write(isp, base + WRITER_BANKS, 0);
++		isp_write(isp, base + WRITER_LINE_OFFSET, isp->pix.bytesperline);
++		isp_write(isp, base + WRITER_AXI, WRITER_AXI_ENABLE);
++	}
++
++	/* DS1 output end on line 13 */
++	isp_update(isp, ISP_IRQ_SOURCE(ISP_LINE_DS1_DONE),
++		   0x3f << ISP_IRQ_SOURCE_SHIFT(ISP_LINE_DS1_DONE),
++		   ISP_SRC_DS1_DONE << ISP_IRQ_SOURCE_SHIFT(ISP_LINE_DS1_DONE));
++	isp_write(isp, ISP_IRQ_CLEAR, 0);
++	isp_write(isp, ISP_IRQ_CLEAR, 0xffff);
++	writel(GENMASK(22, 0), isp->irqc + IRQC_CLEAR);
++	writel(~BIT(ISP_LINE_DS1_DONE), isp->irqc + IRQC_MASK);
++	writel(BIT(ISP_LINE_DS1_DONE), isp->irqc + IRQC_ENABLE);
++
++	isp_write(isp, ISP_INPUT_MODE, ISP_INPUT_SAFE_START);
++}
++
++static void t20_isp_hw_stop(struct t20_isp *isp)
++{
++	isp_write(isp, ISP_INPUT_MODE, ISP_INPUT_SAFE_STOP);
++	t20_isp_set_buffer(isp, NULL);
++	writel(0, isp->irqc + IRQC_ENABLE);
++	writel(GENMASK(22, 0), isp->irqc + IRQC_MASK);
++	writel(VIC_CONTROL_SAFE_RESET, isp->vic + VIC_CONTROL);
++}
++
++static irqreturn_t t20_isp_irq(int irq, void *data)
++{
++	struct t20_isp *isp = data;
++	struct t20_isp_buffer *done, *next = NULL;
++	u32 pending, status;
++
++	pending = readl(isp->irqc + IRQC_STATUS) & ~readl(isp->irqc + IRQC_MASK);
++	if (!pending)
++		return IRQ_NONE;
++	writel(pending, isp->irqc + IRQC_CLEAR);
++
++	status = isp_read(isp, ISP_IRQ_STATUS);
++	isp_write(isp, ISP_IRQ_CLEAR, 0);
++	isp_write(isp, ISP_IRQ_CLEAR, status);
++
++	if (!(status & BIT(ISP_LINE_DS1_DONE)))
++		return IRQ_HANDLED;
++
++	/* The next frame's address latches in this vertical blanking */
++	spin_lock(&isp->buf_lock);
++	done = isp->active;
++	if (!list_empty(&isp->pending)) {
++		next = list_first_entry(&isp->pending, struct t20_isp_buffer, list);
++		list_del(&next->list);
++	}
++	isp->active = next;
++	t20_isp_set_buffer(isp, next);
++	spin_unlock(&isp->buf_lock);
++
++	if (done) {
++		done->vb.vb2_buf.timestamp = ktime_get_ns();
++		done->vb.sequence = isp->sequence;
++		done->vb.field = V4L2_FIELD_NONE;
++		vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
++	}
++	isp->sequence++;
++	return IRQ_HANDLED;
++}
++
++/* Video device and queue */
++
++static void t20_isp_fill_pix(struct v4l2_pix_format *pix, u32 w, u32 h)
++{
++	pix->width = ALIGN(w, 2);
++	pix->height = ALIGN(h, 2);
++	pix->pixelformat = V4L2_PIX_FMT_NV12;
++	pix->field = V4L2_FIELD_NONE;
++	pix->bytesperline = ALIGN(pix->width, 8);
++	pix->sizeimage = pix->bytesperline * pix->height * 3 / 2;
++	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
++	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
++	pix->xfer_func = V4L2_XFER_FUNC_NONE;
++}
++
++static int t20_isp_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
++			       unsigned int *nplanes, unsigned int sizes[],
++			       struct device *alloc_devs[])
++{
++	struct t20_isp *isp = vb2_get_drv_priv(q);
++
++	if (*nplanes)
++		return sizes[0] < isp->pix.sizeimage ? -EINVAL : 0;
++	*nplanes = 1;
++	sizes[0] = isp->pix.sizeimage;
++	return 0;
++}
++
++static int t20_isp_buf_prepare(struct vb2_buffer *vb)
++{
++	struct t20_isp *isp = vb2_get_drv_priv(vb->vb2_queue);
++
++	if (vb2_plane_size(vb, 0) < isp->pix.sizeimage)
++		return -EINVAL;
++	vb2_set_plane_payload(vb, 0, isp->pix.sizeimage);
++	return 0;
++}
++
++static void t20_isp_buf_queue(struct vb2_buffer *vb)
++{
++	struct t20_isp *isp = vb2_get_drv_priv(vb->vb2_queue);
++	struct t20_isp_buffer *buf =
++		container_of(to_vb2_v4l2_buffer(vb), struct t20_isp_buffer, vb);
++	unsigned long flags;
++
++	spin_lock_irqsave(&isp->buf_lock, flags);
++	list_add_tail(&buf->list, &isp->pending);
++	spin_unlock_irqrestore(&isp->buf_lock, flags);
++}
++
++static void t20_isp_return_buffers(struct t20_isp *isp, enum vb2_buffer_state state)
++{
++	struct t20_isp_buffer *buf, *tmp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&isp->buf_lock, flags);
++	if (isp->active)
++		list_add(&isp->active->list, &isp->pending);
++	isp->active = NULL;
++	list_for_each_entry_safe(buf, tmp, &isp->pending, list) {
++		list_del(&buf->list);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
++	}
++	spin_unlock_irqrestore(&isp->buf_lock, flags);
++}
++
++static int t20_isp_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct t20_isp *isp = vb2_get_drv_priv(q);
++	unsigned long flags;
++	int ret;
++
++	ret = video_device_pipeline_alloc_start(&isp->vdev);
++	if (ret)
++		goto err_return;
++
++	ret = pm_runtime_resume_and_get(isp->dev);
++	if (ret)
++		goto err_pipeline;
++
++	isp->sequence = 0;
++	spin_lock_irqsave(&isp->buf_lock, flags);
++	isp->active = list_first_entry(&isp->pending, struct t20_isp_buffer, list);
++	list_del(&isp->active->list);
++	spin_unlock_irqrestore(&isp->buf_lock, flags);
++
++	t20_isp_hw_start(isp);
++	t20_isp_set_buffer(isp, isp->active);
++
++	ret = v4l2_subdev_enable_streams(isp->sensor, isp->sensor_pad, BIT_ULL(0));
++	if (ret)
++		goto err_hw;
++	return 0;
++
++err_hw:
++	t20_isp_hw_stop(isp);
++	pm_runtime_put(isp->dev);
++err_pipeline:
++	video_device_pipeline_stop(&isp->vdev);
++err_return:
++	t20_isp_return_buffers(isp, VB2_BUF_STATE_QUEUED);
++	return ret;
++}
++
++static void t20_isp_stop_streaming(struct vb2_queue *q)
++{
++	struct t20_isp *isp = vb2_get_drv_priv(q);
++
++	v4l2_subdev_disable_streams(isp->sensor, isp->sensor_pad, BIT_ULL(0));
++	t20_isp_hw_stop(isp);
++	synchronize_irq(isp->irq);
++	pm_runtime_put(isp->dev);
++	video_device_pipeline_stop(&isp->vdev);
++	t20_isp_return_buffers(isp, VB2_BUF_STATE_ERROR);
++}
++
++static const struct vb2_ops t20_isp_vb2_ops = {
++	.queue_setup = t20_isp_queue_setup,
++	.buf_prepare = t20_isp_buf_prepare,
++	.buf_queue = t20_isp_buf_queue,
++	.start_streaming = t20_isp_start_streaming,
++	.stop_streaming = t20_isp_stop_streaming,
++};
++
++static int t20_isp_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, "t20-isp", sizeof(cap->driver));
++	strscpy(cap->card, "Ingenic T20 ISP", sizeof(cap->card));
++	return 0;
++}
++
++static int t20_isp_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
++{
++	if (f->index || (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_YUV10_1X30))
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_NV12;
++	return 0;
++}
++
++static int t20_isp_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_isp *isp = video_drvdata(file);
++
++	f->fmt.pix = isp->pix;
++	return 0;
++}
++
++/* The DS1 scaler is bypassed: the output is the sensor's size */
++static int t20_isp_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_isp *isp = video_drvdata(file);
++
++	f->fmt.pix = isp->pix;
++	return 0;
++}
++
++static int t20_isp_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_isp *isp = video_drvdata(file);
++
++	if (vb2_is_busy(&isp->queue))
++		return -EBUSY;
++	return t20_isp_try_fmt(file, fh, f);
++}
++
++static const struct v4l2_ioctl_ops t20_isp_ioctl_ops = {
++	.vidioc_querycap = t20_isp_querycap,
++	.vidioc_enum_fmt_vid_cap = t20_isp_enum_fmt,
++	.vidioc_g_fmt_vid_cap = t20_isp_g_fmt,
++	.vidioc_s_fmt_vid_cap = t20_isp_s_fmt,
++	.vidioc_try_fmt_vid_cap = t20_isp_try_fmt,
++	.vidioc_reqbufs = vb2_ioctl_reqbufs,
++	.vidioc_create_bufs = vb2_ioctl_create_bufs,
++	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
++	.vidioc_querybuf = vb2_ioctl_querybuf,
++	.vidioc_qbuf = vb2_ioctl_qbuf,
++	.vidioc_dqbuf = vb2_ioctl_dqbuf,
++	.vidioc_expbuf = vb2_ioctl_expbuf,
++	.vidioc_streamon = vb2_ioctl_streamon,
++	.vidioc_streamoff = vb2_ioctl_streamoff,
++};
++
++static const struct v4l2_file_operations t20_isp_fops = {
++	.owner = THIS_MODULE,
++	.open = v4l2_fh_open,
++	.release = vb2_fop_release,
++	.poll = vb2_fop_poll,
++	.mmap = vb2_fop_mmap,
++	.unlocked_ioctl = video_ioctl2,
++};
++
++static int t20_isp_link_validate(struct media_link *link)
++{
++	return 0;
++}
++
++static const struct media_entity_operations t20_isp_video_entity_ops = {
++	.link_validate = t20_isp_link_validate,
++};
++
++/* ISP subdevice: Bayer in, YUV out at the same size */
++
++static int t20_isp_sd_enum_mbus_code(struct v4l2_subdev *sd,
++				     struct v4l2_subdev_state *state,
++				     struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index)
++		return -EINVAL;
++	code->code = code->pad == T20_ISP_PAD_SINK ? MEDIA_BUS_FMT_SBGGR10_1X10 :
++						      MEDIA_BUS_FMT_YUV10_1X30;
++	return 0;
++}
++
++static int t20_isp_sd_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
++			      struct v4l2_subdev_format *fmt)
++{
++	struct v4l2_mbus_framefmt *sink = v4l2_subdev_state_get_format(state, T20_ISP_PAD_SINK);
++	struct v4l2_mbus_framefmt *src = v4l2_subdev_state_get_format(state, T20_ISP_PAD_SOURCE);
++
++	if (fmt->pad == T20_ISP_PAD_SINK) {
++		*sink = fmt->format;
++		sink->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++		sink->field = V4L2_FIELD_NONE;
++		*src = *sink;
++		src->code = MEDIA_BUS_FMT_YUV10_1X30;
++		src->colorspace = V4L2_COLORSPACE_SMPTE170M;
++		fmt->format = *sink;
++	} else {
++		fmt->format = *src;
++	}
++	return 0;
++}
++
++static int t20_isp_sd_init_state(struct v4l2_subdev *sd, struct v4l2_subdev_state *state)
++{
++	struct v4l2_subdev_format fmt = {
++		.which = V4L2_SUBDEV_FORMAT_TRY,
++		.pad = T20_ISP_PAD_SINK,
++		.format = {
++			.width = 1920,
++			.height = 1080,
++			.code = MEDIA_BUS_FMT_SBGGR10_1X10,
++			.colorspace = V4L2_COLORSPACE_RAW,
++		},
++	};
++
++	return t20_isp_sd_set_fmt(sd, state, &fmt);
++}
++
++static const struct v4l2_subdev_pad_ops t20_isp_sd_pad_ops = {
++	.enum_mbus_code = t20_isp_sd_enum_mbus_code,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = t20_isp_sd_set_fmt,
++	.link_validate = v4l2_subdev_link_validate_default,
++};
++
++static const struct v4l2_subdev_ops t20_isp_sd_ops = {
++	.pad = &t20_isp_sd_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops t20_isp_sd_internal_ops = {
++	.init_state = t20_isp_sd_init_state,
++};
++
++static const struct media_entity_operations t20_isp_sd_entity_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++};
++
++/* Sensor binding */
++
++static int t20_isp_notify_bound(struct v4l2_async_notifier *nf,
++				struct v4l2_subdev *sd,
++				struct v4l2_async_connection *asc)
++{
++	struct t20_isp *isp = container_of(nf, struct t20_isp, notifier);
++	int pad;
++
++	pad = media_entity_get_fwnode_pad(&sd->entity, asc->match.fwnode,
++					  MEDIA_PAD_FL_SOURCE);
++	if (pad < 0)
++		return pad;
++	isp->sensor = sd;
++	isp->sensor_pad = pad;
++	return media_create_pad_link(&sd->entity, pad, &isp->sd.entity,
++				     T20_ISP_PAD_SINK,
++				     MEDIA_LNK_FL_ENABLED | MEDIA_LNK_FL_IMMUTABLE);
++}
++
++static int t20_isp_notify_complete(struct v4l2_async_notifier *nf)
++{
++	struct t20_isp *isp = container_of(nf, struct t20_isp, notifier);
++	struct v4l2_subdev_format fmt = {
++		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
++		.pad = isp->sensor_pad,
++	};
++	struct v4l2_subdev_state *state;
++	int ret;
++
++	/* Take the sensor's format for the ISP and the video node */
++	ret = v4l2_subdev_call_state_active(isp->sensor, pad, get_fmt, &fmt);
++	if (ret)
++		return ret;
++	fmt.pad = T20_ISP_PAD_SINK;
++	state = v4l2_subdev_lock_and_get_active_state(&isp->sd);
++	t20_isp_sd_set_fmt(&isp->sd, state, &fmt);
++	v4l2_subdev_unlock_state(state);
++	t20_isp_fill_pix(&isp->pix, fmt.format.width, fmt.format.height);
++
++	ret = v4l2_device_register_subdev_nodes(&isp->v4l2_dev);
++	if (ret)
++		return ret;
++	return media_device_register(&isp->mdev);
++}
++
++static const struct v4l2_async_notifier_operations t20_isp_notify_ops = {
++	.bound = t20_isp_notify_bound,
++	.complete = t20_isp_notify_complete,
++};
++
++static int t20_isp_parse_endpoint(struct t20_isp *isp)
++{
++	struct v4l2_async_connection *asc;
++	struct fwnode_handle *ep;
++	int ret;
++
++	ep = fwnode_graph_get_endpoint_by_id(dev_fwnode(isp->dev), 0, 0, 0);
++	if (!ep)
++		return dev_err_probe(isp->dev, -EINVAL, "no sensor endpoint\n");
++
++	isp->ep.bus_type = V4L2_MBUS_PARALLEL;
++	ret = v4l2_fwnode_endpoint_parse(ep, &isp->ep);
++	if (ret) {
++		fwnode_handle_put(ep);
++		return dev_err_probe(isp->dev, ret, "the sensor bus must be parallel\n");
++	}
++
++	asc = v4l2_async_nf_add_fwnode_remote(&isp->notifier, ep,
++					      struct v4l2_async_connection);
++	fwnode_handle_put(ep);
++	return PTR_ERR_OR_ZERO(asc);
++}
++
++/* Probe */
++
++static int t20_isp_runtime_resume(struct device *dev)
++{
++	struct t20_isp *isp = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_prepare_enable(isp->clk_core);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(isp->clk_isp);
++	if (ret)
++		clk_disable_unprepare(isp->clk_core);
++	return ret;
++}
++
++static int t20_isp_runtime_suspend(struct device *dev)
++{
++	struct t20_isp *isp = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(isp->clk_isp);
++	clk_disable_unprepare(isp->clk_core);
++	return 0;
++}
++
++static int t20_isp_register_video(struct t20_isp *isp)
++{
++	struct video_device *vdev = &isp->vdev;
++	struct vb2_queue *q = &isp->queue;
++	int ret;
++
++	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	q->io_modes = VB2_MMAP | VB2_DMABUF;
++	q->drv_priv = isp;
++	q->buf_struct_size = sizeof(struct t20_isp_buffer);
++	q->ops = &t20_isp_vb2_ops;
++	q->mem_ops = &vb2_dma_contig_memops;
++	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
++	q->min_queued_buffers = 1;
++	q->lock = &isp->lock;
++	q->dev = isp->dev;
++	ret = vb2_queue_init(q);
++	if (ret)
++		return ret;
++
++	strscpy(vdev->name, "t20-isp-main", sizeof(vdev->name));
++	vdev->fops = &t20_isp_fops;
++	vdev->ioctl_ops = &t20_isp_ioctl_ops;
++	vdev->v4l2_dev = &isp->v4l2_dev;
++	vdev->queue = q;
++	vdev->lock = &isp->lock;
++	vdev->release = video_device_release_empty;
++	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
++			    V4L2_CAP_IO_MC;
++	vdev->entity.ops = &t20_isp_video_entity_ops;
++	video_set_drvdata(vdev, isp);
++
++	isp->vpad.flags = MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
++	ret = media_entity_pads_init(&vdev->entity, 1, &isp->vpad);
++	if (ret)
++		return ret;
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		return ret;
++	return media_create_pad_link(&isp->sd.entity, T20_ISP_PAD_SOURCE,
++				     &vdev->entity, 0,
++				     MEDIA_LNK_FL_ENABLED | MEDIA_LNK_FL_IMMUTABLE);
++}
++
++static int t20_isp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct t20_isp *isp;
++	int irq, ret;
++
++	isp = devm_kzalloc(dev, sizeof(*isp), GFP_KERNEL);
++	if (!isp)
++		return -ENOMEM;
++	isp->dev = dev;
++	mutex_init(&isp->lock);
++	spin_lock_init(&isp->buf_lock);
++	INIT_LIST_HEAD(&isp->pending);
++	platform_set_drvdata(pdev, isp);
++	t20_isp_fill_pix(&isp->pix, 1920, 1080);
++
++	isp->vic = devm_platform_ioremap_resource_byname(pdev, "vic");
++	if (IS_ERR(isp->vic))
++		return PTR_ERR(isp->vic);
++	isp->irqc = devm_platform_ioremap_resource_byname(pdev, "irq");
++	if (IS_ERR(isp->irqc))
++		return PTR_ERR(isp->irqc);
++	isp->core = devm_platform_ioremap_resource_byname(pdev, "core");
++	if (IS_ERR(isp->core))
++		return PTR_ERR(isp->core);
++
++	isp->clk_isp = devm_clk_get(dev, "isp");
++	if (IS_ERR(isp->clk_isp))
++		return dev_err_probe(dev, PTR_ERR(isp->clk_isp), "isp clock\n");
++	isp->clk_core = devm_clk_get(dev, "core");
++	if (IS_ERR(isp->clk_core))
++		return dev_err_probe(dev, PTR_ERR(isp->clk_core), "core clock\n");
++	ret = clk_set_rate(isp->clk_core, T20_ISP_CLK_RATE);
++	if (ret)
++		return dev_err_probe(dev, ret, "core clock rate\n");
++
++	/* Frame buffers from the reserved ISP memory */
++	ret = of_reserved_mem_device_init(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "no memory-region\n");
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = irq;
++		goto err_mem;
++	}
++	isp->irq = irq;
++	ret = devm_request_irq(dev, irq, t20_isp_irq, 0, dev_name(dev), isp);
++	if (ret)
++		goto err_mem;
++
++	isp->mdev.dev = dev;
++	strscpy(isp->mdev.model, "Ingenic T20 ISP", sizeof(isp->mdev.model));
++	media_device_init(&isp->mdev);
++	isp->v4l2_dev.mdev = &isp->mdev;
++	ret = v4l2_device_register(dev, &isp->v4l2_dev);
++	if (ret)
++		goto err_mdev;
++
++	v4l2_subdev_init(&isp->sd, &t20_isp_sd_ops);
++	isp->sd.internal_ops = &t20_isp_sd_internal_ops;
++	isp->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	isp->sd.entity.function = MEDIA_ENT_F_PROC_VIDEO_ISP;
++	isp->sd.entity.ops = &t20_isp_sd_entity_ops;
++	isp->sd.owner = THIS_MODULE;
++	strscpy(isp->sd.name, "t20-isp", sizeof(isp->sd.name));
++	isp->pads[T20_ISP_PAD_SINK].flags = MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
++	isp->pads[T20_ISP_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&isp->sd.entity, T20_ISP_PADS, isp->pads);
++	if (ret)
++		goto err_v4l2;
++	ret = v4l2_subdev_init_finalize(&isp->sd);
++	if (ret)
++		goto err_entity;
++	ret = v4l2_device_register_subdev(&isp->v4l2_dev, &isp->sd);
++	if (ret)
++		goto err_sd;
++
++	ret = t20_isp_register_video(isp);
++	if (ret)
++		goto err_unreg_sd;
++
++	pm_runtime_enable(dev);
++
++	v4l2_async_nf_init(&isp->notifier, &isp->v4l2_dev);
++	isp->notifier.ops = &t20_isp_notify_ops;
++	ret = t20_isp_parse_endpoint(isp);
++	if (ret)
++		goto err_nf;
++	ret = v4l2_async_nf_register(&isp->notifier);
++	if (ret)
++		goto err_nf;
++	return 0;
++
++err_nf:
++	v4l2_async_nf_cleanup(&isp->notifier);
++	pm_runtime_disable(dev);
++	video_unregister_device(&isp->vdev);
++err_unreg_sd:
++	v4l2_device_unregister_subdev(&isp->sd);
++err_sd:
++	v4l2_subdev_cleanup(&isp->sd);
++err_entity:
++	media_entity_cleanup(&isp->sd.entity);
++err_v4l2:
++	v4l2_device_unregister(&isp->v4l2_dev);
++err_mdev:
++	media_device_cleanup(&isp->mdev);
++err_mem:
++	of_reserved_mem_device_release(dev);
++	return ret;
++}
++
++static void t20_isp_remove(struct platform_device *pdev)
++{
++	struct t20_isp *isp = platform_get_drvdata(pdev);
++
++	media_device_unregister(&isp->mdev);
++	v4l2_async_nf_unregister(&isp->notifier);
++	v4l2_async_nf_cleanup(&isp->notifier);
++	pm_runtime_disable(isp->dev);
++	video_unregister_device(&isp->vdev);
++	v4l2_device_unregister_subdev(&isp->sd);
++	v4l2_subdev_cleanup(&isp->sd);
++	media_entity_cleanup(&isp->sd.entity);
++	v4l2_device_unregister(&isp->v4l2_dev);
++	media_device_cleanup(&isp->mdev);
++	of_reserved_mem_device_release(isp->dev);
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(t20_isp_pm_ops, t20_isp_runtime_suspend,
++				 t20_isp_runtime_resume, NULL);
++
++static const struct of_device_id t20_isp_of_match[] = {
++	{ .compatible = "ingenic,t20-isp" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, t20_isp_of_match);
++
++static struct platform_driver t20_isp_driver = {
++	.driver = {
++		.name = "t20-isp",
++		.of_match_table = t20_isp_of_match,
++		.pm = pm_ptr(&t20_isp_pm_ops),
++	},
++	.probe = t20_isp_probe,
++	.remove = t20_isp_remove,
++};
++module_platform_driver(t20_isp_driver);
++
++MODULE_DESCRIPTION("Ingenic T20 camera input and ISP");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/pinctrl/pinctrl-ingenic.c b/drivers/pinctrl/pinctrl-ingenic.c
+index b7cf54081..3dd92b1cc 100644
+--- a/drivers/pinctrl/pinctrl-ingenic.c
++++ b/drivers/pinctrl/pinctrl-ingenic.c
+@@ -2844,6 +2844,10 @@ static int t20_sfc_pins[] = { 0x17, 0x18, 0x1b, 0x1c, };
+ static int t20_sfc_quad_pins[] = { 0x19, 0x1a, };
+ static int t20_ssi0_pins[] = { 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, };
+ static int t20_cim_mclk_pins[] = { 0x0f, };
++/* DVP: data PA0-PA9, PCLK PA14, HREF PA16, VSYNC PA17 (vendor DVP_PA_LOW_10BIT) */
++static int t20_dvp_10bit_pins[] = {
++	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0e, 0x10, 0x11,
++};
+ static int t20_dmic_pins[] = { 0x4b, 0x4c, 0x4f, };
+ static int t20_pwm0_pins[] = { 0x31, };
+ static int t20_pwm1_pins[] = { 0x32, };
+@@ -2864,6 +2868,7 @@ static const struct group_desc t20_groups[] = {
+ 	INGENIC_PIN_GROUP("sfc-quad", t20_sfc_quad, 1),
+ 	INGENIC_PIN_GROUP("ssi0", t20_ssi0, 0),
+ 	INGENIC_PIN_GROUP("cim-mclk", t20_cim_mclk, 1),
++	INGENIC_PIN_GROUP("dvp-10bit", t20_dvp_10bit, 1),
+ 	INGENIC_PIN_GROUP("dmic", t20_dmic, 1),
+ 	INGENIC_PIN_GROUP("pwm0", t20_pwm0, 0),
+ 	INGENIC_PIN_GROUP("pwm1", t20_pwm1, 0),
+@@ -2879,7 +2884,7 @@ static const char *t20_mmc0_groups[] = { "mmc0-1bit", "mmc0-4bit", };
+ static const char *t20_mmc1_groups[] = { "mmc1-1bit", "mmc1-4bit", };
+ static const char *t20_sfc_groups[] = { "sfc", "sfc-quad", };
+ static const char *t20_ssi0_groups[] = { "ssi0", };
+-static const char *t20_cim_groups[] = { "cim-mclk", };
++static const char *t20_cim_groups[] = { "cim-mclk", "dvp-10bit", };
+ static const char *t20_dmic_groups[] = { "dmic", };
+ static const char *t20_pwm0_groups[] = { "pwm0", };
+ static const char *t20_pwm1_groups[] = { "pwm1", };

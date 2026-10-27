@@ -139,6 +139,10 @@ CONFIG_MEDIA_SUBDRV_AUTOSELECT=n
 # Image sensor: JX-F22 or JX-F23 (our patch 0011), on the ISP's parallel input
 CONFIG_VIDEO_CAMERA_SENSOR=y
 CONFIG_VIDEO_JXF2X=m
+# Camera input and ISP (our patch 0012); frame buffers from reserved memory
+CONFIG_V4L_PLATFORM_DRIVERS=y
+CONFIG_VIDEO_INGENIC_T20_ISP=m
+CONFIG_DMA_CMA=n
 
 ## Filesystems: squashfs root, JFFS2 config partition, vfat SD card
 CONFIG_MISC_FILESYSTEMS=y
