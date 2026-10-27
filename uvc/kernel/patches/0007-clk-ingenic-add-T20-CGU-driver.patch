@@ -1,4 +1,4 @@
-From 2ff60339b9b174d31913301c94519bed14d5e144 Mon Sep 17 00:00:00 2001
+From e7d7d301166a26cd39bfb36b1ca226849531cae1 Mon Sep 17 00:00:00 2001
 From: openmico_onvif <andrei.tanas@gmail.com>
 Date: Tue, 27 Oct 2026 01:20:38 +0000
 Subject: [PATCH 7/9] clk: ingenic: add T20 CGU driver
@@ -9,9 +9,9 @@ dividers and gates use the common Ingenic CGU code.
 ---
  drivers/clk/ingenic/Kconfig                 |  10 +
  drivers/clk/ingenic/Makefile                |   1 +
- drivers/clk/ingenic/t20-cgu.c               | 385 ++++++++++++++++++++
+ drivers/clk/ingenic/t20-cgu.c               | 399 ++++++++++++++++++++
  include/dt-bindings/clock/ingenic,t20-cgu.h |  52 +++
- 4 files changed, 448 insertions(+)
+ 4 files changed, 462 insertions(+)
  create mode 100644 drivers/clk/ingenic/t20-cgu.c
  create mode 100644 include/dt-bindings/clock/ingenic,t20-cgu.h
 
@@ -48,10 +48,10 @@ index 81d8e23c2..467930a40 100644
  obj-$(CONFIG_INGENIC_TCU_CLK)		+= tcu.o
 diff --git a/drivers/clk/ingenic/t20-cgu.c b/drivers/clk/ingenic/t20-cgu.c
 new file mode 100644
-index 000000000..47947f91c
+index 000000000..beacae28f
 --- /dev/null
 +++ b/drivers/clk/ingenic/t20-cgu.c
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,399 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Ingenic T20 SoC CGU driver
@@ -61,6 +61,7 @@ index 000000000..47947f91c
 + */
 +
 +#include <linux/clk-provider.h>
++#include <linux/clkdev.h>
 +#include <linux/io.h>
 +#include <linux/math64.h>
 +#include <linux/of.h>
@@ -416,6 +417,7 @@ index 000000000..47947f91c
 +
 +static void __init t20_cgu_init(struct device_node *np)
 +{
++	unsigned int i;
 +	int retval;
 +
 +	cgu = ingenic_cgu_new(t20_cgu_clocks, ARRAY_SIZE(t20_cgu_clocks), np);
@@ -428,6 +430,18 @@ index 000000000..47947f91c
 +	if (retval) {
 +		pr_err("%s: failed to register CGU clocks\n", __func__);
 +		return;
++	}
++
++	/*
++	 * Vendor-derived drivers (tx-isp, VPU, IPU, audio) register their own
++	 * platform devices and look clocks up by the vendor names ("isp",
++	 * "cgu_isp", "csi", ...): make every clock findable by name alone.
++	 */
++	for (i = 0; i < ARRAY_SIZE(t20_cgu_clocks); i++) {
++		struct clk *clk = cgu->clocks.clks[i];
++
++		if (!IS_ERR_OR_NULL(clk))
++			clk_register_clkdev(clk, t20_cgu_clocks[i].name, NULL);
 +	}
 +
 +	ingenic_cgu_register_syscore(cgu);

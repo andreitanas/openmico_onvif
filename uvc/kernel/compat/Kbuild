@@ -1,0 +1,2 @@
+obj-m := t20-compat.o
+ccflags-y += -I$(src)/include

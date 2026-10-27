@@ -13,7 +13,8 @@
 #     on Ubuntu 24.04 those are installed with gcc)
 #   rtl8189fs (WiFi) from jwrdegoede/rtl8189ES_linux, by commit
 # Patches in kernel/patches/ are applied in order; kernel/dts/ is copied in.
-# Host tools: make, gcc, flex, bison, bc, python3, xz (lzma), git, curl.
+# Host tools: make, gcc, flex, bison, bc, python3, xz (lzma), git, curl,
+# depmod (kmod).
 set -e
 cd "$(dirname "$0")/.."
 TOP=$PWD
@@ -58,15 +59,20 @@ export LD_LIBRARY_PATH=$TC/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRA
 
 # Kernel source, patched
 SRC=$DL/linux
-if [ ! -f "$SRC/.patched" ]; then
-    rm -rf "$SRC"
-    git clone -q --depth 1 -b $LINUX_TAG https://github.com/gregkh/linux "$SRC"
-    [ "$(git -C "$SRC" rev-parse HEAD)" = $LINUX_COMMIT ] ||
-        { echo "linux $LINUX_TAG is not commit $LINUX_COMMIT" >&2; exit 1; }
+if [ ! -d "$SRC/.git" ]; then
+    git -c advice.detachedHead=false clone -q --depth 1 -b $LINUX_TAG https://github.com/gregkh/linux "$SRC"
+fi
+[ "$(git -C "$SRC" rev-parse HEAD)" = $LINUX_COMMIT ] ||
+    { echo "linux $LINUX_TAG is not commit $LINUX_COMMIT" >&2; exit 1; }
+# Re-patched from the pristine tree whenever kernel/patches/ changes
+PATCHES=$(cat "$TOP"/kernel/patches/*.patch | sha256sum | cut -d' ' -f1)
+if [ "$(cat "$SRC/.git/patched" 2>/dev/null)" != "$PATCHES" ]; then
+    git -C "$SRC" reset -q --hard
+    git -C "$SRC" clean -qfdx
     for p in "$TOP"/kernel/patches/*.patch; do
         git -C "$SRC" apply "$p"
     done
-    touch "$SRC/.patched"
+    echo "$PATCHES" > "$SRC/.git/patched"
 fi
 cp "$TOP"/kernel/dts/*.dts "$TOP"/kernel/dts/*.dtsi "$SRC/arch/mips/boot/dts/ingenic/"
 
@@ -74,7 +80,7 @@ export ARCH=mips CROSS_COMPILE=mipsel-linux-gnu-
 export KBUILD_BUILD_USER=uvc KBUILD_BUILD_HOST=build
 export KBUILD_BUILD_TIMESTAMP="$(git -C "$TOP" log -1 --format=%cd --date=rfc 2>/dev/null || echo 'Thu, 01 Jan 2026 00:00:00 +0000')"
 export SOURCE_DATE_EPOCH=$(date -d "$KBUILD_BUILD_TIMESTAMP" +%s)
-K="make -s -C $SRC O=$OUT/obj"
+K="make -s -C $SRC O=$OUT/obj LOCALVERSION="
 JOBS=$(nproc)
 
 # Configuration: tinyconfig plus kernel/config, every option checked
@@ -100,11 +106,11 @@ VER=$($K kernelrelease)
 # WiFi driver (out of tree)
 WIFI=$DL/rtl8189fs
 if [ ! -d "$WIFI" ]; then
-    git clone -q -b rtl8189fs https://github.com/jwrdegoede/rtl8189ES_linux "$WIFI"
+    git -c advice.detachedHead=false clone -q -b rtl8189fs https://github.com/jwrdegoede/rtl8189ES_linux "$WIFI"
     git -C "$WIFI" checkout -q $RTL8189FS_COMMIT
 fi
 make -s -C "$OUT/obj" M="$WIFI" -j"$JOBS" \
-    CONFIG_RTL8189FS=m USER_EXTRA_CFLAGS="-Wno-error" modules
+    CONFIG_RTL8189FS=m CONFIG_MP_INCLUDED=n USER_EXTRA_CFLAGS="-Wno-error" modules
 
 # Outputs
 D=$OUT/out

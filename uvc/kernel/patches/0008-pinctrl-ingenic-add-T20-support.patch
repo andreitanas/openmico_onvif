@@ -1,4 +1,4 @@
-From 814e60ee1c4532105b4999e7f6d254db6ed8c013 Mon Sep 17 00:00:00 2001
+From cfc5e33235f515993b4b1becaedc063b4458fae5 Mon Sep 17 00:00:00 2001
 From: openmico_onvif <andrei.tanas@gmail.com>
 Date: Tue, 27 Oct 2026 01:20:39 +0000
 Subject: [PATCH 8/9] pinctrl: ingenic: add T20 support
