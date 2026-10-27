@@ -3,7 +3,13 @@
 # background until it gets a lease.
 case "$1" in
 start)
-	insmod /lib/modules/3.10.14/kernel/drivers/net/wireless/rtl818x/rtl8189FS/8189fs.ko
+	if [ -d /lib/modules/3.10.14 ]; then
+		insmod /lib/modules/3.10.14/kernel/drivers/net/wireless/rtl818x/rtl8189FS/8189fs.ko
+	else
+		# Our kernel: cfg80211 comes with it, IPv6 is a module too
+		modprobe ipv6
+		modprobe 8189fs
+	fi
 	# Without a hostname in the settings (one SD card sets up any number of
 	# cameras) each camera is named after its MAC, e.g. wyze-2BE8.
 	if [ ! -f /config/overlay/etc/hostname ]; then

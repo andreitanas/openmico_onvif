@@ -8,7 +8,9 @@ case "$1" in
 start)
 	mkdir -p /config /rom /sdcard
 	mount -t jffs2 /dev/mtdblock3 /config || logger -s -t config "cannot mount /config"
-	mount -t jffs2 -o ro /dev/mtdblock2 /rom || logger -s -t config "cannot mount /rom"
+	# On our kernel /rom is part of the squashfs root
+	awk '$2 == "/" && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts ||
+		mount -t jffs2 -o ro /dev/mtdblock2 /rom || logger -s -t config "cannot mount /rom"
 
 	if [ -b /dev/mmcblk0p1 ] && mount -t vfat -o rw,noatime,umask=0000 /dev/mmcblk0p1 /sdcard; then
 		if [ -d /sdcard/config ]; then

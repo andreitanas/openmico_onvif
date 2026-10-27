@@ -1,7 +1,7 @@
 From e831675bd265cd141569cc5f104ec6b4c41daf84 Mon Sep 17 00:00:00 2001
 From: Alfonso Gamboa <gtxent@gmail.com>
 Date: Sun, 3 May 2026 08:38:52 -0700
-Subject: [PATCH 2/9] irqchip/clocksource/serial: ingenic: add T31 SoC
+Subject: [PATCH 02/10] irqchip/clocksource/serial: ingenic: add T31 SoC
  compatibles
 
 Add 'ingenic,t31-intc', 'ingenic,t31-ost' and 'ingenic,t31-uart'

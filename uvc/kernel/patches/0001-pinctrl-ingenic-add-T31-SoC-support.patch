@@ -1,7 +1,7 @@
 From 3b83cd81b0b1cce224de9ea7c427b9296f753c04 Mon Sep 17 00:00:00 2001
 From: Alfonso Gamboa <gtxent@gmail.com>
 Date: Sun, 3 May 2026 08:38:52 -0700
-Subject: [PATCH 1/9] pinctrl: ingenic: add T31 SoC support
+Subject: [PATCH 01/10] pinctrl: ingenic: add T31 SoC support
 
 Add the pin groups, functions and pull-up/down tables for the Ingenic
 T31. Three GPIO ports (PA, PB, PC), 32 pins each, with up to four

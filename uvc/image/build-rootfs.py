@@ -13,6 +13,12 @@ The tarball is filtered member by member, never unpacked, so file modes,
 owners and names survive the host filesystem.
 
     build-rootfs.py BASE.tar.xz OVERLAY_DIR OUT.tar.xz
+    build-rootfs.py BASE.tar.xz OVERLAY_DIR OUT.tar OVERLAY_DIR...
+
+With more overlays (our kernel's root filesystem, image/build-modern.sh)
+the base image's 3.10 kernel modules all go, the extra overlays (our
+modules, uvcd) are added like the first, and OUT is a plain tar for
+sqfstar.
 """
 import io
 import lzma
@@ -90,7 +96,7 @@ def needed(data):
     return [data[strtab + v:data.index(b'\0', strtab + v)].decode() for v in entries]
 
 
-def main(base, overlay, out):
+def main(base, overlay, out, *extra):
     src = tarfile.open(base)
     members, data = {}, {}
     for m in src.getmembers():
@@ -116,9 +122,9 @@ def main(base, overlay, out):
             return True
         m = members[n]
         if m.isreg() and n.endswith('.ko'):
-            return n not in KEEP_MODULES
+            return bool(extra) or n not in KEEP_MODULES
         if m.isreg() and n.startswith('driver/'):
-            return n not in KEEP_MODULES
+            return bool(extra) or n not in KEEP_MODULES
         if m.isreg() and posixpath.dirname(n) in BIN_DIRS:
             return n not in KEEP_PROGRAMS
         return False
@@ -150,10 +156,11 @@ def main(base, overlay, out):
 
     # Ours replace theirs.
     ours = {}
-    for root, dirs, files in os.walk(overlay):
-        for f in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
-            path = os.path.join(root, f)
-            ours[os.path.relpath(path, overlay)] = path
+    for top in (overlay,) + extra:
+        for root, dirs, files in os.walk(top):
+            for f in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+                path = os.path.join(root, f)
+                ours[os.path.relpath(path, top)] = path
     keep -= set(ours)
 
     # Links whose target went (busybox applets stay: busybox is kept). Links
@@ -192,18 +199,24 @@ def main(base, overlay, out):
             with open(path, 'rb') as fp:
                 dst.addfile(t, fp)
     raw = buf.getvalue()
+    total = sum(members[n].size for n in keep if n in members and members[n].isreg())
+    if extra:
+        with open(out, 'wb') as fp:
+            fp.write(raw)
+        print(f'{out}: {len(keep)} entries, {total / 1048576:.1f} MiB of base files, '
+              f'tar {len(raw) / 1048576:.1f} MiB')
+        return
     # CRC32 and a small dictionary: decompressed by busybox in the kernel's
     # initramfs with little RAM.
     xz = lzma.compress(raw, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32,
                        filters=[{'id': lzma.FILTER_LZMA2, 'preset': 9, 'dict_size': 4 << 20}])
     with open(out, 'wb') as fp:
         fp.write(xz)
-    total = sum(members[n].size for n in keep if n in members and members[n].isreg())
     print(f'{out}: {len(keep)} entries, {total / 1048576:.1f} MiB of files, '
           f'tar {len(raw) / 1048576:.1f} MiB, xz {len(xz) / 1048576:.1f} MiB')
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4:
+    if len(sys.argv) < 4:
         sys.exit(__doc__)
     main(*sys.argv[1:])

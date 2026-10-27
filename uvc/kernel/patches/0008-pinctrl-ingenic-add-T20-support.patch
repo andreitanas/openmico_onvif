@@ -1,7 +1,7 @@
 From cfc5e33235f515993b4b1becaedc063b4458fae5 Mon Sep 17 00:00:00 2001
 From: openmico_onvif <andrei.tanas@gmail.com>
 Date: Tue, 27 Oct 2026 01:20:39 +0000
-Subject: [PATCH 8/9] pinctrl: ingenic: add T20 support
+Subject: [PATCH 08/10] pinctrl: ingenic: add T20 support
 
 Four ports 0x100 apart with JZ4770-style registers written directly (no
 shadow registers), and the pull enable at 0x60 with set meaning enabled,

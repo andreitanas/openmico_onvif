@@ -1,7 +1,7 @@
 From 4863b2cdc7b3deba472f63e07a4f702c0dfb5b87 Mon Sep 17 00:00:00 2001
 From: Alfonso Gamboa <gtxent@gmail.com>
 Date: Sun, 3 May 2026 08:38:52 -0700
-Subject: [PATCH 3/9] MIPS: ingenic: add T31 SoC machine support
+Subject: [PATCH 03/10] MIPS: ingenic: add T31 SoC machine support
 
 Add MACH_T31 Kconfig option, MACH_INGENIC_T31 enum, the system_type
 mapping, the 'ingenic,t31' OF match, and a dtb build entry for the

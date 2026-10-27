@@ -105,9 +105,10 @@ CONFIG_MTD=y
 CONFIG_MTD_OF_PARTS=y
 CONFIG_MTD_BLOCK=y
 CONFIG_MTD_SPI_NOR=y
-# 4 KB erase would turn the 32 KB-block JFFS2 config partition unreadable;
-# off gives the largest erase size the chip's SFDP lists (see docs)
+# Erase in 32 KB blocks like the vendor kernel: the config partition is a
+# JFFS2 image with 32 KB erase blocks (our patch 0010)
 CONFIG_MTD_SPI_NOR_USE_4K_SECTORS=n
+CONFIG_MTD_SPI_NOR_USE_32K_SECTORS=y
 
 ## SD card and SDIO (MSC0, MSC1)
 CONFIG_BLOCK=y

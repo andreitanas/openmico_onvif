@@ -26,7 +26,7 @@
 	 */
 	chosen {
 		stdout-path = "serial1:115200n8";
-		bootargs = "console=ttyS1,115200n8 earlycon root=/dev/mtdblock2 rootfstype=squashfs ro init=/sbin/init panic=10";
+		bootargs = "console=ttyS1,115200n8 earlycon root=/dev/mtdblock2 rootfstype=squashfs ro panic=10";
 	};
 
 	/*

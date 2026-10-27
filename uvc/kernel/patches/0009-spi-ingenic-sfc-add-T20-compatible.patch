@@ -1,7 +1,7 @@
 From 94a4f28eb1fb09f7b4c1ad6c005870414eb0d984 Mon Sep 17 00:00:00 2001
 From: openmico_onvif <andrei.tanas@gmail.com>
 Date: Tue, 27 Oct 2026 01:20:39 +0000
-Subject: [PATCH 9/9] spi: ingenic-sfc: add T20 compatible
+Subject: [PATCH 09/10] spi: ingenic-sfc: add T20 compatible
 
 Same registers as the X1000's SFC (vendor drivers/mtd/devices/jz_sfc.h).
 ---

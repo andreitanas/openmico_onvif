@@ -1,0 +1,55 @@
+From b692ec731897855c0da283cde4d804e13b335ea0 Mon Sep 17 00:00:00 2001
+From: openmico_onvif <andrei.tanas@gmail.com>
+Date: Tue, 27 Oct 2026 01:28:50 +0000
+Subject: [PATCH 10/10] mtd: spi-nor: option to erase in 32 KiB sectors
+
+The Wyze Cam v2's config partition is a JFFS2 image with 32 KiB erase
+blocks, as Ingenic's vendor kernels use; the mainline default (largest
+erase size, usually 64 KiB) would not read it.
+---
+ drivers/mtd/spi-nor/Kconfig | 10 ++++++++++
+ drivers/mtd/spi-nor/core.c  | 10 ++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/drivers/mtd/spi-nor/Kconfig b/drivers/mtd/spi-nor/Kconfig
+index fd05a24d6..f1365ea3a 100644
+--- a/drivers/mtd/spi-nor/Kconfig
++++ b/drivers/mtd/spi-nor/Kconfig
+@@ -20,6 +20,16 @@ config MTD_SPI_NOR_USE_4K_SECTORS
+ 	  small sectors. On the other hand erasing should be faster when using
+ 	  64 KiB block instead of 16 × 4 KiB sectors.
+ 
++config MTD_SPI_NOR_USE_32K_SECTORS
++	bool "Use small 32 KiB sectors for erase operations"
++	depends on !MTD_SPI_NOR_USE_4K_SECTORS
++	default n
++	help
++	  Erase in 32 KiB blocks when the flash supports it (as listed in its
++	  SFDP tables), for JFFS2 images made with 32 KiB erase blocks, as on
++	  cameras with Ingenic SoCs whose vendor kernels erase in 32 KiB.
++	  Falls back to the largest erase size otherwise.
++
+ 	  Please note that some tools/drivers/filesystems may not work with
+ 	  4096 B erase size (e.g. UBIFS requires 15 KiB as a minimum).
+ 
+diff --git a/drivers/mtd/spi-nor/core.c b/drivers/mtd/spi-nor/core.c
+index 037407fc2..1482c0117 100644
+--- a/drivers/mtd/spi-nor/core.c
++++ b/drivers/mtd/spi-nor/core.c
+@@ -2613,6 +2613,16 @@ spi_nor_select_uniform_erase(struct spi_nor_erase_map *map)
+ 			break;
+ 		}
+ 
++		/*
++		 * Likewise for 32k, the erase block of flash images made for
++		 * vendor kernels that erase in 32k blocks (Ingenic SoCs).
++		 */
++		if (IS_ENABLED(CONFIG_MTD_SPI_NOR_USE_32K_SECTORS) &&
++		    tested_erase->size == SZ_32K) {
++			erase = tested_erase;
++			break;
++		}
++
+ 		/*
+ 		 * Otherwise, the current erase size is still a valid candidate.
+ 		 * Select the biggest valid candidate.

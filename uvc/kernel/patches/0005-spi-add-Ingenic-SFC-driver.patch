@@ -1,7 +1,7 @@
 From 14f79b104f15df8a22ff1e67ca7af58bec5bd788 Mon Sep 17 00:00:00 2001
 From: Alfonso Gamboa <gtxent@gmail.com>
 Date: Sun, 3 May 2026 08:38:53 -0700
-Subject: [PATCH 5/9] spi: add Ingenic SFC driver
+Subject: [PATCH 05/10] spi: add Ingenic SFC driver
 
 Add the SPI Flash Controller driver covering Ingenic X1000, X1600,
 X1830, T31 and X2000 SoCs. Driver from Zhou Yanjie's series, ported

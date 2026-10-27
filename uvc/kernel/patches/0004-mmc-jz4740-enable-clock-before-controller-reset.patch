@@ -1,7 +1,7 @@
 From 57f97561528a302459dd9f03b31d7badc8333479 Mon Sep 17 00:00:00 2001
 From: Alfonso Gamboa <gtxent@gmail.com>
 Date: Sun, 3 May 2026 08:38:52 -0700
-Subject: [PATCH 4/9] mmc: jz4740: enable clock before controller reset
+Subject: [PATCH 04/10] mmc: jz4740: enable clock before controller reset
 
 On T31 the MSC clock is gated at boot. Calling jz4740_mmc_reset()
 before clk_prepare_enable() writes to ungated registers and the
