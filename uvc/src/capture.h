@@ -23,10 +23,12 @@ int capture_jpeg(uint8_t **data, size_t *len);
 int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma);
 
 // Image settings from Protect, 0-100 with 50 neutral, applied to the ISP.
-// flip/mirror add to the config's FLIP_V/FLIP_H (mounting).
+// flip/mirror add to the config's FLIP_V/FLIP_H (mounting); wdr is Protect's
+// WDR level, 0 (off) to 3.
 struct isp_params {
     int brightness, contrast, saturation, sharpness, denoise;
     int flip, mirror;
+    int wdr;
 };
 void capture_isp(const struct isp_params *p);
 

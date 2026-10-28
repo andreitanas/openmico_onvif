@@ -125,7 +125,7 @@ static cJSON *feature_flags(void) {
     cJSON_AddItemToObject(f, "audioCodecs", str_array(aac, 1));
     cJSON_AddItemToObject(f, "audioStyle", str_array(nature, 1));
     BOOL(f, "hasHdr", 0);
-    BOOL(f, "hasWdr", 0);
+    BOOL(f, "hasWdr", 1); // the ISP's Iridix (src/capture_v4l2.c)
     BOOL(f, "hasMic", 1);
     BOOL(f, "hasSpeaker", 0);
     BOOL(f, "hasInfrared", 1);

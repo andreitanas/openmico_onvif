@@ -114,7 +114,7 @@ int main(void) {
     printf("exposure figure %d\n", capture_v4l2_exposure());
     CHECK(capture_v4l2_exposure() > 0, "no exposure figure");
 
-    struct isp_params p = {50, 60, 70, 50, 40, 0, 0};
+    struct isp_params p = {50, 60, 70, 50, 40, 0, 0, 2};
     capture_v4l2_isp(&p);
     streams(&hi, &lo, "settings");
 

@@ -56,7 +56,7 @@ static volatile int running;
 static struct stream hi_st, lo_st;
 static int sensor = -1;  // the sensor's subdevice: exposure, gain, flips
 static struct ae ae;
-static struct isp_params params = {50, 50, 50, 50, 50, 0, 0};
+static struct isp_params params = {50, 50, 50, 50, 50, 0, 0, 0};
 static int night;
 
 // Requests from other threads, served by the stream threads between frames
@@ -222,6 +222,10 @@ static void apply_isp(void) {
     level(fd, V4L2_CID_SHARPNESS, params.sharpness);
     level(fd, ctrl_by_name(fd, "Noise Reduction"), params.denoise);
     level(fd, ctrl_by_name(fd, "Temporal Noise Reduction"), params.denoise);
+    // WDR 1-3: Iridix at 32, 64, 128 (128 already flattens the picture)
+    int drc = ctrl_by_name(fd, "Dynamic Range Compression");
+    if (drc)
+        ctrl_set(fd, drc, params.wdr <= 0 ? 0 : 32 << ((params.wdr > 3 ? 3 : params.wdr) - 1));
 }
 
 // Streams
@@ -354,8 +358,12 @@ static int jpeg_open(void) {
     struct v4l2_requestbuffers req = {
         .count = ISP_BUFS, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_DMABUF};
     TRY(xioctl(jpeg_fd, VIDIOC_REQBUFS, &req));
-    req = (struct v4l2_requestbuffers){
-        .count = 1, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP};
+    // A cached JPEG buffer if the driver gives one: copied out uncached, a
+    // snapshot took 40-60 ms more
+    req = (struct v4l2_requestbuffers){.count = 1,
+                                       .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                                       .memory = V4L2_MEMORY_MMAP,
+                                       .flags = V4L2_MEMORY_FLAG_NON_COHERENT};
     TRY(xioctl(jpeg_fd, VIDIOC_REQBUFS, &req));
     struct v4l2_buffer b = {.type = req.type, .memory = req.memory, .index = 0};
     TRY(xioctl(jpeg_fd, VIDIOC_QUERYBUF, &b));
@@ -647,8 +655,8 @@ void capture_v4l2_isp(const struct isp_params *p) {
         }
     }
     pthread_mutex_unlock(&life_lock);
-    log_info("capture: image brightness %d contrast %d saturation %d sharpness %d denoise %d%s%s",
-             p->brightness, p->contrast, p->saturation, p->sharpness, p->denoise,
+    log_info("capture: image brightness %d contrast %d saturation %d sharpness %d denoise %d wdr %d%s%s",
+             p->brightness, p->contrast, p->saturation, p->sharpness, p->denoise, p->wdr,
              p->flip ? " flip" : "", p->mirror ? " mirror" : "");
 }
 

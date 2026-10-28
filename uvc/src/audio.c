@@ -29,6 +29,8 @@
 #define BITRATE 32000
 #define HIGHPASS_HZ 120
 #define GAIN_MAX_DB 30  // at Protect's microphone volume 100
+#define LIMIT 23000     // -3 dBFS: louder peaks are turned down, not clipped
+#define LIMIT_RELEASE_MS 100
 
 // The ADC's output has a DC offset and the room's rumble below 100 Hz far
 // above everything else: a 4th-order Butterworth high-pass, two biquads
@@ -37,6 +39,7 @@ struct biquad {
 };
 
 static struct biquad hp[2];
+static float env, release;  // the limiter's peak envelope and its decay a sample
 static volatile int volume = 100;
 
 struct aframe {
@@ -65,6 +68,8 @@ static void highpass_init(void) {
         hp[i] = (struct biquad){.b0 = (1 + c) / 2 / a0, .b1 = -(1 + c) / a0, .b2 = (1 + c) / 2 / a0,
                                 .a1 = -2 * c / a0, .a2 = (1 - alpha) / a0};
     }
+    env = 0;
+    release = expf(-1000.0f / (LIMIT_RELEASE_MS * RATE));
 }
 
 static int16_t process(int16_t in, float gain) {
@@ -77,6 +82,12 @@ static int16_t process(int16_t in, float gain) {
         x = y;
     }
     x *= gain;
+    // Peak limiter: the envelope jumps to a louder sample and decays over
+    // LIMIT_RELEASE_MS, so no sample comes out above LIMIT
+    float a = fabsf(x);
+    env = a > env ? a : env * release;
+    if (env > LIMIT)
+        x *= LIMIT / env;
     return x > 32767 ? 32767 : x < -32768 ? -32768 : (int16_t)lrintf(x);
 }
 

@@ -83,6 +83,7 @@ cJSON *isp_change(const cJSON *payload, int reset) {
         .denoise = num("denoise"),
         .flip = num("flip") == 1,
         .mirror = num("mirror") == 1,
+        .wdr = num("wdr"),
     };
     // Protect's night mode setting, camera side: "manual" is always day
     // (irLedLevel 0) or always night, "auto" switches; irLedLevel 0 keeps the
