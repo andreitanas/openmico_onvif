@@ -1,55 +1,62 @@
 # A modern kernel for the Wyze Cam v2 (2026-10-27)
 
 Linux 6.18 LTS for the Ingenic T20, built from source by `uvc/kernel/build.sh`,
-with a root filesystem on flash instead of OpenMiko's initramfs. Nothing here has
-run on a camera yet: everything below "builds" is untested on hardware. Read
+with a root filesystem on flash instead of OpenMiko's initramfs. It boots on a
+Wyze Cam v2 from flash, with WiFi, SSH and the SD card (2026-10-27, with a
+serial console; see [Bring-up on hardware](#bring-up-on-hardware)). Our sensor
+and ISP drivers deliver 1080p colour frames at 25 fps, the VPU drivers encode
+them to H.264 and JPEG, and uvcd streams them to Protect (2026-10-28). Read
 [Hardware test plan](#hardware-test-plan) before flashing anything.
 
 ## Status
 
 | Piece | Source | Status |
 |---|---|---|
-| Kernel, MIPS32r1, T20 machine | Linux v6.18.59 + patches 0001-0006 | builds |
-| Clocks (CGU) | ours, `t20-cgu.c` (patch 0007) | builds |
-| Interrupts (INTC) | mainline `irq-ingenic` (jz4780) | builds |
-| Timers | mainline `ingenic-sysost` (OST) and `ingenic-timer` (TCU) | builds |
-| UART console (ttyS1) | mainline `8250_ingenic` | builds |
-| Pins, GPIO, LEDs, `/sys/class/gpio` | mainline `pinctrl-ingenic` + T20 (patch 0008) | builds |
-| SPI NOR flash, partitions | gtxaspec's `spi-ingenic-sfc` (0005, 0009), mainline spi-nor + 32 KiB erase (0010) | builds |
-| SD card (MSC0) | mainline `jz4740_mmc`, PIO (no DMA yet) | builds |
-| Watchdog | mainline `jz4740_wdt` | builds |
-| I2C (sensor bus) | mainline `i2c-jz4780` | builds |
-| WiFi, RTL8189FS on MSC1 | jwrdegoede/rtl8189ES_linux (out of tree), cfg80211 module | builds |
-| Squashfs root on mtdblock2 | `image/build-modern.sh`, `image/flash-modern.sh` | written, not run (needs OpenMiko's `demo.bin` as the base) |
-| Sensor JX-F22/JX-F23 | ours, `jxf2x` (patch 0011; register tables from Ingenic's GPL sensor drivers) | builds |
-| ISP | ours, `t20-isp` (patch 0012), from [`t20-isp-hardware.md`](t20-isp-hardware.md) | first version builds: NV12, no 3A or tuning |
-| H.264 encoder (VPU) | ours, to write | **missing**: not started |
-| Audio | ALSA, to write | **missing**: not started |
-| uvcd | unchanged, closed libimp | runs without video on the new kernel; needs our libimp over V4L2 (below) |
+| Kernel, MIPS32r1, T20 machine | Linux v6.18.59 + patches 0001-0006 | runs |
+| Clocks (CGU) | ours, `t20-cgu.c` (patch 0007) | runs |
+| Interrupts (INTC) | mainline `irq-ingenic` (jz4780) | runs |
+| Timers | mainline `ingenic-sysost` (OST) and `ingenic-timer` (TCU) | runs: OST is the clocksource (24 MHz, BogoMIPS 858), TCU registered too |
+| UART console (ttyS1) | mainline `8250_ingenic` | runs |
+| Pins, GPIO, LEDs, `/sys/class/gpio` | mainline `pinctrl-ingenic` + T20 (patch 0008) | runs (LEDs and GPIOs not tested one by one) |
+| SPI NOR flash, partitions | gtxaspec's `spi-ingenic-sfc` (0005, 0009), mainline spi-nor + 32 KiB erase (0010) | runs: reads, `flashcp` writes, JFFS2 config |
+| SD card (MSC0) | mainline `jz4740_mmc`, DMA through the PDMA (`dma-jz4780`, built in) | runs: 16 MB/s reads (one 8 GB card read only zeros; see below) |
+| Watchdog | mainline `jz4740_wdt` | runs: `/dev/watchdog`, an unfed watchdog resets the SoC |
+| I2C (sensor bus) | mainline `i2c-jz4780` | runs |
+| WiFi, RTL8189FS on MSC1 | jwrdegoede/rtl8189ES_linux (out of tree), cfg80211 module; SDIO transfers by DMA | runs: WPA, DHCP, SSH; with both streams going out, the kernel's share of the CPU went from 31% (PIO) to 11% (DMA) |
+| Squashfs root on mtdblock2 | `image/build-modern.sh`, `image/flash-modern.sh` | runs; installed over SSH from both kernels |
+| Sensor JX-F22/JX-F23 | ours, `jxf2x` (patch 0011; register tables from Ingenic's GPL sensor drivers) | runs (JX-F22): 1080p, exposure, gain, mirror and flip controls |
+| ISP | ours, `t20-isp` (patch 0012), from [`t20-isp-hardware.md`](t20-isp-hardware.md) | runs: 1920x1080 NV12 at 24.6 fps in colour: black level, auto white balance, colour matrix, sRGB gamma, noise reduction, sharpening, brightness/contrast/saturation |
+| JPEG encoder (VPU) | ours, `t20-vpu` (patch 0013; the VPU sequence and Huffman table from Ingenic's GPL X1000/T31 drivers) | runs: 1080p NV12 to JPEG in 10.7 ms, from a file or an ISP frame as a dma-buf |
+| H.264 encoder (VPU) | ours, `t20-vpu` (patch 0013; register names from Ingenic's GPL Helix encoder, the T20's values in [`t20-isp-hardware.md`](t20-isp-hardware.md)) | runs: 1080p Main profile, CABAC, I and P frames, 16 ms a frame in the VPU, constant QP or bit rate; streams pass strict ffmpeg decoding |
+| Audio | mainline `jz4740-i2s` (T20 variant) and `dma-jz4780`, our `t20-codec` (patches 0014, 0015; sequences from Ingenic's GPL OSS driver) | runs: the microphone at 8-96 kHz through `/dev/dsp` (OSS emulation) or ALSA; `audiorec` records it; the speaker is not driven yet |
+| uvcd | `src/capture_v4l2.c` on this kernel, the closed libimp on 3.10 (`capture.c` picks at start) | runs: both H.264 streams to Protect, snapshots, object detection, auto exposure, the exposure figure for day/night; `test/test_capture_v4l2.c` (on the camera, uvcd stopped) checks streams, snapshots, raw frames, flip and mirror restarts and start/stop cycles |
 
 So the new kernel is a bring-up kernel: shell on the serial console, flash, SD card,
-GPIOs and LEDs, WiFi and SSH, no camera. The image scripts keep OpenMiko's kernel
+GPIOs and LEDs, WiFi and SSH, the watchdog, and raw camera frames that only
+`v4l2grab` reads. The image scripts keep OpenMiko's kernel
 as the default (`image/build.sh`, `image/flash.sh` are unchanged in behaviour).
 
 ## Where this stopped
 
-Work paused here, on branch `kernel-modern`, with the owner to test on hardware:
+On branch `kernel-modern`, with one camera on the new kernel and a serial
+console attached:
 
-- Built and checked here (clean rebuild from `kernel/build.sh`): the kernel,
-  the device tree, the WiFi module, `jxf2x`, `t20-isp`, `capture/v4l2grab`.
-- Written, not run: `image/build-modern.sh` and `image/flash-modern.sh` (they
-  need OpenMiko's `deploy/demo.bin`, which is not in this environment).
-- Not started: ISP statistics and AE/AWB in the driver, ISP tuning tables, the
-  DS2 stream, mirror and flip, the H.264 and JPEG encoders, our libimp, audio.
-- Next, in order: hardware test steps 1-5 (boot, flash, SD, WiFi), then step 6
-  (the camera with `v4l2grab`); what comes back decides the ISP work. The
-  encoder is the largest open piece and the riskiest: the VPU's registers are
-  documented (Ingenic's GPL `jzm_vpu.h`), the encoding algorithm is not. Start
-  with JPEG, the smaller block.
-- Top first-boot risks: see "First-boot risks" in the [Hardware test plan](#hardware-test-plan). In short, a
-  wrong clock or pin setting can leave the camera without console output and,
-  since serial U-Boot is not set up, recovery is the SD card `demo.bin` only;
-  if WiFi does not come up there is no SSH.
+- Runs on the camera: hardware test steps 1, 2, 4, 5 and 6 (boot, flash and
+  config, SD card, WiFi and SSH, the watchdog, the camera with `v4l2grab`),
+  and `flash-modern.sh` from both kernels. S50camera loads the camera drivers
+  at boot.
+- Open from bring-up: the 8 GB card that read only zeros, step 3 (LEDs, IR
+  cut, IR LEDs one by one).
+- Done since (2026-10-28): colour (white balance with AWB, colour matrix,
+  gamma, noise reduction), the DS2 stream, mirror and flip, and the VPU's JPEG
+  and H.264 encoders (`t20-vpu`, one driver, a video node each; tests
+  `v4l2jpeg` and `v4l2h264`, which also feed ISP frames as dma-bufs).
+- Not started: ISP shading, temporal noise reduction (Temper), Iridix.
+- uvcd streams on this kernel (2026-10-28) through `src/capture_v4l2.c`
+  (below), not through a libimp of our own as first planned.
+- Audio (2026-10-28): the microphone in the kernel (patches 0014, 0015) and in
+  uvcd's streams (AAC-LC); the speaker is not driven yet.
+- Next: the remaining ISP tuning, the speaker for talkback.
 
 ## Sources
 
@@ -121,9 +128,9 @@ made with 32 KiB blocks, would not read cleanly.
 **SD card and WiFi**. Both MSC controllers with the mainline JZ4740 driver,
 in PIO mode: the PDMA controller is not described yet. SD card detect is polled
 (`broken-cd`); the vendor board file has PB27, not confirmed on this camera.
-WiFi power is WL_REG_EN, PC16 (GPIO 80), from the vendor `board.h` and
-`bcm_power_control.c` (OpenMiko's 8189fs patch calls `bcm_wlan_power_on`), as
-an `mmc-pwrseq-simple` reset line.
+WiFi power is PB30 (GPIO 62), high for on, as an `mmc-pwrseq-simple` reset
+line. This camera's U-Boot names it `wifi_enable_gpio` in its boot log. The
+vendor `board.h` has WL_REG_EN on PC16 (GPIO 80), which is not this board's.
 
 **LEDs**. `led_blue` GPIO 39 and `led_yellow` GPIO 38, active low, from OpenMiko's
 `linux-led.patch`, so `/sys/class/leds/led_blue` and `led_yellow` exist as uvcd and
@@ -155,18 +162,18 @@ buffers, used by the ISP driver through the DMA API.
 
 | | Today (OpenMiko 3.10.14) | Linux 6.18 |
 |---|---|---|
-| uImage | (in a 2048 KiB partition, with the initramfs) | 1,716,688 bytes of 2,097,152 (82 %) |
-| Unpacked image | | 5,050,772 bytes of 5,242,880 (192 KB left) |
-| Kernel code | 3877k | 3621k |
-| Data | 1205k | 1112k "rwdata" (of which 924k read-only), 67k bss |
-| Init, freed after boot | | 188k |
+| uImage | (in a 2048 KiB partition, with the initramfs) | 1,745,119 bytes of 2,097,152 (83 %) |
+| Unpacked image | | 5,133,180 bytes of 5,242,880 (107 KB left) |
+| Kernel code | 3877k | 3717k |
+| Data | 1205k | 187k rwdata, 940k rodata, 67k bss |
+| Init, freed after boot | | 204k |
 | Modules loaded for WiFi | 8189fs (cfg80211 built in) | cfg80211 504k, ipv6 555k, 8189fs (2.2 MB file, stripped), firmware_class, libsha1 |
 | Root filesystem | `rootfs.tar.xz` unpacked into RAM (zram) on every boot | squashfs read from flash, page cache only |
+| Free at boot | | 91,620K of 131,072K (the top 32 MB is the camera pool) |
 
-The code and data figures are from the build before the camera drivers; the
-media core added about 34 KB since (the camera drivers themselves are modules).
-Kernel figures as the kernel prints them at boot ("Memory: ... kernel code,
-rwdata, rodata, init, bss"), from `System.map`. The resident kernel is a little
+Kernel figures as the kernel prints them at boot on the camera ("Memory: ...
+kernel code, rwdata, rodata, init, bss"), with the media core built in and the
+camera drivers as modules. The resident kernel is a little
 smaller than today's; cfg80211 and IPv6 move from built-in to modules, so with
 WiFi up the total is about the same. The large saving is the root filesystem,
 which no longer sits in RAM.
@@ -184,10 +191,10 @@ Proposal, implemented in the image scripts:
   format carries (8.6 MiB).
 - **Writable storage**: settings stay where they are, the JFFS2 config partition
   (mtdblock3) on `/config`, read by S10config as today, so an existing camera keeps
-  its WiFi settings, hostname and keys. `/etc` (and `/var` if it is a directory)
-  gets a writable layer in RAM (`S00rootfs`, overlayfs on tmpfs), because
-  S10config installs `/config/overlay` over `/etc` and S20wifi edits
-  `wpa_supplicant.conf`. The SD card stays optional (`/sdcard/config` imports, a
+  its WiFi settings, hostname and keys. `/etc`, `/root` and `/var` (if it is a
+  directory) get a writable layer in RAM (`S00rootfs`, overlayfs on tmpfs),
+  because S10config installs `/config/overlay` over them (`/etc/dropbear`,
+  `/root/.ssh/authorized_keys`) and S20wifi edits `wpa_supplicant.conf`. The SD card stays optional (`/sdcard/config` imports, a
   development uvcd). Nothing else writes to flash.
 - **Install**: `image/build-modern.sh` builds `uImage`, `root.sqfs` and a
   `demo.bin` carrying both (`demo-bin.py` takes our uImage as a fourth argument).
@@ -201,10 +208,10 @@ Proposal, implemented in the image scripts:
   `modprobe` (modules from our kernel's `modules.dep`), S50camera logs that there
   are no camera drivers and returns.
 
-Not run: `build-modern.sh` needs OpenMiko's `demo.bin` (`deploy/demo.bin`) like
-`build.sh`, which was not available here. The pieces it calls were checked
-separately (`build-rootfs.py` with extra overlays, `demo-bin.py` with a uImage,
-`sqfstar` from squashfs-tools 4.6).
+With our kernel, `build-rootfs.py` drops all of `lib/modules/3.10.14` and
+`driver/`, and the init scripts tell the kernels apart by `uname -r`. Empty
+directories from the overlays are kept: `/config` and `/sdcard` are mount
+points on a read-only root.
 
 ## Camera stack
 
@@ -215,21 +222,24 @@ same Apical family). No code is taken from open-tx-isp (GPLv3), OpenIMP (mostly
 unlicensed) or the unlicensed parts of Ingenic's SDK; they serve as
 documentation, and what is used from them is recorded as hardware facts in
 [`t20-isp-hardware.md`](t20-isp-hardware.md). Ingenic's GPL-2.0+ sources (the
-sensor drivers, the 3.10 kernel) can be used directly. On top, uvcd gets our own
-implementation of the libimp calls it makes, over V4L2, so uvcd's code stays as
-it is; the closed libimp, `tools/imp-rename.py` and the `mm32`/`ftrunc32` shims
-go.
+sensor drivers, the 3.10 kernel) can be used directly. On top, uvcd has a
+second capture backend, `src/capture_v4l2.c`, with the same interface
+(`capture.h`) over these V4L2 drivers; `capture.c` uses it when the drivers
+are there and libimp otherwise. A libimp of our own (the plan below) was not
+needed: uvcd's interface to the camera is six functions, libimp's is 44 with
+the vendor's structure layouts. The closed libimp, `tools/imp-rename.py` and
+the `mm32`/`ftrunc32` shims stay only for the 3.10 kernel.
 
 | Piece | Kernel | Userspace (our libimp) | Status |
 |---|---|---|---|
-| Sensor JX-F22/JX-F23 | `jxf2x` (patch 0011): V4L2 subdevice, exposure, analog gain, frame length; both sensors, told apart by chip ID | `IMP_ISP_AddSensor`, `EnableSensor`; exposure and gain from our AE | builds |
-| ISP | `t20-isp` (patch 0012): VIC + ISP core, NV12 out of DS1 at sensor size, one video node | FrameSource channels | first version builds |
-| Auto exposure, white balance | statistics node (to do; the statistics layout is not known yet) | our AE/AWB, from statistics or from the frames | AE on frame luma in `capture/v4l2grab.c`; AWB not started |
-| Image tuning (gamma, noise reduction, shading, sharpness) | parameters node (to do; the tables' formats are not known yet) | `IMP_ISP_Tuning_*` | not started; those blocks are bypassed, so the picture is linear (dark, flat) |
-| Second stream | DS2 path (to do) | detector channel | not started |
-| H.264 encoder | VPU at 0x13200000 (register map in Ingenic's GPL `jzm_vpu.h`); V4L2 stateful encoder (to do) | `IMP_Encoder_*` | not started: the encoding itself (motion search, mode decision, entropy coding, rate control) is in the closed libimp; a clean-room encoder for this VPU is the largest piece left |
-| JPEG | the VPU's JPEG codec block (`JPGC`, documented in `jzm_vpu.h`) | snapshot channel | not started |
-| Audio | ALSA (the AIC and the internal codec; mainline has related Ingenic drivers) | not used by uvcd yet | not started |
+| Sensor JX-F22/JX-F23 | `jxf2x` (patch 0011): V4L2 subdevice, exposure, analog gain, frame length; both sensors, told apart by chip ID | `IMP_ISP_AddSensor`, `EnableSensor`; exposure and gain from our AE | runs (JX-F22) |
+| ISP | `t20-isp` (patch 0012): VIC + ISP core, NV12 out of DS1 at sensor size, one video node | FrameSource channels | runs: 25 fps |
+| Auto exposure, white balance | AWB in the driver (grey world from the ISP's global R/G, B/G statistics, every frame); white balance, brightness, contrast, saturation and noise reduction as V4L2 controls | our AE from the frames | runs: AWB in `t20-isp`, AE on frame luma in uvcd (`src/capture_v4l2.c`) and `capture/v4l2grab.c` |
+| Image tuning (gamma, noise reduction, shading, sharpness) | fixed in the driver: sRGB gamma, a generic colour matrix, Sinter with a flat noise profile | `IMP_ISP_Tuning_*` | gamma, colour, Sinter, sharpening run; shading, temporal noise reduction (Temper), Iridix not started |
+| Second stream | DS2 path: a second video node (`t20-isp-sub`, `/dev/video1`) scaled to any even size, 640x360 by default | detector channel | runs, alone or with the main stream |
+| H.264 encoder | `t20-vpu` (patch 0013), node `t20-h264`: V4L2 stateful encoder, NV12 in (MMAP or dma-buf), Annex B out (SPS and PPS before every IDR frame); controls GOP size, force key frame, frame rate control with bit rate and min/max QP (or I/P QP), frame rate by `S_PARM`. The VPU does motion search, mode decision, transform and CABAC; the driver writes the headers and runs the rate control | `IMP_Encoder_*` | runs (`v4l2h264`): 1080p at the ISP's 25 fps, 16 ms a frame in the VPU; PSNR 43 dB on a synthetic pan; 1-8 Mbit/s held within 2% |
+| JPEG | `t20-vpu` (patch 0013), node `t20-jpeg`: V4L2 mem2mem, NV12 in (MMAP or dma-buf), JFIF out, `V4L2_CID_JPEG_COMPRESSION_QUALITY` | snapshot channel | runs (`v4l2jpeg`), also while H.264 encodes (the jobs take turns) |
+| Audio | ALSA: the AIC (mainline `jz4740-i2s`, a T20 variant), PDMA (`dma-jz4780` as the X1830's), our internal codec driver `t20-codec` (patch 0014), `simple-audio-card`; the codec is the I2S master on the AIC's 256 fs system clock; its one ADC is the right channel | uvcd's `src/audio.c`: `/dev/dsp` at 16 kHz, AAC-LC 32 kbit/s (vo-aacenc), into the streams' audio track in place of silence | microphone runs (`audiorec`, `test/test_audio.c`; uvcd streams it); speaker (DAC, amplifier GPIO) not started |
 
 What `t20-isp` does today: VIC set up for the 10-bit parallel bus, the ISP core's
 geometry and Bayer order, every block that needs a memory table bypassed (white
@@ -242,7 +252,13 @@ statistics or tuning. Unknowns are listed in `t20-isp-hardware.md`.
 ### uvcd's libimp calls
 
 uvcd calls 44 libimp functions (all in `src/capture.c`; `IMP_Log_Get_Option` is
-uvcd's own, in `imp_compat.c`). Our implementation maps them onto the drivers:
+uvcd's own, in `imp_compat.c`). The first plan was to implement them over the
+drivers as below; `src/capture_v4l2.c` does the same work directly instead
+(one thread per ISP output: ISP buffer as a dma-buf into its H.264 context,
+the encoded frame to the source; JPEG from the main output on demand; raw
+low-resolution frames copied on demand; auto exposure on the low-resolution
+luma through the sensor's exposure and gain; flips restart the pipeline, as
+they change the Bayer order):
 
 | Calls | Over |
 |---|---|
@@ -254,18 +270,125 @@ uvcd's own, in `imp_compat.c`). Our implementation maps them onto the drivers:
 | `IMP_FrameSource_CreateChn`, `DestroyChn`, `SetChnAttr`, `EnableChn`, `DisableChn`, `SetFrameDepth`, `GetFrame`, `ReleaseFrame` | the DS1 and DS2 video nodes |
 | `IMP_Encoder_CreateGroup`, `DestroyGroup`, `CreateChn`, `DestroyChn`, `RegisterChn`, `UnRegisterChn`, `StartRecvPic`, `StopRecvPic`, `PollingStream`, `GetStream`, `ReleaseStream` | the encoder's V4L2 node, frames passed as dma-bufs from the ISP |
 
-Order from here: test the sensor and ISP on hardware with `v4l2grab` (below),
-then statistics and our AE/AWB, the DS2 stream, the encoder, our libimp in uvcd,
-then audio.
+Done in that order, audio included (2026-10-28).
+
+## Bring-up on hardware
+
+First boots on 2026-10-27, one Wyze Cam v2, serial console on ttyS1 (115200
+8N1) through a USB serial adapter.
+
+**U-Boot over serial**. The vendor U-Boot 2013.07 (`isvp_t20#` prompt) waits 1 s
+before autoboot. Enter pressed repeatedly during power-on stops it. Its
+environment is compiled in ("bad CRC, using default environment"), so `bootcmd`
+cannot be changed, but at the prompt it has what testing needs: `loady`
+(YMODEM), `sf`, `crc32`, `mw`, `bootm`.
+
+- Kernel from RAM, nothing written: `loady 0x80600000`, send the uImage,
+  `bootm 0x80600000`. The root filesystem is still the one on flash.
+- Flash from U-Boot: `loady` the image to 0x80600000, compare `crc32` with
+  the file's, `sf probe`, `sf update 0x80600000 <offset> <length>`, then
+  `sf read` it back elsewhere and compare `crc32` again. `sf update` here
+  erases only whole 64 KiB blocks and fails on a partial last block ("len
+  align as 10000", "sfc erase error"). Pad the image in RAM with 0xff to a
+  multiple of 0x10000 first (`mw.b`). Offsets: kernel 0x40000, root 0x240000.
+- YMODEM at 115200 moves about 11 KB/s: the kernel takes 3 minutes, the root
+  8 minutes.
+
+**Board GPIOs**. This U-Boot logs the board GPIOs it sets (`misc_init_r`). They
+are this camera's, where the vendor `board.h` has another board's.
+
+| GPIO | U-Boot's name | U-Boot leaves it |
+|---|---|---|
+| 62 (PB30) | `wifi_enable_gpio` | 0, then 1 (WiFi power) |
+| 38, 39 | `yellow_gpio`, `blue_gpio` | LEDs |
+| 81, 25, 49 | `night_gpio` | 0 |
+| 47 | `USB_able_gpio` | 0 |
+| 43 | `TF_able_gpio` | 1 |
+| 63 | `SPK_able_gpio` | 0 |
+| 48 | `SD_able_gpio` | 0 |
+| 46 | (SD update button) | input |
+
+**What the first boots found**, each fixed in this branch:
+
+- The kernel hung before the console came up. The CGU registers clocks in
+  index order, and `rtc_ercs` came before its parent `exclk_div512`. The
+  binding indices are swapped (`T20_CLK_EXCLK_DIV512` 34, `T20_CLK_RTC` 40),
+  so the OST and its clock event come up.
+- No WiFi: the power line was PC16 from the vendor `board.h`. It is PB30, as
+  U-Boot shows.
+- Init died with SIGILL (exit code 4): OpenMiko's userspace is hard-float, so
+  `CONFIG_MIPS_FP_SUPPORT`.
+- `sleep` and udhcpc failed ("clock_gettime(MONOTONIC) failed"), and uvcd-run
+  restarted uvcd in a tight loop: uClibc 1.0.12 uses the 32-bit `time_t`
+  system calls, so `CONFIG_COMPAT_32BIT_TIME`.
+- The config partition gave "compression type 0x07 not available": the vendor
+  kernel writes it with zlib, rtime and lzo, so all three JFFS2 compressors.
+- `/etc/dropbear` gave EIO: overlayfs needs xattrs on its tmpfs upper layer to
+  make an opaque directory over the base image's symlink, so
+  `CONFIG_TMPFS_XATTR`.
+- No `/config` or `/sdcard` mount points on the read-only root, and an empty
+  `lib/modules/3.10.14` made the init scripts take the 3.10 paths
+  (`build-rootfs.py`, `build-modern.sh`, S20wifi, S50camera).
+- No SSH keys: S10config installs `/config/overlay` before S40sshd replaced
+  the base image's dangling `/etc/dropbear` link, and `/root` was read-only.
+  S10config now replaces the link, and S00rootfs gives `/root` a RAM layer.
+
+**The camera** (step 6, 2026-10-28):
+
+- The sensor did not answer on I2C ("no sensor on I2C", reading the chip ID
+  gave -EIO). Its MCLK pin (PA15) was in the ISP's pin group, set up only
+  when the ISP driver probes, after the sensor. The sensor node now has the
+  `cim-mclk` group itself.
+- Streaming started but no frame came, and every VIC and ISP register read 0:
+  the ISP clock gate (CLKGR0 bit 23) was closed. The kernel has no
+  `CONFIG_PM`, so `pm_runtime_resume_and_get()` succeeds without calling the
+  driver's resume, which enables the clocks. `t20-isp` now enables them in
+  probe, like `jxf2x` powers the sensor.
+- Then: JX-F22 found, 1920x1080 NV12 at 24.6 fps, the DS1 output-end
+  interrupt (source 50 on line 13) once per frame. `v4l2grab`'s auto exposure
+  settles at mean Y 105 indoors (exposure 1346 lines, the maximum at 25 fps,
+  analog gain code 71). The picture is right side up, nearly colourless (a sepia cast: white balance gains 1.0, no
+  saturation) and noisy, with no gamma, as expected.
+- The TCU failed with -ENODEV ("Unable to start CPU timers: -19"), so the
+  watchdog, a TCU child, was never probed. Its interrupt domain is
+  `CONFIG_INGENIC_TCU_IRQ`, on by default for Ingenic but off in tinyconfig.
+  With it, `/dev/watchdog` resets the camera when not fed (tested by closing
+  it without the magic character).
+
+**U-Boot's SD update on every boot**: with a `demo.bin` on the SD card, U-Boot
+runs its update check at each boot, whether or not the setup button is held.
+On this camera it logs "FWGRADEUP not find", "gradeup check fail", then
+"addr align as 10000 / sfc erase error", and boots normally: nothing is
+erased. Keep only a demo.bin meant for recovery on the card.
+
+**Open**:
+
+- An 8 GB SDHC card (SMI-S) enumerated as "high speed" and read only zeros,
+  from sector 0 on, without errors. A 128 GB SDXC card reads correctly in
+  the same camera. Small reads at default speed (SCR, CMD6) worked on both
+  cards. The difference only shows on 512-byte block reads at 48 MHz, so
+  test that card at 24 MHz before suspecting the PIO code.
 
 ## Hardware test plan
 
 **Before anything**: an SD card with a known-good `demo.bin` (today's,
 `image/build.sh`, OpenMiko's kernel) and the setup-button procedure tested on this
-camera. A serial console (UART on ttyS1, 115200 8N1) is strongly recommended for
-the first boots: without it a kernel that does not reach WiFi is a black box. U-Boot
-over serial is not set up, so a test kernel cannot be booted from RAM; every test
-is a flash write.
+camera. A serial console (UART on ttyS1, 115200 8N1) is strongly recommended:
+without it a kernel that does not reach WiFi is a black box. With it, a test
+kernel boots from RAM through U-Boot ([Bring-up on hardware](#bring-up-on-hardware)).
+
+**Rollback** (automatic, needs the SD card in the camera): `image/flash-modern.sh`
+saves the image the camera runs (kernel partition and the root partition's
+first 274 blocks, as a demo.bin) to `/sdcard/rollback/image.bin` before it
+writes anything. Every boot of the new kernel is then a trial: unless `rollback
+keep` runs on the camera within 10 minutes of boot, or by the third boot, it
+writes the saved image back and reboots into it (`/usr/sbin/rollback`,
+`S15rollback`). During a trial, `/sdcard/rollback/trial.txt` gets dmesg, the
+syslog, `ip addr` and `lsmod` every minute, and `/sdcard/rollback/log` says what
+happened, so a kernel that boots without WiFi leaves its log on the card.
+`rollback status` shows the time left, `rollback now` rolls back at once. It
+cannot help a kernel that hangs before userspace or cannot read the SD card:
+that still needs the recovery below.
 
 **Recovery**: power off, put the known-good `demo.bin` on the SD card, hold the
 setup button, power on (README, "Install"). The bootloader rewrites the kernel
@@ -273,8 +396,9 @@ partition and the first 274 blocks of the root partition and the camera boots
 OpenMiko's kernel again. The config partition is not touched by either path,
 but see the JFFS2 risk below.
 
-1. **Serial first boot** (`demo.bin` from `image/build-modern.sh`, or
-   `image/flash-modern.sh` from a running camera). Expected on ttyS1: U-Boot
+1. **Serial first boot** (`image/flash-modern.sh` from a running camera, which
+   arms the rollback; `demo.bin` from `image/build-modern.sh` and the setup
+   button do not). Expected on ttyS1: U-Boot
    `## Booting kernel ... LZMA ... OK`, then earlycon output from the first line
    of the kernel. Check: `Linux version 6.18.59`, `T20` as system type, the CPU line
    (`Ingenic XBurst`), the clock rates (`cat /sys/kernel/debug/clk/clk_summary` is not
@@ -291,9 +415,9 @@ but see the JFFS2 risk below.
 5. **WiFi**: `modprobe 8189fs`, `ip link` shows wlan0 with the camera's MAC, S20wifi
    associates, DHCP, `ssh` in. Then the watchdog: uvcd arms it; `killall -STOP uvcd`
    must reboot the camera.
-6. **Camera** (with SSH up, since a mistake here can hang the SoC):
-   `modprobe jxf2x`, then `dmesg` shows `jxf22` or `jxf23`; `modprobe t20-isp`,
-   then `/dev/video0` and two `/dev/v4l-subdev*` exist. `v4l2grab
+6. **Camera** (with SSH up, since a mistake here can hang the SoC): S50camera
+   loads `t20-isp` and `jxf2x` at boot; `dmesg` shows `jxf22` or `jxf23`, and
+   `/dev/video0` and two `/dev/v4l-subdev*` exist. `v4l2grab
    /sdcard/f.nv12 100` streams 100 frames: it should report about 25 fps and a
    mean Y that settles near 110 as its auto exposure works. Convert the saved
    frame with `ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -i f.nv12 f.png`:
@@ -304,32 +428,24 @@ but see the JFFS2 risk below.
 7. **Back to OpenMiko's kernel** once (`image/flash.sh` writes only the root
    partition and leaves our kernel in place, so use demo.bin) to prove the way back.
 
-**First-boot risks**, most likely first:
+**Risks on another camera** (the first one boots, so these are about board
+differences):
 
-- **No output at all**: wrong load address/format for this U-Boot, the unpacked
-  kernel overlapping U-Boot's load buffer, or a fault before the console. Earlycon
-  is on; U-Boot's own messages show whether it accepted the image. Recovery:
-  demo.bin.
-- **Hang after "Calibrating delay" or no scheduler ticks**: the OST interrupt (CPU
-  IP4) or its clock. The TCU registers a second clock event, which may keep the
-  system going. Serial needed to tell.
-- **Wrong CPU rate or MMC clock**: the PLL readout (two output dividers and the
-  fractional part as the vendor reads them) is new code; UART is unaffected (it
-  runs from the 24 MHz crystal), the SD card and SDIO clocks are not.
-- **No flash**: the SFC at U-Boot's clock in single-bit mode should be safe; a chip
-  without a 32 KiB erase in its SFDP table falls back to 64 KiB.
-- **Config partition rewritten**: if the erase size is not 32 KiB, JFFS2 may
-  treat blocks as dirty and erase them: WiFi settings lost, no SSH. Keep
-  `wpa_supplicant.conf` under `/sdcard/config/overlay/etc/` on the SD card; S10config
-  imports it at boot.
-- **WiFi not coming up**, which loses SSH: the power line (PC16) and the SDIO bus
-  in PIO mode at 24 MHz are both unverified. With serial, `dmesg | grep mmc1`
-  shows whether the card enumerates. Without serial the only way back is demo.bin.
-- **Init**: OpenMiko's busybox and uClibc on a 6.18 kernel (system calls are
-  compatible; not seen to run). `/sbin/init` is the kernel's default.
+- **No output at all**: a fault before the console. Earlycon is on; U-Boot's
+  own messages show whether it accepted the image. Recovery: demo.bin, or
+  U-Boot over serial.
+- **Another flash chip**: one without a 32 KiB erase in its SFDP table falls
+  back to 64 KiB, and JFFS2 may then treat the config partition's blocks as
+  dirty and erase them: WiFi settings lost, no SSH. Keep
+  `wpa_supplicant.conf` under `/sdcard/config/overlay/etc/` on the SD card;
+  S10config imports it at boot. `cat /proc/mtd` must show erase size 00008000.
+- **WiFi not coming up**, which loses SSH: another board revision may power the
+  WiFi from another GPIO. Its U-Boot log names it (`wifi_enable_gpio`). With
+  serial, `dmesg | grep mmc1` shows whether the card enumerates.
 - **No camera in uvcd**: expected. uvcd starts, finds no `/proc/jz/sinfo/info`,
-  logs it and keeps restarting every 5 s; WiFi, SSH and the LEDs work. The
-  camera drivers are not loaded at boot (step 6 loads them by hand).
+  logs it and keeps restarting every 5 s; WiFi, SSH and the LEDs work. It
+  fails before it arms the watchdog. Our camera drivers are loaded at boot
+  for `v4l2grab`.
 
 ## Building
 
@@ -341,4 +457,7 @@ uvc/image/flash-modern.sh 192.168.1.9
 
 Host: Linux x86_64 with make, gcc, flex, bison, bc, python3, xz-utils, git, curl,
 kmod (depmod) and squashfs-tools (sqfstar). A clean kernel build takes about 15
-minutes on 4 cores.
+minutes on 4 cores. Only `kernel/build.sh` needs Linux: it can run in an
+`ubuntu:24.04` container with those packages on any x86_64 Docker host, with
+`build/kernel/out/` copied back; `build-modern.sh` runs on macOS too (zig,
+`brew install squashfs`).
