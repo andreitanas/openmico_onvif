@@ -67,7 +67,7 @@ new file mode 100644
 index 000000000..076de7775
 --- /dev/null
 +++ b/drivers/media/platform/ingenic/t20-isp.c
-@@ -0,0 +1,1604 @@
+@@ -0,0 +1,1691 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Ingenic T20 camera input (VIC) and ISP core: a parallel Bayer sensor in,
@@ -130,6 +130,7 @@ index 000000000..076de7775
 +#define ISP_BYPASS_LOW		0x040
 +#define ISP_BYPASS_HIGH		0x044
 +#define ISP_BYPASS_SINTER	BIT(9)
++#define ISP_BYPASS_TEMPER	BIT(10)
 +#define ISP_IRQ_SOURCE(n)	(0x080 + 4 * ((n) / 2))
 +#define ISP_IRQ_SOURCE_SHIFT(n)	(((n) & 1) ? 16 : 0)
 +#define ISP_IRQ_STATUS		0x0a0
@@ -140,6 +141,22 @@ index 000000000..076de7775
 +#define ISP_INPUT_SAFE_STOP	0
 +#define ISP_INPUT_SAFE_START	1
 +#define ISP_SINTER_THRESH(n)	(0x290 + 4 * (n))	/* two 8-bit bands each */
++#define ISP_TEMPER		0x2c0
++#define ISP_TEMPER_ENABLE	BIT(0)
++#define ISP_TEMPER_THRESH_SHORT	0x2c4
++#define ISP_TEMPER_THRESH_LONG	0x2c8
++/* Temper's frame buffer: the filtered previous frame, 32 bits a pixel */
++#define ISP_TEMPER_FB		0xa00	/* bits 3:0 base mode, as the writers' */
++#define ISP_TEMPER_FB_GEN32	5	/* 0 (reset) reads back black */
++#define ISP_TEMPER_FB_WRITE_ON	BIT(16)
++#define ISP_TEMPER_FB_READ_ON	BIT(17)
++#define ISP_TEMPER_FB_WRITE_CANCEL BIT(24)
++#define ISP_TEMPER_FB_READ_CANCEL BIT(25)
++#define ISP_TEMPER_FB_WIDTH	0xa10
++#define ISP_TEMPER_FB_HEIGHT	0xa14
++#define ISP_TEMPER_FB_BANK(n)	(0xa18 + 4 * (n))
++#define ISP_TEMPER_FB_LINE_OFFSET 0xa24
++#define ISP_TEMPER_FB_AXI	0xa28	/* bit 0: port on */
 +#define ISP_SENSOR_OFFSET(n)	(0x140 + 4 * (n))	/* n: 0 R, 1 Gr, 2 Gb, 3 B */
 +#define ISP_WB_GAIN(n)		(0x300 + 4 * (n))	/* the same order */
 +#define ISP_WB_GAIN_ONE		0x100
@@ -245,6 +262,14 @@ index 000000000..076de7775
 +#define T20_ISP_CID_NOISE_REDUCTION	(V4L2_CID_USER_BASE + 0x1300)
 +#define T20_ISP_NOISE_REDUCTION_DEFAULT	32
 +#define T20_ISP_SHARPNESS_DEFAULT	0x30	/* the block's reset strength */
++/*
++ * Temper (temporal noise reduction) on the same noise profile; the control
++ * sets its noise threshold. It needs a frame buffer of 4 bytes a pixel.
++ * At 64 it halves the frame-to-frame noise of static areas at high gain
++ * without visible trails behind moving things.
++ */
++#define T20_ISP_CID_TEMPORAL_NR		(V4L2_CID_USER_BASE + 0x1301)
++#define T20_ISP_TEMPORAL_NR_DEFAULT	64
 +
 +/* Auto white balance: least pixels for a valid measure, damping (1/n per frame) */
 +#define T20_ISP_AWB_MIN_PIXELS	10000
@@ -525,6 +550,9 @@ index 000000000..076de7775
 +	struct v4l2_ctrl *contrast;
 +	struct v4l2_ctrl *saturation;
 +	bool awb_on;			/* read by the interrupt handler */
++	void *temper_buf;		/* Temper's frame buffer */
++	dma_addr_t temper_dma;
++	size_t temper_size;
 +	int wb_red, wb_blue;		/* the AWB's gains, 4.8 fixed point */
 +};
 +
@@ -591,6 +619,47 @@ index 000000000..076de7775
 +		isp_write(isp, ISP_SINTER_THRESH(i), thresh | thresh << 16);
 +	isp_update(isp, ISP_BYPASS_LOW, ISP_BYPASS_SINTER,
 +		   thresh ? 0 : ISP_BYPASS_SINTER);
++}
++
++/*
++ * Temporal noise reduction: 0 bypasses Temper. Its frame buffer comes from
++ * the camera memory when first needed, for the sensor's frame size; without
++ * the memory the picture goes on without it.
++ */
++static void t20_isp_set_temper(struct t20_isp *isp, int thresh)
++{
++	u32 w = isp->width, h = isp->height;
++	size_t size = (size_t)w * h * 4;
++
++	if (thresh && size > isp->temper_size) {
++		if (isp->temper_buf)
++			dma_free_coherent(isp->dev, isp->temper_size, isp->temper_buf,
++					  isp->temper_dma);
++		isp->temper_size = 0;
++		isp->temper_buf = dma_alloc_coherent(isp->dev, size, &isp->temper_dma,
++						     GFP_KERNEL);
++		if (isp->temper_buf)
++			isp->temper_size = size;
++		else
++			thresh = 0;
++		dev_info(isp->dev, "temporal noise reduction %s\n",
++			 thresh ? "on" : "off: no memory for its frame buffer");
++	}
++	if (thresh) {
++		isp_write(isp, ISP_TEMPER_FB_WIDTH, w);
++		isp_write(isp, ISP_TEMPER_FB_HEIGHT, h);
++		isp_write(isp, ISP_TEMPER_FB_LINE_OFFSET, w * 4);
++		isp_write(isp, ISP_TEMPER_FB_BANK(0), isp->temper_dma);
++		isp_write(isp, ISP_TEMPER_FB_BANK(1), isp->temper_dma);
++		isp_write(isp, ISP_TEMPER_THRESH_SHORT, thresh);
++		isp_write(isp, ISP_TEMPER_THRESH_LONG, thresh);
++	}
++	isp_write(isp, ISP_TEMPER_FB, thresh ?
++		  ISP_TEMPER_FB_GEN32 | ISP_TEMPER_FB_WRITE_ON | ISP_TEMPER_FB_READ_ON :
++		  ISP_TEMPER_FB_WRITE_CANCEL | ISP_TEMPER_FB_READ_CANCEL);
++	isp_write(isp, ISP_TEMPER_FB_AXI, !!thresh);
++	isp_update(isp, ISP_BYPASS_LOW, ISP_BYPASS_TEMPER, thresh ? 0 : ISP_BYPASS_TEMPER);
++	isp_update(isp, ISP_TEMPER, ISP_TEMPER_ENABLE, thresh ? ISP_TEMPER_ENABLE : 0);
 +}
 +
 +/* Sharpening of both outputs: 0 bypasses it */
@@ -1185,6 +1254,11 @@ index 000000000..076de7775
 +	case V4L2_CID_SHARPNESS:
 +		t20_isp_set_sharpen(isp, ctrl->val);
 +		return 0;
++	case T20_ISP_CID_TEMPORAL_NR:
++		/* Set again when streaming starts, with the frame size */
++		if (pm_runtime_active(isp->dev) && isp->width)
++			t20_isp_set_temper(isp, ctrl->val);
++		return 0;
 +	}
 +	return -EINVAL;
 +}
@@ -1204,6 +1278,16 @@ index 000000000..076de7775
 +	.def = T20_ISP_NOISE_REDUCTION_DEFAULT,
 +};
 +
++static const struct v4l2_ctrl_config t20_isp_temporal_nr = {
++	.ops = &t20_isp_ctrl_ops,
++	.id = T20_ISP_CID_TEMPORAL_NR,
++	.name = "Temporal Noise Reduction",
++	.type = V4L2_CTRL_TYPE_INTEGER,
++	.max = 255,
++	.step = 1,
++	.def = T20_ISP_TEMPORAL_NR_DEFAULT,
++};
++
 +static int t20_isp_init_ctrls(struct t20_isp *isp)
 +{
 +	struct v4l2_ctrl_handler *h = &isp->ctrls;
@@ -1211,7 +1295,7 @@ index 000000000..076de7775
 +
 +	isp->wb_red = ISP_WB_GAIN_ONE;
 +	isp->wb_blue = ISP_WB_GAIN_ONE;
-+	v4l2_ctrl_handler_init(h, 8);
++	v4l2_ctrl_handler_init(h, 9);
 +	isp->awb = v4l2_ctrl_new_std(h, ops, V4L2_CID_AUTO_WHITE_BALANCE, 0, 1, 1, 1);
 +	isp->red = v4l2_ctrl_new_std(h, ops, V4L2_CID_RED_BALANCE, 0,
 +				     ISP_WB_GAIN_MAX, 1, ISP_WB_GAIN_ONE);
@@ -1222,6 +1306,7 @@ index 000000000..076de7775
 +	isp->saturation = v4l2_ctrl_new_std(h, ops, V4L2_CID_SATURATION, 0, 255, 1, 128);
 +	v4l2_ctrl_new_custom(h, &t20_isp_noise_reduction, NULL);
 +	v4l2_ctrl_new_std(h, ops, V4L2_CID_SHARPNESS, 0, 255, 1, T20_ISP_SHARPNESS_DEFAULT);
++	v4l2_ctrl_new_custom(h, &t20_isp_temporal_nr, NULL);
 +	if (h->error)
 +		return h->error;
 +	v4l2_ctrl_auto_cluster(3, &isp->awb, 0, true);
@@ -1647,6 +1732,8 @@ index 000000000..076de7775
 +	v4l2_ctrl_handler_free(&isp->ctrls);
 +	v4l2_device_unregister(&isp->v4l2_dev);
 +	media_device_cleanup(&isp->mdev);
++	if (isp->temper_buf)
++		dma_free_coherent(isp->dev, isp->temper_size, isp->temper_buf, isp->temper_dma);
 +	of_reserved_mem_device_release(isp->dev);
 +}
 +

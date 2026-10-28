@@ -51,7 +51,8 @@ console attached:
   gamma, noise reduction), the DS2 stream, mirror and flip, and the VPU's JPEG
   and H.264 encoders (`t20-vpu`, one driver, a video node each; tests
   `v4l2jpeg` and `v4l2h264`, which also feed ISP frames as dma-bufs).
-- Not started: ISP shading, temporal noise reduction (Temper), Iridix.
+- Temporal noise reduction (Temper) runs since 2026-10-28, from the camera
+  memory, which is now a CMA area (below). Not started: ISP shading, Iridix.
 - uvcd streams on this kernel (2026-10-28) through `src/capture_v4l2.c`
   (below), not through a libimp of our own as first planned.
 - Audio (2026-10-28): the microphone in the kernel (patches 0014, 0015) and in
@@ -136,9 +137,14 @@ vendor `board.h` has WL_REG_EN on PC16 (GPIO 80), which is not this board's.
 `linux-led.patch`, so `/sys/class/leds/led_blue` and `led_yellow` exist as uvcd and
 S01system expect.
 
-**Memory**. Linux keeps the low 96 MB as with `mem=96M@0x0`; 0x6000000 to
-0x8000000 (today's `ispmem` and `rmem`) is a reserved pool for the camera's frame
-buffers, used by the ISP driver through the DMA API.
+**Memory**. 0x6000000 to 0x8000000 (today's `ispmem` and `rmem`) is a CMA
+area for the camera's frame buffers (`reusable` in the device tree), used
+by the ISP and VPU drivers through the DMA API. A plain reserved pool
+(`no-map`, the first version) rounds every allocation up to a power of two
+(4 MB for a 3 MB 1080p frame) and filled up with the streams alone; CMA
+allocates to the page, so Temper's 8.3 MB frame buffer fits too (uvcd
+running: 30.6 of 32 MB used), and Linux uses the free part for movable
+pages. CMA costs 37 KB of kernel.
 
 ## Boot with the vendor U-Boot
 
@@ -162,14 +168,14 @@ buffers, used by the ISP driver through the DMA API.
 
 | | Today (OpenMiko 3.10.14) | Linux 6.18 |
 |---|---|---|
-| uImage | (in a 2048 KiB partition, with the initramfs) | 1,745,119 bytes of 2,097,152 (83 %) |
-| Unpacked image | | 5,133,180 bytes of 5,242,880 (107 KB left) |
+| uImage | (in a 2048 KiB partition, with the initramfs) | 1,771,520 bytes of 2,097,152 (84 %) |
+| Unpacked image | | 5,215,080 bytes of 5,242,880 (27 KB left; 2026-10-28, with the encoders, audio, CMA) |
 | Kernel code | 3877k | 3717k |
 | Data | 1205k | 187k rwdata, 940k rodata, 67k bss |
 | Init, freed after boot | | 204k |
 | Modules loaded for WiFi | 8189fs (cfg80211 built in) | cfg80211 504k, ipv6 555k, 8189fs (2.2 MB file, stripped), firmware_class, libsha1 |
 | Root filesystem | `rootfs.tar.xz` unpacked into RAM (zram) on every boot | squashfs read from flash, page cache only |
-| Free at boot | | 91,620K of 131,072K (the top 32 MB is the camera pool) |
+| Free at boot | | 91,620K of 131,072K with the camera memory a reserved pool; with it a CMA area, 124,868K total and 59 MB available while uvcd streams |
 
 Kernel figures as the kernel prints them at boot on the camera ("Memory: ...
 kernel code, rwdata, rodata, init, bss"), with the media core built in and the
@@ -235,7 +241,7 @@ the `mm32`/`ftrunc32` shims stay only for the 3.10 kernel.
 | Sensor JX-F22/JX-F23 | `jxf2x` (patch 0011): V4L2 subdevice, exposure, analog gain, frame length; both sensors, told apart by chip ID | `IMP_ISP_AddSensor`, `EnableSensor`; exposure and gain from our AE | runs (JX-F22) |
 | ISP | `t20-isp` (patch 0012): VIC + ISP core, NV12 out of DS1 at sensor size, one video node | FrameSource channels | runs: 25 fps |
 | Auto exposure, white balance | AWB in the driver (grey world from the ISP's global R/G, B/G statistics, every frame); white balance, brightness, contrast, saturation and noise reduction as V4L2 controls | our AE from the frames | runs: AWB in `t20-isp`, AE on frame luma in uvcd (`src/capture_v4l2.c`) and `capture/v4l2grab.c` |
-| Image tuning (gamma, noise reduction, shading, sharpness) | fixed in the driver: sRGB gamma, a generic colour matrix, Sinter with a flat noise profile | `IMP_ISP_Tuning_*` | gamma, colour, Sinter, sharpening run; shading, temporal noise reduction (Temper), Iridix not started |
+| Image tuning (gamma, noise reduction, shading, sharpness) | fixed in the driver: sRGB gamma, a generic colour matrix, Sinter with a flat noise profile | `IMP_ISP_Tuning_*` | gamma, colour, Sinter, sharpening, Temper run; shading, Iridix not started |
 | Second stream | DS2 path: a second video node (`t20-isp-sub`, `/dev/video1`) scaled to any even size, 640x360 by default | detector channel | runs, alone or with the main stream |
 | H.264 encoder | `t20-vpu` (patch 0013), node `t20-h264`: V4L2 stateful encoder, NV12 in (MMAP or dma-buf), Annex B out (SPS and PPS before every IDR frame); controls GOP size, force key frame, frame rate control with bit rate and min/max QP (or I/P QP), frame rate by `S_PARM`. The VPU does motion search, mode decision, transform and CABAC; the driver writes the headers and runs the rate control | `IMP_Encoder_*` | runs (`v4l2h264`): 1080p at the ISP's 25 fps, 16 ms a frame in the VPU; PSNR 43 dB on a synthetic pan; 1-8 Mbit/s held within 2% |
 | JPEG | `t20-vpu` (patch 0013), node `t20-jpeg`: V4L2 mem2mem, NV12 in (MMAP or dma-buf), JFIF out, `V4L2_CID_JPEG_COMPRESSION_QUALITY` | snapshot channel | runs (`v4l2jpeg`), also while H.264 encodes (the jobs take turns) |

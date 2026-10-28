@@ -151,7 +151,12 @@ CONFIG_MEDIA_SUBDRV_AUTOSELECT=n
 # Image sensor: JX-F22 or JX-F23 (our patch 0011), on the ISP's parallel input
 CONFIG_VIDEO_CAMERA_SENSOR=y
 CONFIG_VIDEO_JXF2X=m
-# Camera input and ISP (our patch 0012); frame buffers from reserved memory
+# Camera input and ISP (our patch 0012); frame buffers from reserved memory,
+# a CMA area: allocations to the page (a plain DMA pool rounds each to a
+# power of two, 4 MB for a 3 MB frame), and the system's while unused
+CONFIG_CMA=y
+CONFIG_DMA_CMA=y
+CONFIG_CMA_SIZE_MBYTES=0
 CONFIG_V4L_PLATFORM_DRIVERS=y
 CONFIG_VIDEO_INGENIC_T20_ISP=m
 # JPEG and H.264 encoders on the VPU (our patch 0013)
@@ -172,7 +177,6 @@ CONFIG_SND_SIMPLE_CARD=m
 # /dev/dsp: the simplest way to read samples (tests, uvcd)
 CONFIG_SND_OSSEMUL=y
 CONFIG_SND_PCM_OSS=m
-CONFIG_DMA_CMA=n
 
 ## Filesystems: squashfs root, JFFS2 config partition, vfat SD card
 CONFIG_MISC_FILESYSTEMS=y

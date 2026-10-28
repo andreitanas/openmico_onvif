@@ -35,8 +35,9 @@
 	};
 
 	/*
-	 * Linux keeps the low 96 MB as today (mem=96M@0x0). The top 32 MB
-	 * (today's ispmem and rmem) hold the camera's frame buffers.
+	 * The top 32 MB (where the vendor kernel had ispmem and rmem) hold
+	 * the camera's frame buffers: a CMA area, which Linux uses for
+	 * movable pages while the camera does not.
 	 */
 	reserved-memory {
 		#address-cells = <1>;
@@ -46,7 +47,7 @@
 		camera_mem: camera@6000000 {
 			compatible = "shared-dma-pool";
 			reg = <0x6000000 0x2000000>;
-			no-map;
+			reusable;
 		};
 	};
 

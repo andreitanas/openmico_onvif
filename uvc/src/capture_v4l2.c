@@ -128,7 +128,7 @@ static int ctrl_range(int fd, unsigned id, int *min, int *max) {
     return 0;
 }
 
-// A control by name (the ISP's noise reduction has no standard id)
+// A control by name (the ISP's noise reductions have no standard id)
 static unsigned ctrl_by_name(int fd, const char *name) {
     struct v4l2_queryctrl q = {.id = V4L2_CTRL_FLAG_NEXT_CTRL};
     while (xioctl(fd, VIDIOC_QUERYCTRL, &q) == 0) {
@@ -221,6 +221,7 @@ static void apply_isp(void) {
     level(fd, V4L2_CID_SATURATION, night ? 0 : params.saturation);
     level(fd, V4L2_CID_SHARPNESS, params.sharpness);
     level(fd, ctrl_by_name(fd, "Noise Reduction"), params.denoise);
+    level(fd, ctrl_by_name(fd, "Temporal Noise Reduction"), params.denoise);
 }
 
 // Streams

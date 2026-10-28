@@ -172,6 +172,32 @@ slightly crisper with no visible noise gain; at 0xa0 the sensor noise is
 amplified. The demosaic's own sharpening (0x43c directional, 0x440
 non-directional, signed 4.4, 0x30 and 0x20 at reset) is left at reset.
 
+## Temporal noise reduction (verified 2026-10-28)
+
+Temper (the Apical "Temper" and "Temper Frame Buffer" groups) blends each
+frame with the filtered previous one, which it keeps in memory:
+
+- 0x2c0 bit 0 on (bit 1 logarithmic weighting, 1 at reset; bit 7 Temper2
+  mode; bit 8 one frame of extra delay); 0x2c4 and 0x2c8 the noise
+  thresholds for short and long exposure data (8 bits; 0x30 at reset for
+  long); 0x2cc bits 3:0 the recursion limit (lower: longer history; 2 at
+  reset). Bypassed by 0x40 bit 10. It uses Sinter's noise profile (the LUT
+  at 0x1d00, 0x2e0-0x2ec).
+- Frame buffer, 0xa00: bits 3:0 base mode, in the video writers' codes. It
+  must be 5 (GEN32): at 0 (reset) the frame reads back as zeros and the
+  picture is black. Bit 16 write on, 17 read on (both 1 at reset), 24 and
+  25 cancel. 0xa10/0xa14 width and height, 0xa18/0xa1c bank 0 and 1 base
+  (the same buffer for both), 0xa24 line offset (width × 4), 0xa28 bit 0
+  AXI port on. 4 bytes a pixel: 8.3 MB at 1080p.
+- Measured on the JX-F22 at 1080p, frame-to-frame luma noise (std of the
+  difference, median over static 16×16 blocks): at gain code 79, 2.54
+  without, 2.06 at threshold 48, 1.00 at 128, 0.95 at 255; with auto
+  exposure in a dim room (gain ~60), 1.30 without, 0.68 at 64, 0.65 at
+  128. No visible trails behind moving content at 64. The encoders' time
+  per 1080p frame is the same with it on (H.264 18.8 ms, JPEG 10.7 ms).
+- Base modes 1-14 all give a picture; 6 (RAW16) as bright as 5, the
+  others darker or brighter. Mode 15 stalled the stream.
+
 ## Sensor (JX-F22) mirror and flip
 
 Register 0x12: bit 5 mirror, bit 4 flip, bit 6 sleep. Mirror turns BGGR into
@@ -182,6 +208,9 @@ GBRG, flip into GRBG, both into RGGB.
 - The interrupt source numbers of frame start/end, statistics and errors.
 - The shading and Iridix tables and their formats; what the noise
   profile entries mean exactly (the vendor's are calibrated per sensor).
+- What Temper keeps in its 32 bits a pixel, and Temper2 mode (bit 7 of
+  0x2c0) against the default Temper3; whether RAW16 (2 bytes a pixel,
+  half the memory) filters as well.
 - The zoned statistics (AE and AWB per zone, in the metering memory at
   0x8000) and the default config sequence's format
   (`SENSOR_ISP_SEQUENCE_DEFAULT`).

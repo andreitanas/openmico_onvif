@@ -11,7 +11,8 @@
 // CTRLS="name=value ..." sets controls of the video node and subdevices by
 // name, lower case without spaces or punctuation (horizontalflip=1,
 // whitebalanceautomatic=0, redbalance=300), and lists them all. SIZE=WxH
-// sets the frame size (the second stream, /dev/video1, scales).
+// sets the frame size (the second stream, /dev/video1, scales). KEEP=n saves
+// the last n frames, one after another (the sequence numbers show drops).
 // Build: zig cc -target mipsel-linux-musleabihf -mcpu=mips32r2 -Os
 //   -static -o v4l2grab capture/v4l2grab.c
 
@@ -120,6 +121,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     int frames = argc > 2 ? atoi(argv[2]) : 50;
+    int keep = getenv("KEEP") ? atoi(getenv("KEEP")) : 1;
     const char *vpath = argc > 3 ? argv[3] : "/dev/video0";
     char spath[32] = "";
     if (argc > 4) snprintf(spath, sizeof(spath), "%s", argv[4]);
@@ -239,8 +241,8 @@ int main(int argc, char **argv) {
         printf("frame %u: seq %u, mean Y %u, exposure %d, gain %d\n", got, b.sequence, luma,
                ae.expo, ae.gain);
         ae_step(&ae, luma);
-        if (got == frames - 1) {
-            FILE *fp = fopen(argv[1], "wb");
+        if (got + keep >= frames) {
+            FILE *fp = fopen(argv[1], got + keep == frames ? "wb" : "ab");
             if (!fp || fwrite(mem[b.index], 1, pix->sizeimage, fp) != pix->sizeimage)
                 perror(argv[1]);
             if (fp) fclose(fp);
