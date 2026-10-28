@@ -109,6 +109,12 @@ if [ ! -d "$WIFI" ]; then
     git -c advice.detachedHead=false clone -q -b rtl8189fs https://github.com/jwrdegoede/rtl8189ES_linux "$WIFI"
     git -C "$WIFI" checkout -q $RTL8189FS_COMMIT
 fi
+# Its own make does not notice a new kernel configuration (struct layouts
+# change with it): rebuilt from clean when the configuration differs
+if ! cmp -s "$OUT/obj/.config" "$WIFI/.kernel-config"; then
+    make -s -C "$OUT/obj" M="$WIFI" clean
+    cp "$OUT/obj/.config" "$WIFI/.kernel-config"
+fi
 make -s -C "$OUT/obj" M="$WIFI" -j"$JOBS" \
     CONFIG_RTL8189FS=m CONFIG_MP_INCLUDED=n USER_EXTRA_CFLAGS="-Wno-error" modules
 
