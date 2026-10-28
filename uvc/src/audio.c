@@ -1,7 +1,9 @@
 // The microphone: /dev/dsp (OSS emulation over the T20 codec's ALSA driver)
 // at 16 kHz, 16-bit stereo, of which the right channel has the codec's one
-// ADC; AAC-LC from vo-aacenc (Apache-2.0); a ring of the last 4 s of frames,
-// each placed in monotonic time by the samples read so far.
+// ADC; high-passed and amplified here (the codec's own gain controls change
+// nothing: docs/t20-isp-hardware.md); AAC-LC from vo-aacenc (Apache-2.0); a
+// ring of the last 4 s of frames, each placed in monotonic time by the
+// samples read so far.
 
 #include "audio.h"
 
@@ -10,6 +12,7 @@
 #if defined(__linux__)
 
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -24,6 +27,17 @@
 #define FRAME_MS (FRAME * 1000 / RATE)
 #define RING 64     // frames kept: 4 s
 #define BITRATE 32000
+#define HIGHPASS_HZ 120
+#define GAIN_MAX_DB 30  // at Protect's microphone volume 100
+
+// The ADC's output has a DC offset and the room's rumble below 100 Hz far
+// above everything else: a 4th-order Butterworth high-pass, two biquads
+struct biquad {
+    float b0, b1, b2, a1, a2, z1, z2;
+};
+
+static struct biquad hp[2];
+static volatile int volume = 100;
 
 struct aframe {
     int64_t index;  // frame number since the start, -1: empty
@@ -42,6 +56,31 @@ static VO_AUDIO_CODECAPI api;
 static VO_HANDLE enc;
 static VO_MEM_OPERATOR mem = {.Alloc = cmnMemAlloc, .Free = cmnMemFree, .Set = cmnMemSet,
                               .Copy = cmnMemCopy, .Check = cmnMemCheck};
+
+static void highpass_init(void) {
+    static const float q[2] = {0.5412f, 1.3066f};
+    float w = 2 * (float)M_PI * HIGHPASS_HZ / RATE, c = cosf(w);
+    for (int i = 0; i < 2; i++) {
+        float alpha = sinf(w) / (2 * q[i]), a0 = 1 + alpha;
+        hp[i] = (struct biquad){.b0 = (1 + c) / 2 / a0, .b1 = -(1 + c) / a0, .b2 = (1 + c) / 2 / a0,
+                                .a1 = -2 * c / a0, .a2 = (1 - alpha) / a0};
+    }
+}
+
+static int16_t process(int16_t in, float gain) {
+    float x = in;
+    for (int i = 0; i < 2; i++) {
+        struct biquad *f = &hp[i];
+        float y = f->b0 * x + f->z1;
+        f->z1 = f->b1 * x - f->a1 * y + f->z2;
+        f->z2 = f->b2 * x - f->a2 * y;
+        x = y;
+    }
+    x *= gain;
+    return x > 32767 ? 32767 : x < -32768 ? -32768 : (int16_t)lrintf(x);
+}
+
+void audio_set_volume(int v) { volume = v < 0 ? 0 : v > 100 ? 100 : v; }
 
 static int encoder_open(void) {
     VO_CODEC_INIT_USERDATA user = {.memflag = VO_IMF_USERMEMOPERATOR, .memData = &mem};
@@ -84,8 +123,10 @@ static void *audio_main(void *arg) {
         // The last sample was taken about now: the frame's start follows.
         // Smoothed, as reads come back late by a varying amount.
         int64_t start = mono_ms() - (index + 1) * FRAME_MS;
+        int v = volume;
+        float gain = v ? powf(10, GAIN_MAX_DB * v / 100.0f / 20) : 0;
         for (int i = 0; i < FRAME; i++)
-            mono[i] = stereo[2 * i + 1];
+            mono[i] = process(stereo[2 * i + 1], gain);
         struct aframe f = {.index = index};
         f.len = encode(mono, f.data);
         pthread_mutex_lock(&lock);
@@ -117,6 +158,7 @@ int audio_start(void) {
     }
     for (int i = 0; i < RING; i++)
         ring[i].index = -1;
+    highpass_init();
     running = 1;
     pthread_create(&thread, NULL, audio_main, NULL);
     log_info("audio: microphone, AAC-LC %d Hz %d kbit/s", RATE, BITRATE / 1000);
@@ -155,6 +197,7 @@ size_t audio_frame_at(int64_t t_ms, uint8_t *out) {
 #else  // no OSS on this host
 
 int audio_start(void) { return -1; }
+void audio_set_volume(int volume) {}
 void audio_stop(void) {}
 size_t audio_frame_at(int64_t t_ms, uint8_t *out) { return 0; }
 

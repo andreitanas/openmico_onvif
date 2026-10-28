@@ -28,7 +28,7 @@ them to H.264 and JPEG, and uvcd streams them to Protect (2026-10-28). Read
 | ISP | ours, `t20-isp` (patch 0012), from [`t20-isp-hardware.md`](t20-isp-hardware.md) | runs: 1920x1080 NV12 at 24.6 fps in colour: black level, auto white balance, colour matrix, sRGB gamma, noise reduction, sharpening, brightness/contrast/saturation |
 | JPEG encoder (VPU) | ours, `t20-vpu` (patch 0013; the VPU sequence and Huffman table from Ingenic's GPL X1000/T31 drivers) | runs: 1080p NV12 to JPEG in 10.7 ms, from a file or an ISP frame as a dma-buf |
 | H.264 encoder (VPU) | ours, `t20-vpu` (patch 0013; register names from Ingenic's GPL Helix encoder, the T20's values in [`t20-isp-hardware.md`](t20-isp-hardware.md)) | runs: 1080p Main profile, CABAC, I and P frames, 16 ms a frame in the VPU, constant QP or bit rate; streams pass strict ffmpeg decoding |
-| Audio | mainline `jz4740-i2s` (T20 variant) and `dma-jz4780`, our `t20-codec` (patches 0014, 0015; sequences from Ingenic's GPL OSS driver) | runs: the microphone at 8-96 kHz through `/dev/dsp` (OSS emulation) or ALSA; `audiorec` records it; the speaker is not driven yet |
+| Audio | mainline `jz4740-i2s` (T20 variant) and `dma-jz4780`, our `t20-codec` (patches 0014, 0015; sequences from Ingenic's GPL OSS driver) | runs: the microphone at 8-96 kHz through `/dev/dsp` (OSS emulation) or ALSA; `audiorec` records it; uvcd high-passes and amplifies it in software; the speaker is not driven yet |
 | uvcd | `src/capture_v4l2.c` on this kernel, the closed libimp on 3.10 (`capture.c` picks at start) | runs: both H.264 streams to Protect, snapshots, object detection, auto exposure, the exposure figure for day/night; `test/test_capture_v4l2.c` (on the camera, uvcd stopped) checks streams, snapshots, raw frames, flip and mirror restarts and start/stop cycles |
 
 So the new kernel is a bring-up kernel: shell on the serial console, flash, SD card,
@@ -41,8 +41,9 @@ as the default (`image/build.sh`, `image/flash.sh` are unchanged in behaviour).
 On branch `kernel-modern`, with one camera on the new kernel and a serial
 console attached:
 
-- Runs on the camera: hardware test steps 1, 2, 4, 5 and 6 (boot, flash and
-  config, SD card, WiFi and SSH, the watchdog, the camera with `v4l2grab`),
+- Runs on the camera: hardware test steps 1, 2, 4, 5, 6 and 7 (boot, flash and
+  config, SD card, WiFi and SSH, the watchdog, the camera with `v4l2grab`,
+  the microphone; listening in Protect still to do),
   and `flash-modern.sh` from both kernels. S50camera loads the camera drivers
   at boot.
 - Open from bring-up: the 8 GB card that read only zeros, step 3 (LEDs, IR
@@ -56,7 +57,10 @@ console attached:
 - uvcd streams on this kernel (2026-10-28) through `src/capture_v4l2.c`
   (below), not through a libimp of our own as first planned.
 - Audio (2026-10-28): the microphone in the kernel (patches 0014, 0015) and in
-  uvcd's streams (AAC-LC); the speaker is not driven yet.
+  uvcd's streams (AAC-LC); the speaker is not driven yet. The first version
+  was silent in Protect: the audio clock ran 1.2x fast (the CGU read the
+  I2SCDR PLL select as the X1000's) and the signal was 30 dB too low (the
+  codec's gain controls do nothing). Both fixed; see Audio gain below.
 - Next: the remaining ISP tuning, the speaker for talkback.
 
 ## Sources
@@ -168,8 +172,8 @@ pages. CMA costs 37 KB of kernel.
 
 | | Today (OpenMiko 3.10.14) | Linux 6.18 |
 |---|---|---|
-| uImage | (in a 2048 KiB partition, with the initramfs) | 1,771,520 bytes of 2,097,152 (84 %) |
-| Unpacked image | | 5,215,080 bytes of 5,242,880 (27 KB left; 2026-10-28, with the encoders, audio, CMA) |
+| uImage | (in a 2048 KiB partition, with the initramfs) | 1,771,467 bytes of 2,097,152 (84 %) |
+| Unpacked image | | 5,215,064 bytes of 5,242,880 (27 KB left; 2026-10-28, with the encoders, audio, CMA) |
 | Kernel code | 3877k | 3717k |
 | Data | 1205k | 187k rwdata, 940k rodata, 67k bss |
 | Init, freed after boot | | 204k |
@@ -245,7 +249,7 @@ the `mm32`/`ftrunc32` shims stay only for the 3.10 kernel.
 | Second stream | DS2 path: a second video node (`t20-isp-sub`, `/dev/video1`) scaled to any even size, 640x360 by default | detector channel | runs, alone or with the main stream |
 | H.264 encoder | `t20-vpu` (patch 0013), node `t20-h264`: V4L2 stateful encoder, NV12 in (MMAP or dma-buf), Annex B out (SPS and PPS before every IDR frame); controls GOP size, force key frame, frame rate control with bit rate and min/max QP (or I/P QP), frame rate by `S_PARM`. The VPU does motion search, mode decision, transform and CABAC; the driver writes the headers and runs the rate control | `IMP_Encoder_*` | runs (`v4l2h264`): 1080p at the ISP's 25 fps, 16 ms a frame in the VPU; PSNR 43 dB on a synthetic pan; 1-8 Mbit/s held within 2% |
 | JPEG | `t20-vpu` (patch 0013), node `t20-jpeg`: V4L2 mem2mem, NV12 in (MMAP or dma-buf), JFIF out, `V4L2_CID_JPEG_COMPRESSION_QUALITY` | snapshot channel | runs (`v4l2jpeg`), also while H.264 encodes (the jobs take turns) |
-| Audio | ALSA: the AIC (mainline `jz4740-i2s`, a T20 variant), PDMA (`dma-jz4780` as the X1830's), our internal codec driver `t20-codec` (patch 0014), `simple-audio-card`; the codec is the I2S master on the AIC's 256 fs system clock; its one ADC is the right channel | uvcd's `src/audio.c`: `/dev/dsp` at 16 kHz, AAC-LC 32 kbit/s (vo-aacenc), into the streams' audio track in place of silence | microphone runs (`audiorec`, `test/test_audio.c`; uvcd streams it); speaker (DAC, amplifier GPIO) not started |
+| Audio | ALSA: the AIC (mainline `jz4740-i2s`, a T20 variant), PDMA (`dma-jz4780` as the X1830's), our internal codec driver `t20-codec` (patch 0014), `simple-audio-card`; the codec is the I2S master on the AIC's 256 fs system clock; its one ADC is the right channel | uvcd's `src/audio.c`: `/dev/dsp` at 16 kHz, AAC-LC 32 kbit/s (vo-aacenc), into the streams' audio track in place of silence | microphone runs (`audiorec`, `test/test_audio.c`; uvcd streams it, gain from Protect's microphone volume); speaker (DAC, amplifier GPIO) not started |
 
 What `t20-isp` does today: VIC set up for the 10-bit parallel bus, the ISP core's
 geometry and Bayer order, every block that needs a memory table bypassed (white
@@ -254,6 +258,31 @@ values: gains 1.0, identity matrix, BT.601), the DS1 Y and UV writers in NV12 fr
 32 MB of reserved memory, frames completed on the DS1 output-end interrupt
 (source 50, the one source number the SDK shows). No crop, scaling, mirroring,
 statistics or tuning. Unknowns are listed in `t20-isp-hardware.md`.
+
+### Audio gain
+
+**Decision (2026-10-28): the microphone's gain is applied in software, in
+uvcd, not in the codec.** The internal codec's PGA (CACR2) and the AGC-like
+registers at 0x100-0x130 change nothing on the T20 (measured,
+[`t20-isp-hardware.md`](t20-isp-hardware.md)); only the +20 dB boost and the
+ALC bits do, and the kernel sets both. That leaves the ADC's output about 30
+dB below a usable level, with a DC offset and room rumble below 100 Hz far
+above the rest. The vendor's stack does the same in libimp (`IMP_AI_SetVol`).
+So `t20-codec` keeps the vendor's fixed settings (its "Mic Capture Volume"
+control stays, as the vendor's register, but changes nothing measurable), and
+`src/audio.c` filters and amplifies:
+
+- a 4th-order Butterworth high-pass at 120 Hz (two biquads, float), against
+  the DC offset and the rumble, which the gain would otherwise bring near
+  full scale;
+- then a gain linear in dB from Protect's microphone volume
+  (`ChangeVideoSettings` `audio.volume`, 0-100, default 100): 0 is silence,
+  100 is +30 dB; samples are clamped, not limited.
+
+At volume 100 a quiet room comes out at -46 dBFS RMS (peaks -21 dBFS), so
+background sound is audible and a loud sound has about 20 dB before it
+clips. An automatic gain control in software, if needed, would go in the
+same place.
 
 ### uvcd's libimp calls
 
@@ -431,7 +460,14 @@ but see the JFFS2 risk below.
    reduction yet). Failures to report: no frame in 2 s (interrupt routing or
    the input port), DMA alarms, a green or striped picture (writer format or
    Bayer order), a hang (register access with a clock off).
-7. **Back to OpenMiko's kernel** once (`image/flash.sh` writes only the root
+7. **Microphone**: `audiorec /tmp/a.wav 10 16000 2` with uvcd stopped
+   (`killall uvcd`; it restarts in 5 s): 10 s of samples must take about 10
+   s (a fast or slow clock shows here; it was 8.5 s with the wrong PLL), and
+   a 1 kHz tone played near the camera must come out at 1 kHz in the right
+   channel. Then `test_audio` (uvcd's path: high-pass, gain, AAC) and
+   `ffmpeg -i /tmp/audio.aac`: a quiet room near -46 dBFS, no DC. Finally
+   listen in Protect: room sound audible, voices clear, not slowed.
+8. **Back to OpenMiko's kernel** once (`image/flash.sh` writes only the root
    partition and leaves our kernel in place, so use demo.bin) to prove the way back.
 
 **Risks on another camera** (the first one boots, so these are about board

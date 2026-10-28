@@ -329,11 +329,16 @@ Xiaomi Dafang tree's `sound/oss/jzsound`, `soc-t20` headers).
   bytes, the low byte used, up to 0x130). It is the I2S master (CMCR =
   0x3e) and runs on the AIC's system clock: AICFR bit 7 (ICS) selects the
   internal codec, bit 5 (ICDC) makes it master, I2SCR bit 4 outputs the
-  system clock. The vendor sets the clock (CGU I2SCDR 0x60: M bits 21:13,
-  N bits 12:0, bit 29 divider on, bit 30 divider selected, bit 31 MPLL
-  rather than SCLK_A; I2SCDR1 0x70 written 0 after N changes, as on the
-  X1000) to 256 fs; the sample rate is CSRR (0x110) bits 2:0, 7..0 for 8,
-  12, 16, 24, 32, 44.1, 48, 96 kHz.
+  system clock. The vendor sets the clock to 256 fs; the sample rate is
+  CSRR (0x110) bits 2:0, 7..0 for 8, 12, 16, 24, 32, 44.1, 48, 96 kHz.
+- The clock: CGU I2SCDR (0x60) M bits 21:13, N bits 12:0 (rate = PLL x M /
+  N); I2SCDR1 (0x70) written 0 after N changes, as on the X1000. Not the
+  X1000's selects (measured 2026-10-28, by how fast samples come at a fixed
+  M/N): bits 31:30 pick the PLL as in the T20's other dividers, 0 SCLK_A
+  (APLL, 852 MHz here), 1 MPLL (1000 MHz), 2 and 3 VPLL (1200 MHz); bit 29
+  runs the divider (cleared, no samples at all). Read as the X1000's layout
+  (bit 31 MPLL, bits 30:29 divider on), "MPLL" was VPLL and every rate 1.2x
+  too fast: a 1 kHz tone recorded as 833 Hz, mains hum as 50 Hz.
 - Power-up: CGR (0x00) bits 1:0 to 0 then 3; CMCR 0x3e, CDCR1 0x10, CDCR2
   0x0e; CHCR (0x9c) bits 7:6 = 1 (precharge); on the T20 CCR (0xa0) bit 7
   set, then bits 6:0 stepped up to 0x3f over about 200 ms.
@@ -344,6 +349,19 @@ Xiaomi Dafang tree's `sound/oss/jzsound`, `soc-t20` headers).
   5 reference, ADC clock, ADC amplifier; CMICCR (0x88) bit 6 boost on, bit
   5 +20 dB, bit 4 boost running, bits 1:0 ALC on and running. Off: CAMPCR
   bits 7:5 cleared.
+- Gain (measured 2026-10-28 with a 1 kHz tone from a loudspeaker in the
+  room): the CACR2 PGA changes nothing over its whole range (0 to 31, with
+  the ALC on or off), nor do CPGR (0x10c), CAGCCR (0x108) or CCAGVR
+  (0x130) of the block at 0x100-0x130 (an AGC by the vendor's names,
+  untouched by its driver). What does change the level: the +20 dB boost
+  (CMICCR bit 5, about 18 dB measured) and the ALC bits (CMICCR 1:0, 14 dB
+  more with them set). CGAINR (0x28, 0x0c at reset) is not a gain: bits 3:2
+  clear mute the ADC, bit 5 set takes 10 dB off. Setting CAMPCR bits 4:0
+  makes the output garbage. With the vendor's settings the tone came in at
+  -74 dBFS and a quiet room at about -77 dBFS above 100 Hz, under a DC
+  offset of about +100 and rumble below 100 Hz at -48 dBFS: too quiet to
+  hear in a recording. The vendor's libimp amplifies in software
+  (`IMP_AI_SetVol`); uvcd does the same (`src/audio.c`).
 - The one ADC's samples are in the right I2S channel; the left channel has
   a copy of every 8th sample and zeros between (in mono mode as in stereo):
   the vendor sums the two in software, we take the right one.

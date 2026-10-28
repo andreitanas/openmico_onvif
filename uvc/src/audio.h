@@ -10,6 +10,9 @@
 int audio_start(void);
 void audio_stop(void);
 
+// Protect's microphone volume, 0 (silence) to 100 (the most gain)
+void audio_set_volume(int volume);
+
 // The raw AAC frame (no ADTS header) captured at monotonic time t_ms: its
 // length, or 0 if there is none (not yet encoded, gone from the buffer, or
 // no microphone). out holds AUDIO_FRAME_MAX bytes.

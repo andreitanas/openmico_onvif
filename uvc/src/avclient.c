@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "analytics.h"
+#include "audio.h"
 #include "board.h"
 #include "cJSON.h"
 #include "capture.h"
@@ -314,6 +315,8 @@ static cJSON *video_channel(int idx, const char *desc, double cbr, double vbr_ma
     return v;
 }
 
+static int mic_volume = 100; // Protect's microphone sensitivity (audio.h)
+
 static cJSON *video_settings(void) {
     cJSON *p = cJSON_CreateObject();
     cJSON *a = OBJ(p, "audio");
@@ -326,7 +329,7 @@ static cJSON *video_settings(void) {
     NUM(a, "quality", 0);
     NUM(a, "sampleRate", 16000);
     STR(a, "type", "aac");
-    NUM(a, "volume", 100);
+    NUM(a, "volume", mic_volume);
     STR(p, "firmwarePath", "/lib/firmware/");
 
     cJSON *v = OBJ(p, "video");
@@ -382,6 +385,12 @@ static cJSON *video_settings(void) {
 // --- request handlers ---------------------------------------------------
 
 static void change_video_settings(cJSON *payload) {
+    cJSON *volume = cJSON_GetObjectItem(cJSON_GetObjectItem(payload, "audio"), "volume");
+    if (cJSON_IsNumber(volume) && volume->valueint != mic_volume) {
+        mic_volume = volume->valueint;
+        audio_set_volume(mic_volume);
+        log_info("audio: microphone volume %d", mic_volume);
+    }
     cJSON *video = cJSON_GetObjectItem(payload, "video");
     for (int i = 0; i < 3 && video; i++) {
         cJSON *ch = cJSON_GetObjectItem(video, streams[i].channel);
