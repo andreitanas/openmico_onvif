@@ -10,11 +10,21 @@ gpio_out() {
 }
 case "$1" in
 start)
-	if [ ! -d /lib/modules/3.10.14 ]; then
-		# Our kernel: the sensor (jxf2x) and ISP (t20-isp) drivers are
-		# loaded by hand until they are tested (docs/kernel-modern.md,
-		# hardware test plan); uvcd does not read them yet.
-		logger -s -t camera "camera drivers not loaded on $(uname -r)"
+	if [ "$(uname -r)" != 3.10.14 ]; then
+		# Our kernel: the ISP (t20-isp: /dev/video0 main stream,
+		# /dev/video1 second stream), sensor (jxf2x) and the VPU's JPEG
+		# and H.264 encoders (t20-vpu) drivers. uvcd uses them through
+		# src/capture_v4l2.c; v4l2grab, v4l2jpeg and v4l2h264 test them.
+		modprobe t20-isp && modprobe jxf2x ||
+			logger -s -t camera "camera drivers not loaded"
+		modprobe t20-vpu || logger -s -t camera "VPU encoders not loaded"
+		# The microphone: AIC, internal codec, their card; /dev/dsp
+		modprobe snd-soc-jz4740-i2s &&
+			modprobe snd-soc-t20-codec && modprobe snd-soc-simple-card &&
+			modprobe snd-pcm-oss ||
+			logger -s -t camera "audio drivers not loaded"
+		sensor=$(dmesg | grep -m1 -oE 'jxf2x [^:]*: jxf2[0-9]' | grep -oE 'jxf2[0-9]$')
+		logger -s -t camera "image sensor ${sensor:-not found}"
 		exit 0
 	fi
 	# USB power (some board revisions need it)

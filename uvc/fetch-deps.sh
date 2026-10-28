@@ -10,6 +10,8 @@ CJSON=1.7.18
 NCNN=20260526
 STB=003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5
 DROPBEAR=2026.94
+VOAAC=0.1.3
+VOAAC_SHA256=ae38610405f862237f6c70360c406297cc4222abf82e86722c505ba74b53a97d
 # Signed by the Dropbear release key F734 7EF2 EE2E 07A2 6762 8CA9 4493 1494 F29C 6773
 DROPBEAR_SHA256=e098034a843699200c8c977a991fff73159735bf795d5f72ef672c41a6b1ae81
 
@@ -34,6 +36,15 @@ fi
 if [ ! -d ncnn ]; then
     curl -fsSL "https://github.com/Tencent/ncnn/archive/refs/tags/$NCNN.tar.gz" | tar xz
     mv "ncnn-$NCNN" ncnn
+fi
+
+# AAC-LC encoder for the microphone (Android's, Apache-2.0)
+if [ ! -d vo-aacenc ]; then
+    curl -fsSL "https://github.com/mstorsjo/vo-aacenc/archive/refs/tags/v$VOAAC.tar.gz" -o vo-aacenc.tar.gz
+    echo "$VOAAC_SHA256  vo-aacenc.tar.gz" | shasum -a 256 -c - >/dev/null
+    tar xzf vo-aacenc.tar.gz
+    rm vo-aacenc.tar.gz
+    mv "vo-aacenc-$VOAAC" vo-aacenc
 fi
 
 # stb_image_write: JPEG encoding of detection crops.

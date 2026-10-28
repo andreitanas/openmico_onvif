@@ -24,9 +24,10 @@ struct config {
     char snapshot[128];  // JPEG device or file
     char state_file[128];
     char log_file[128]; // empty: stderr
-    // CAPTURE=1 (default): uvcd drives the sensor and encoders through
-    // libimp. CAPTURE=0 reads H.264 from HI_SOURCE/LO_SOURCE (files or v4l2
-    // devices), for tests off the camera.
+    // CAPTURE=1 (default): uvcd drives the sensor and encoders, through
+    // our kernel's V4L2 drivers or libimp (capture.h). CAPTURE=0 reads H.264
+    // from HI_SOURCE/LO_SOURCE (files or v4l2 devices), for tests off the
+    // camera.
     int capture;
     int hi_kbps, lo_kbps, hi_gop, lo_gop;
     int lo_width, lo_height;

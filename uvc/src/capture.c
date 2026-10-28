@@ -1,5 +1,7 @@
 #include "capture.h"
 
+#include "audio.h"
+#include "capture_v4l2.h"
 #include "util.h"
 
 #ifdef UVC_IMP
@@ -185,7 +187,7 @@ static int jpeg_grab(void) {
     return rc;
 }
 
-int capture_jpeg(uint8_t **data, size_t *len) {
+static int imp_jpeg(uint8_t **data, size_t *len) {
     int rc = 0;
     pthread_mutex_lock(&jpeg_lock);
     if (!running)
@@ -202,7 +204,7 @@ int capture_jpeg(uint8_t **data, size_t *len) {
     return rc;
 }
 
-int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) {
+static int imp_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) {
     IMPFrameInfo *f;
     pthread_mutex_lock(&raw_lock);
     int n = -1;
@@ -220,7 +222,7 @@ int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) {
     return n;
 }
 
-void capture_night(int night) {
+static void imp_night(int night) {
     if (!running)
         return;
     log_info("capture: %s mode", night ? "night" : "day");
@@ -235,7 +237,7 @@ static unsigned char isp_level(int v) {
     return v <= 50 ? v * 128 / 50 : 128 + (v - 50) * 127 / 50;
 }
 
-void capture_isp(const struct isp_params *p) {
+static void imp_isp(const struct isp_params *p) {
     if (!running)
         return;
     IMP_ISP_Tuning_SetBrightness(isp_level(p->brightness));
@@ -270,7 +272,7 @@ static int isp_start(void) {
     return 0;
 }
 
-int capture_start(const struct config *c, struct source *hi, struct source *lo) {
+static int imp_start(const struct config *c, struct source *hi, struct source *lo) {
     cfg = c;
     // The sensor's native size; the T20's sensors here are all 1080p.
     encoders[0] = (struct encoder){.chn = ENC_HI, .src = hi, .width = 1920, .height = 1080};
@@ -307,7 +309,7 @@ int capture_start(const struct config *c, struct source *hi, struct source *lo) 
 
 // Tear down in the reverse order of capture_start, so the next owner of
 // libimp (a restarted uvcd) finds the hardware idle.
-void capture_stop(void) {
+static void imp_stop(void) {
     if (!running)
         return;
     pthread_mutex_lock(&jpeg_lock);
@@ -339,21 +341,70 @@ void capture_stop(void) {
     log_info("capture: stopped");
 }
 
-#else // host builds: no camera
+#else // host builds: no libimp
 
-int capture_start(const struct config *c, struct source *hi, struct source *lo) {
+static int imp_start(const struct config *c, struct source *hi, struct source *lo) {
     log_error("capture: this build has no libimp support (CAPTURE=1 needs the camera build)");
     return -1;
 }
 
-void capture_stop(void) {}
+static void imp_stop(void) {}
 
-int capture_jpeg(uint8_t **data, size_t *len) { return -1; }
+static int imp_jpeg(uint8_t **data, size_t *len) { return -1; }
 
-int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) { return -1; }
+static int imp_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) { return -1; }
 
-void capture_isp(const struct isp_params *p) {}
+static void imp_isp(const struct isp_params *p) {}
 
-void capture_night(int night) {}
+static void imp_night(int night) {}
 
 #endif
+
+// Our kernel's V4L2 drivers when they are there (capture_v4l2.c), else
+// libimp on Ingenic's 3.10 kernel.
+static int v4l2;
+
+// The microphone (audio.h) on our kernel only: libimp's is not used
+int capture_start(const struct config *c, struct source *hi, struct source *lo) {
+    v4l2 = capture_v4l2_available();
+    if (!v4l2)
+        return imp_start(c, hi, lo);
+    if (capture_v4l2_start(c, hi, lo) < 0)
+        return -1;
+    if (c->audio)
+        audio_start();
+    return 0;
+}
+
+void capture_stop(void) {
+    if (v4l2) {
+        audio_stop();
+        capture_v4l2_stop();
+    } else {
+        imp_stop();
+    }
+}
+
+int capture_jpeg(uint8_t **data, size_t *len) {
+    return v4l2 ? capture_v4l2_jpeg(data, len) : imp_jpeg(data, len);
+}
+
+int capture_raw(uint8_t *buf, size_t cap, int *w, int *h, int chroma) {
+    return v4l2 ? capture_v4l2_raw(buf, cap, w, h, chroma) : imp_raw(buf, cap, w, h, chroma);
+}
+
+void capture_isp(const struct isp_params *p) {
+    if (v4l2)
+        capture_v4l2_isp(p);
+    else
+        imp_isp(p);
+}
+
+void capture_night(int night) {
+    if (v4l2)
+        capture_v4l2_night(night);
+    else
+        imp_night(night);
+}
+
+int capture_exposure(void) { return v4l2 ? capture_v4l2_exposure() : -1; }

@@ -82,13 +82,15 @@ static void set_night(int on, int leds) {
 }
 
 // The ISP's exposure figure ("exposure log2 id", larger is darker), -1 if
-// unreadable.
+// unreadable: from the capture pipeline, else the vendor ISP's proc file.
 static int exposure(void) {
+    int e = capture_exposure();
+    if (e >= 0)
+        return e;
     FILE *fp = fopen(ISP_INFO, "r");
     if (!fp)
         return -1;
     char line[128];
-    int e = -1;
     while (fgets(line, sizeof(line), fp)) {
         if (!strncmp(line, "ISP exposure log2 id", 20)) {
             char *c = strchr(line, ':');

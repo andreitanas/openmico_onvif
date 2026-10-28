@@ -7,10 +7,11 @@
 #include "config.h"
 #include "source.h"
 
-// The camera pipeline through Ingenic's libimp (camera builds only): sensor
-// and ISP, a full-resolution H.264 encoder feeding hi, a low-resolution one
-// feeding lo, an on-demand JPEG encoder, and raw low-resolution frames for
-// motion detection. libimp has a single owner process.
+// The camera pipeline: sensor and ISP, a full-resolution H.264 encoder
+// feeding hi, a low-resolution one feeding lo, an on-demand JPEG encoder,
+// and raw low-resolution frames for motion detection. Through Ingenic's
+// libimp (camera builds, 3.10 kernel) or our kernel's V4L2 drivers
+// (capture_v4l2.c); either has a single owner process.
 int capture_start(const struct config *c, struct source *hi, struct source *lo);
 void capture_stop(void);
 
@@ -31,5 +32,10 @@ void capture_isp(const struct isp_params *p);
 
 // The ISP's night mode (black and white, night tuning) or day mode.
 void capture_night(int night);
+
+// The exposure the scene needs, as the vendor ISP's "exposure log2 id"
+// (log2(integration lines x gain) x 65536; daynight.h), or -1 if this
+// pipeline does not give it (libimp: daynight reads /proc/jz/isp instead).
+int capture_exposure(void);
 
 #endif

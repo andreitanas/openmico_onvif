@@ -10,8 +10,9 @@ struct flv {
     struct buf out; // bytes ready to send; caller drains it
     int64_t start_ms;
     int64_t last_sync_ms;
-    int audio;              // interleave silent AAC so the stream has an audio track
-    uint64_t audio_samples; // samples of silence emitted so far
+    int audio;              // interleave AAC so the stream has an audio track
+    uint64_t audio_samples; // samples of audio emitted so far
+    int64_t video0_ms;      // monotonic time of video timestamp 0 (audio.h)
 };
 
 void flv_begin(struct flv *f, const char *stream_name, int width, int height, int fps, int audio);

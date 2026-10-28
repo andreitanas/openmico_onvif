@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "audio.h"
 #include "h264.h"
 
 #define TAG_AUDIO 8
@@ -13,7 +14,8 @@
 #define AUDIO_RATE 16000
 #define AAC_FRAME_SAMPLES 1024
 
-// AAC-LC, 16 kHz, mono; and the silent raw frame ffmpeg's encoder emits.
+// AAC-LC, 16 kHz, mono; and the silent raw frame ffmpeg's encoder emits,
+// for the times the microphone has nothing (audio.h).
 static const uint8_t aac_config[] = {0x14, 0x08};
 static const uint8_t aac_silence[] = {0x01, 0x18, 0x20, 0x07};
 
@@ -176,14 +178,19 @@ void flv_avc_config(struct flv *f, const uint8_t *sps, size_t sps_len, const uin
 
 static void audio_until(struct flv *f, uint32_t ts, int64_t now) {
     struct buf b = {0};
+    uint8_t aac[AUDIO_FRAME_MAX];
     for (;;) {
         uint32_t ats = (uint32_t)(f->audio_samples * 1000 / AUDIO_RATE);
         if (ats > ts)
             break;
+        size_t n = audio_frame_at(f->video0_ms + ats, aac);
         b.len = 0;
         buf_u8(&b, 0xaf);
         buf_u8(&b, 1);
-        buf_put(&b, aac_silence, sizeof(aac_silence));
+        if (n)
+            buf_put(&b, aac, n);
+        else
+            buf_put(&b, aac_silence, sizeof(aac_silence));
         tag(f, TAG_AUDIO, ats, &b, now);
         f->audio_samples += AAC_FRAME_SAMPLES;
     }
@@ -196,8 +203,9 @@ void flv_video(struct flv *f, uint32_t ts, int key, const uint8_t *annexb, size_
         f->last_sync_ms = now;
         clock_sync(f, ts, now);
     }
-    if (f->audio)
-        audio_until(f, ts, now);
+    // Audio as late as the microphone's frames are (its timestamps stay true)
+    if (f->audio && ts >= AUDIO_LATENCY_MS)
+        audio_until(f, ts - AUDIO_LATENCY_MS, now);
 
     struct buf b = {0};
     buf_reserve(&b, len + 64);

@@ -69,6 +69,7 @@ static void session(struct stream *s, int fd) {
             flv_begin(&flv, s->name, s->src->width, s->src->height, s->fps, s->audio);
             flv_avc_config(&flv, sps, sps_len, pps, pps_len);
             first_ts = f->ts_ms;
+            flv.video0_ms = first_ts;
             started = 1;
             log_info("%s: streaming %s to %s:%d", s->channel, s->name, s->host, s->port);
         }
