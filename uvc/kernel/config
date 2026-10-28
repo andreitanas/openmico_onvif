@@ -15,6 +15,9 @@ CONFIG_HIGH_RES_TIMERS=y
 CONFIG_NO_HZ_IDLE=y
 # 4 KB pages, as the closed libimp/uvcd binaries expect
 CONFIG_PAGE_SIZE_4KB=y
+# Userspace is hard-float (OpenMiko's uClibc and busybox, our musleabihf
+# builds): without this every FPU instruction is SIGILL and init dies.
+CONFIG_MIPS_FP_SUPPORT=y
 
 ## Boot: device tree linked into the kernel, command line from it
 # Vendor U-Boot passes argc/argv, not a DTB; its arguments are ignored.
@@ -40,6 +43,9 @@ CONFIG_AIO=n
 CONFIG_ADVISE_SYSCALLS=y
 CONFIG_MEMBARRIER=y
 CONFIG_BINFMT_ELF=y
+# OpenMiko's uClibc 1.0.12 makes the 32-bit time_t system calls
+# (clock_gettime, nanosleep, ...): without them sleep and udhcpc fail
+CONFIG_COMPAT_32BIT_TIME=y
 CONFIG_BINFMT_SCRIPT=y
 CONFIG_FILE_LOCKING=y
 CONFIG_TTY=y
@@ -48,6 +54,9 @@ CONFIG_PROC_FS=y
 CONFIG_PROC_SYSCTL=y
 CONFIG_SYSFS=y
 CONFIG_TMPFS=y
+# The overlay on /etc needs xattrs on its tmpfs upper layer (opaque
+# directories, e.g. /etc/dropbear made over the base image's symlink)
+CONFIG_TMPFS_XATTR=y
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 # /dev/mem: libimp maps the ISP and encoder memory (ispmem/rmem) through it
@@ -67,6 +76,9 @@ CONFIG_HW_RANDOM=n
 ## Interrupts, clocks, timers (mainline Ingenic drivers; T20 CGU is ours)
 CONFIG_INGENIC_CGU_T20=y
 CONFIG_INGENIC_TCU_CLK=y
+# The TCU's interrupt domain: without it the TCU timer fails with -ENODEV
+# and the watchdog, a TCU child, is never probed
+CONFIG_INGENIC_TCU_IRQ=y
 CONFIG_INGENIC_TIMER=y
 CONFIG_INGENIC_SYSOST=y
 CONFIG_INGENIC_OST=n
@@ -142,6 +154,24 @@ CONFIG_VIDEO_JXF2X=m
 # Camera input and ISP (our patch 0012); frame buffers from reserved memory
 CONFIG_V4L_PLATFORM_DRIVERS=y
 CONFIG_VIDEO_INGENIC_T20_ISP=m
+# JPEG and H.264 encoders on the VPU (our patch 0013)
+CONFIG_V4L_MEM2MEM_DRIVERS=y
+CONFIG_VIDEO_INGENIC_T20_VPU=m
+# The PDMA: the SD card's and the WiFi's transfers (built in: the MMC hosts
+# probe at boot) and the microphone's
+CONFIG_DMADEVICES=y
+CONFIG_DMA_JZ4780=y
+# Audio: the microphone through the AIC and the internal codec (our patch
+# 0014); modules, as the kernel is near 5 MB raw
+CONFIG_SOUND=m
+CONFIG_SND=m
+CONFIG_SND_SOC=m
+CONFIG_SND_JZ4740_SOC_I2S=m
+CONFIG_SND_SOC_T20_CODEC=m
+CONFIG_SND_SIMPLE_CARD=m
+# /dev/dsp: the simplest way to read samples (tests, uvcd)
+CONFIG_SND_OSSEMUL=y
+CONFIG_SND_PCM_OSS=m
 CONFIG_DMA_CMA=n
 
 ## Filesystems: squashfs root, JFFS2 config partition, vfat SD card
@@ -151,6 +181,11 @@ CONFIG_SQUASHFS_XZ=y
 CONFIG_SQUASHFS_FILE_DIRECT=y
 CONFIG_JFFS2_FS=y
 CONFIG_JFFS2_FS_WRITEBUFFER=y
+# The vendor kernel writes the config partition with zlib, rtime and lzo
+CONFIG_JFFS2_COMPRESSION_OPTIONS=y
+CONFIG_JFFS2_ZLIB=y
+CONFIG_JFFS2_LZO=y
+CONFIG_JFFS2_RTIME=y
 CONFIG_OVERLAY_FS=y
 CONFIG_VFAT_FS=y
 CONFIG_FAT_DEFAULT_UTF8=y
@@ -188,7 +223,6 @@ CONFIG_RFKILL=n
 CONFIG_INPUT=n
 CONFIG_VT=n
 CONFIG_USB_SUPPORT=n
-CONFIG_SOUND=n
 CONFIG_PCI=n
 CONFIG_SWAP=n
 CONFIG_SUSPEND=n

@@ -1,0 +1,2476 @@
+From: openmico_onvif <andrei.tanas@gmail.com>
+Subject: [PATCH] media: ingenic: add T20 VPU JPEG and H.264 encoders
+
+V4L2 mem2mem encoders on the T20's VPU, one driver with a video node for
+each, sharing one job queue (the VPU runs one job at a time). Both take
+NV12 (the ISP's frames, also as dma-bufs).
+
+JPEG: baseline JFIF 4:2:0, quality 1-100. The VPU sequence and the Huffman
+encoder table are from Ingenic's GPL-2.0 drivers for the same blocks (X1000
+JPEG, T31 helix); headers and quantisation tables are generated here.
+
+H.264: Main profile, CABAC, I and P frames, one slice a frame, constant QP
+or a frame-level rate control. The T20's encoder is Ingenic's "Helix": the
+register names and fields are those of Ingenic's GPL-2.0 Helix encoder (T31
+SDK), the motion filters its GPL-2.0 IntpFMT table; the T20's register
+values are documented in docs/t20-isp-hardware.md. Parameter sets and slice
+headers are written here; the VPU writes the slice data.
+---
+diff --git a/drivers/media/platform/ingenic/Kconfig b/drivers/media/platform/ingenic/Kconfig
+--- a/drivers/media/platform/ingenic/Kconfig
++++ b/drivers/media/platform/ingenic/Kconfig
+@@ -17,3 +17,19 @@ config VIDEO_INGENIC_T20_ISP
+ 
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called t20-isp.
++
++config VIDEO_INGENIC_T20_VPU
++	tristate "Ingenic T20 VPU JPEG and H.264 encoders"
++	depends on V4L_MEM2MEM_DRIVERS
++	depends on VIDEO_DEV && OF
++	depends on MACH_INGENIC || COMPILE_TEST
++	select V4L2_MEM2MEM_DEV
++	select VIDEOBUF2_DMA_CONTIG
++	select VIDEOBUF2_VMALLOC
++	select V4L2_JPEG_HELPER
++	help
++	  The encoders of the Ingenic T20 SoC's video processing unit:
++	  NV12 frames in, JPEG or H.264 out.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called t20-vpu.
+diff --git a/drivers/media/platform/ingenic/Makefile b/drivers/media/platform/ingenic/Makefile
+--- a/drivers/media/platform/ingenic/Makefile
++++ b/drivers/media/platform/ingenic/Makefile
+@@ -1 +1,3 @@
+ obj-$(CONFIG_VIDEO_INGENIC_T20_ISP) += t20-isp.o
++obj-$(CONFIG_VIDEO_INGENIC_T20_VPU) += t20-vpu.o
++t20-vpu-y := t20-vpu-core.o t20-vpu-jpeg.o t20-vpu-h264.o
+diff --git a/drivers/media/platform/ingenic/t20-vpu.h b/drivers/media/platform/ingenic/t20-vpu.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/platform/ingenic/t20-vpu.h
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Ingenic T20 VPU: the parts shared by its JPEG and H.264 encoders
++ */
++
++#ifndef T20_VPU_H
++#define T20_VPU_H
++
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/ktime.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++
++#include <media/v4l2-device.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-mem2mem.h>
++
++/* Scheduler */
++#define VPU_SCH_GLBC		0x00000
++#define SCH_GLBC_HIAXI		BIT(9)
++#define SCH_INTE_ENDF		BIT(16)
++#define SCH_INTE_BSERR		BIT(17)
++#define SCH_INTE_TLBERR		BIT(18)
++#define SCH_INTE_ACFGERR	BIT(20)
++#define SCH_INTE_ALL		(SCH_INTE_ENDF | SCH_INTE_BSERR | \
++				 SCH_INTE_TLBERR | SCH_INTE_ACFGERR)
++#define VPU_SCH_STAT		0x00034
++#define SCH_STAT_ENDF		BIT(0)
++#define SCH_STAT_JPGEND		BIT(4)
++
++/* Descriptor DMA: a list of (value, register) pairs */
++#define VPU_VDMA_TASKRG		0x10008
++#define VDMA_ACFG_RUN		BIT(0)
++#define ACFG_VLD		BIT(31)
++#define ACFG_TERM		BIT(30)
++#define ACFG_REG(r)		((r) & 0xffffc)
++
++#define VPU_TCSM_FLUSH		0xc0000
++#define VPU_VRAM		0xf0000		/* internal RAM: EFE macroblock FIFO */
++
++#define T20_VPU_DESC_SIZE	16384
++
++struct t20_vpu_ctx;
++
++/* A codec: its part of a job */
++struct t20_vpu_codec {
++	/* Write the descriptor list for the next frame (device_run) */
++	void (*run)(struct t20_vpu_ctx *ctx);
++	/* The job ended: status 0 on a timeout. Returns the buffers. */
++	void (*done)(struct t20_vpu_ctx *ctx, u32 stat);
++};
++
++struct t20_vpu {
++	struct device *dev;
++	void __iomem *regs;
++	void __iomem *srbc;
++	u32 phys;			/* bus address of the VPU */
++	struct clk *clk_gate;
++	struct clk *clk_core;
++	int irq;
++
++	struct v4l2_device v4l2_dev;
++	struct v4l2_m2m_dev *m2m_dev;	/* one job at a time, either codec */
++	struct video_device jpeg_vdev;
++	struct video_device h264_vdev;
++	struct mutex lock;		/* video devices and queues */
++
++	u32 *desc;			/* the job's descriptor list */
++	dma_addr_t desc_dma;
++	struct delayed_work timeout;
++	spinlock_t hw_lock;		/* the job being run */
++	struct t20_vpu_ctx *running;
++	ktime_t started;
++};
++
++/* The first member of each codec's file context */
++struct t20_vpu_ctx {
++	struct v4l2_fh fh;
++	struct t20_vpu *vpu;
++	const struct t20_vpu_codec *codec;
++};
++
++static inline u32 *t20_vpu_acfg(u32 *d, u32 reg, u32 val)
++{
++	*d++ = val;
++	*d++ = ACFG_VLD | ACFG_REG(reg);
++	return d;
++}
++
++/* The end of a descriptor list */
++static inline void t20_vpu_acfg_end(struct t20_vpu *vpu, u32 *d)
++{
++	d[-1] |= ACFG_TERM;
++	WARN_ON((void *)d > (void *)vpu->desc + T20_VPU_DESC_SIZE);
++}
++
++void t20_vpu_ctx_init(struct t20_vpu_ctx *ctx, struct t20_vpu *vpu,
++		      struct video_device *vdev, const struct t20_vpu_codec *codec);
++int t20_vpu_queue_init(struct t20_vpu_ctx *ctx, struct vb2_queue *src,
++		       struct vb2_queue *dst, const struct vb2_ops *ops,
++		       const struct vb2_mem_ops *dst_mem_ops);
++int t20_vpu_release(struct file *file);
++int t20_vpu_queue_setup(struct vb2_queue *q, u32 size, unsigned int *nbuffers,
++			unsigned int *nplanes, unsigned int sizes[]);
++void t20_vpu_return_bufs(struct t20_vpu_ctx *ctx, struct vb2_queue *q,
++			 enum vb2_buffer_state state);
++void t20_vpu_buf_queue(struct vb2_buffer *vb);
++
++extern const struct v4l2_file_operations t20_vpu_jpeg_fops;
++extern const struct v4l2_ioctl_ops t20_vpu_jpeg_ioctl_ops;
++extern const struct v4l2_file_operations t20_vpu_h264_fops;
++extern const struct v4l2_ioctl_ops t20_vpu_h264_ioctl_ops;
++
++#endif
+diff --git a/drivers/media/platform/ingenic/t20-vpu-core.c b/drivers/media/platform/ingenic/t20-vpu-core.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/platform/ingenic/t20-vpu-core.c
+@@ -0,0 +1,411 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Ingenic T20 VPU: JPEG and H.264 encoders as V4L2 mem2mem devices
++ *
++ * The VPU runs one job at a time: a list of register writes (VDMA
++ * descriptors) that a codec writes for each frame, then an interrupt. Both
++ * codecs' contexts share one mem2mem device, which runs their jobs in turn.
++ * This file has the device, the job and the parts common to the codecs;
++ * t20-vpu-jpeg.c and t20-vpu-h264.c have the codecs.
++ */
++
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-ioctl.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-vmalloc.h>
++
++#include "t20-vpu.h"
++
++/* CPM SRBC: VPU stop request, stop acknowledge, reset */
++#define SRBC_VPU_SR		BIT(31)
++#define SRBC_VPU_STP		BIT(30)
++#define SRBC_VPU_ACK		BIT(29)
++
++#define T20_VPU_CLK_RATE	350000000
++#define T20_VPU_TIMEOUT_MS	1000
++
++/* Job */
++
++static int t20_vpu_reset(struct t20_vpu *vpu)
++{
++	u32 srbc = readl(vpu->srbc);
++	int timeout = 10000;
++
++	writel(srbc | SRBC_VPU_STP, vpu->srbc);
++	while (!(readl(vpu->srbc) & SRBC_VPU_ACK) && --timeout)
++		udelay(1);
++	if (!timeout) {
++		writel(srbc, vpu->srbc);
++		return -ETIMEDOUT;
++	}
++	writel(srbc | SRBC_VPU_SR, vpu->srbc);
++	writel(srbc & ~(SRBC_VPU_SR | SRBC_VPU_STP), vpu->srbc);
++	return 0;
++}
++
++static void t20_vpu_device_run(void *priv)
++{
++	struct t20_vpu_ctx *ctx = priv;
++	struct t20_vpu *vpu = ctx->vpu;
++	unsigned long flags;
++
++	ctx->codec->run(ctx);
++
++	if (t20_vpu_reset(vpu))
++		dev_warn(vpu->dev, "no reset acknowledge\n");
++	spin_lock_irqsave(&vpu->hw_lock, flags);
++	vpu->running = ctx;
++	spin_unlock_irqrestore(&vpu->hw_lock, flags);
++	schedule_delayed_work(&vpu->timeout, msecs_to_jiffies(T20_VPU_TIMEOUT_MS));
++	vpu->started = ktime_get();
++	writel(SCH_GLBC_HIAXI | SCH_INTE_ALL, vpu->regs + VPU_SCH_GLBC);
++	/* The descriptors must be visible to the VPU before it starts */
++	wmb();
++	writel((vpu->desc_dma & ~0x7f) | VDMA_ACFG_RUN, vpu->regs + VPU_VDMA_TASKRG);
++}
++
++static const struct v4l2_m2m_ops t20_vpu_m2m_ops = {
++	.device_run = t20_vpu_device_run,
++};
++
++static struct t20_vpu_ctx *t20_vpu_take_running(struct t20_vpu *vpu)
++{
++	struct t20_vpu_ctx *ctx;
++	unsigned long flags;
++
++	spin_lock_irqsave(&vpu->hw_lock, flags);
++	ctx = vpu->running;
++	vpu->running = NULL;
++	spin_unlock_irqrestore(&vpu->hw_lock, flags);
++	return ctx;
++}
++
++/* Threaded: the H.264 codec copies the slice data out here */
++static irqreturn_t t20_vpu_irq(int irq, void *data)
++{
++	struct t20_vpu *vpu = data;
++	struct t20_vpu_ctx *ctx;
++	u32 stat;
++
++	stat = readl(vpu->regs + VPU_SCH_STAT);
++	/* Interrupts off until the next job */
++	writel(readl(vpu->regs + VPU_SCH_GLBC) & ~SCH_INTE_ALL, vpu->regs + VPU_SCH_GLBC);
++
++	ctx = t20_vpu_take_running(vpu);
++	if (!ctx)
++		return IRQ_HANDLED;
++	cancel_delayed_work(&vpu->timeout);
++	dev_dbg(vpu->dev, "job done in %lld us, status %#x\n",
++		ktime_us_delta(ktime_get(), vpu->started), stat);
++	ctx->codec->done(ctx, stat);
++	v4l2_m2m_job_finish(vpu->m2m_dev, ctx->fh.m2m_ctx);
++	return IRQ_HANDLED;
++}
++
++static void t20_vpu_timeout(struct work_struct *work)
++{
++	static const u32 regs[] = { 0x00000, 0x00034, 0x1000c, 0x40000, 0x40110,
++				    0x70070, 0x80048, 0x90000, 0xe0008 };
++	struct t20_vpu *vpu = container_of(work, struct t20_vpu, timeout.work);
++	struct t20_vpu_ctx *ctx;
++	unsigned int i;
++
++	disable_irq(vpu->irq);
++	ctx = t20_vpu_take_running(vpu);
++	if (ctx) {
++		for (i = 0; i < ARRAY_SIZE(regs); i++)
++			dev_err(vpu->dev, "timeout: %05x = %08x\n", regs[i],
++				readl(vpu->regs + regs[i]));
++		writel(0, vpu->regs + VPU_SCH_GLBC);
++		t20_vpu_reset(vpu);
++		ctx->codec->done(ctx, 0);
++		v4l2_m2m_job_finish(vpu->m2m_dev, ctx->fh.m2m_ctx);
++	}
++	enable_irq(vpu->irq);
++}
++
++/* Common parts of the codecs */
++
++void t20_vpu_ctx_init(struct t20_vpu_ctx *ctx, struct t20_vpu *vpu,
++		      struct video_device *vdev, const struct t20_vpu_codec *codec)
++{
++	ctx->vpu = vpu;
++	ctx->codec = codec;
++	v4l2_fh_init(&ctx->fh, vdev);
++}
++
++/* Raw frames in (from the ISP as dma-bufs, or ours); the codec's buffers out */
++int t20_vpu_queue_init(struct t20_vpu_ctx *ctx, struct vb2_queue *src,
++		       struct vb2_queue *dst, const struct vb2_ops *ops,
++		       const struct vb2_mem_ops *dst_mem_ops)
++{
++	int ret;
++
++	src->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++	src->io_modes = VB2_MMAP | VB2_DMABUF;
++	src->drv_priv = ctx;
++	src->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	src->ops = ops;
++	src->mem_ops = &vb2_dma_contig_memops;
++	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src->lock = &ctx->vpu->lock;
++	src->dev = ctx->vpu->dev;
++	ret = vb2_queue_init(src);
++	if (ret)
++		return ret;
++
++	dst->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	dst->io_modes = VB2_MMAP;
++	if (dst_mem_ops == &vb2_vmalloc_memops)
++		dst->io_modes |= VB2_USERPTR;
++	dst->drv_priv = ctx;
++	dst->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	dst->ops = ops;
++	dst->mem_ops = dst_mem_ops;
++	dst->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst->lock = &ctx->vpu->lock;
++	dst->dev = ctx->vpu->dev;
++	return vb2_queue_init(dst);
++}
++
++int t20_vpu_release(struct file *file)
++{
++	struct t20_vpu_ctx *ctx = container_of(file->private_data, struct t20_vpu_ctx, fh);
++	struct t20_vpu *vpu = ctx->vpu;
++
++	mutex_lock(&vpu->lock);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	mutex_unlock(&vpu->lock);
++	v4l2_ctrl_handler_free(ctx->fh.ctrl_handler);
++	v4l2_fh_del(&ctx->fh, file);
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++	return 0;
++}
++
++int t20_vpu_queue_setup(struct vb2_queue *q, u32 size, unsigned int *nbuffers,
++			unsigned int *nplanes, unsigned int sizes[])
++{
++	if (*nplanes)
++		return sizes[0] < size ? -EINVAL : 0;
++	*nplanes = 1;
++	sizes[0] = size;
++	return 0;
++}
++
++void t20_vpu_return_bufs(struct t20_vpu_ctx *ctx, struct vb2_queue *q,
++			 enum vb2_buffer_state state)
++{
++	struct vb2_v4l2_buffer *vb;
++
++	for (;;) {
++		vb = V4L2_TYPE_IS_OUTPUT(q->type) ? v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx) :
++						    v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++		if (!vb)
++			break;
++		v4l2_m2m_buf_done(vb, state);
++	}
++}
++
++void t20_vpu_buf_queue(struct vb2_buffer *vb)
++{
++	struct t20_vpu_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
++}
++
++/* Probe */
++
++static int t20_vpu_runtime_resume(struct device *dev)
++{
++	struct t20_vpu *vpu = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_prepare_enable(vpu->clk_core);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(vpu->clk_gate);
++	if (ret)
++		clk_disable_unprepare(vpu->clk_core);
++	return ret;
++}
++
++static int t20_vpu_runtime_suspend(struct device *dev)
++{
++	struct t20_vpu *vpu = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(vpu->clk_gate);
++	clk_disable_unprepare(vpu->clk_core);
++	return 0;
++}
++
++static int t20_vpu_register(struct t20_vpu *vpu, struct video_device *vdev,
++			    const char *name, const struct v4l2_file_operations *fops,
++			    const struct v4l2_ioctl_ops *ioctl_ops)
++{
++	int ret;
++
++	strscpy(vdev->name, name, sizeof(vdev->name));
++	vdev->fops = fops;
++	vdev->ioctl_ops = ioctl_ops;
++	vdev->release = video_device_release_empty;
++	vdev->lock = &vpu->lock;
++	vdev->v4l2_dev = &vpu->v4l2_dev;
++	vdev->vfl_dir = VFL_DIR_M2M;
++	vdev->device_caps = V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING;
++	video_set_drvdata(vdev, vpu);
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (!ret)
++		dev_info(vpu->dev, "%s at /dev/video%d\n", name, vdev->num);
++	return ret;
++}
++
++static int t20_vpu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct t20_vpu *vpu;
++	struct resource *res;
++	int ret;
++
++	vpu = devm_kzalloc(dev, sizeof(*vpu), GFP_KERNEL);
++	if (!vpu)
++		return -ENOMEM;
++	vpu->dev = dev;
++	mutex_init(&vpu->lock);
++	spin_lock_init(&vpu->hw_lock);
++	INIT_DELAYED_WORK(&vpu->timeout, t20_vpu_timeout);
++	platform_set_drvdata(pdev, vpu);
++
++	vpu->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(vpu->regs))
++		return PTR_ERR(vpu->regs);
++	vpu->phys = res->start;
++	/* In the CGU's register block, so mapped without claiming it */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "srbc");
++	if (!res)
++		return dev_err_probe(dev, -EINVAL, "no srbc register\n");
++	vpu->srbc = devm_ioremap(dev, res->start, resource_size(res));
++	if (!vpu->srbc)
++		return -ENOMEM;
++
++	vpu->clk_gate = devm_clk_get(dev, "vpu");
++	if (IS_ERR(vpu->clk_gate))
++		return dev_err_probe(dev, PTR_ERR(vpu->clk_gate), "vpu clock\n");
++	vpu->clk_core = devm_clk_get(dev, "core");
++	if (IS_ERR(vpu->clk_core))
++		return dev_err_probe(dev, PTR_ERR(vpu->clk_core), "core clock\n");
++	ret = clk_set_rate(vpu->clk_core, T20_VPU_CLK_RATE);
++	if (ret)
++		return dev_err_probe(dev, ret, "core clock rate\n");
++
++	vpu->irq = platform_get_irq(pdev, 0);
++	if (vpu->irq < 0)
++		return vpu->irq;
++	ret = devm_request_threaded_irq(dev, vpu->irq, NULL, t20_vpu_irq, IRQF_ONESHOT,
++					dev_name(dev), vpu);
++	if (ret)
++		return ret;
++
++	/* Buffers from the reserved camera memory, shared with the ISP */
++	ret = of_reserved_mem_device_init(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "no memory-region\n");
++	vpu->desc = dma_alloc_coherent(dev, T20_VPU_DESC_SIZE, &vpu->desc_dma, GFP_KERNEL);
++	if (!vpu->desc) {
++		ret = -ENOMEM;
++		goto err_mem;
++	}
++
++	ret = v4l2_device_register(dev, &vpu->v4l2_dev);
++	if (ret)
++		goto err_desc;
++	vpu->m2m_dev = v4l2_m2m_init(&t20_vpu_m2m_ops);
++	if (IS_ERR(vpu->m2m_dev)) {
++		ret = PTR_ERR(vpu->m2m_dev);
++		goto err_v4l2;
++	}
++
++	/* Clocks on here: without CONFIG_PM runtime PM never turns them on */
++	ret = t20_vpu_runtime_resume(dev);
++	if (ret)
++		goto err_m2m;
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	ret = t20_vpu_register(vpu, &vpu->jpeg_vdev, "t20-jpeg", &t20_vpu_jpeg_fops,
++			       &t20_vpu_jpeg_ioctl_ops);
++	if (ret)
++		goto err_pm;
++	ret = t20_vpu_register(vpu, &vpu->h264_vdev, "t20-h264", &t20_vpu_h264_fops,
++			       &t20_vpu_h264_ioctl_ops);
++	if (ret)
++		goto err_jpeg;
++	return 0;
++
++err_jpeg:
++	video_unregister_device(&vpu->jpeg_vdev);
++err_pm:
++	pm_runtime_disable(dev);
++	if (!pm_runtime_status_suspended(dev))
++		t20_vpu_runtime_suspend(dev);
++	pm_runtime_set_suspended(dev);
++err_m2m:
++	v4l2_m2m_release(vpu->m2m_dev);
++err_v4l2:
++	v4l2_device_unregister(&vpu->v4l2_dev);
++err_desc:
++	dma_free_coherent(dev, T20_VPU_DESC_SIZE, vpu->desc, vpu->desc_dma);
++err_mem:
++	of_reserved_mem_device_release(dev);
++	return ret;
++}
++
++static void t20_vpu_remove(struct platform_device *pdev)
++{
++	struct t20_vpu *vpu = platform_get_drvdata(pdev);
++
++	video_unregister_device(&vpu->h264_vdev);
++	video_unregister_device(&vpu->jpeg_vdev);
++	cancel_delayed_work_sync(&vpu->timeout);
++	pm_runtime_disable(vpu->dev);
++	if (!pm_runtime_status_suspended(vpu->dev))
++		t20_vpu_runtime_suspend(vpu->dev);
++	pm_runtime_set_suspended(vpu->dev);
++	v4l2_m2m_release(vpu->m2m_dev);
++	v4l2_device_unregister(&vpu->v4l2_dev);
++	dma_free_coherent(vpu->dev, T20_VPU_DESC_SIZE, vpu->desc, vpu->desc_dma);
++	of_reserved_mem_device_release(vpu->dev);
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(t20_vpu_pm_ops, t20_vpu_runtime_suspend,
++				 t20_vpu_runtime_resume, NULL);
++
++static const struct of_device_id t20_vpu_of_match[] = {
++	{ .compatible = "ingenic,t20-vpu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, t20_vpu_of_match);
++
++static struct platform_driver t20_vpu_driver = {
++	.driver = {
++		.name = "t20-vpu",
++		.of_match_table = t20_vpu_of_match,
++		.pm = pm_ptr(&t20_vpu_pm_ops),
++	},
++	.probe = t20_vpu_probe,
++	.remove = t20_vpu_remove,
++};
++module_platform_driver(t20_vpu_driver);
++
++MODULE_DESCRIPTION("Ingenic T20 VPU JPEG and H.264 encoders");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/ingenic/t20-vpu-jpeg.c b/drivers/media/platform/ingenic/t20-vpu-jpeg.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/platform/ingenic/t20-vpu-jpeg.c
+@@ -0,0 +1,543 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Ingenic T20 VPU JPEG encoder: NV12 in, baseline JFIF (4:2:0) out.
++ *
++ * The descriptor list loads the Huffman and quantisation tables and sets up
++ * the JPEG codec (JPGC), then the encoder front end (EFE), which reads the
++ * frame one macroblock at a time into the VPU's internal RAM for the JPGC.
++ * The sequence, the registers and the Huffman encoder table are from
++ * Ingenic's GPL-2.0 kernel drivers for the same VPU blocks (the X1000 JPEG
++ * driver and the T31 helix codec driver, Copyright (C) 2012-2014 Ingenic
++ * Semiconductor Co., Ltd.). The V4L2 side, the JFIF headers and the
++ * quantisation tables (from a quality setting) are new.
++ */
++
++#include <linux/io.h>
++#include <linux/slab.h>
++
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-jpeg.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "t20-vpu.h"
++
++/* Encoder front end */
++#define VPU_EFE_CTRL		0x40000
++#define EFE_ID_JPEG		(1 << 14)
++#define EFE_PLANE_NV12		(2 << 2)
++#define EFE_EN			BIT(1)
++#define EFE_RUN			BIT(0)
++#define VPU_EFE_GEOM		0x40004		/* last MB row << 16 | last MB column */
++#define VPU_EFE_RAWY_SBA	0x40010
++#define VPU_EFE_RAWC_SBA	0x40014
++#define VPU_EFE_RAW_DBA		0x40030
++#define VPU_EFE_RAWV_SBA	0x40034
++#define VPU_EFE_RAW_STRD	0x40038		/* Y stride << 16 | C stride */
++
++/* JPEG codec */
++#define VPU_JPGC_TRIG		0xe0000
++#define JPGC_CORE_OPEN		BIT(0)
++#define JPGC_BS_TRIG		BIT(1)
++#define JPGC_PP_TRIG		BIT(2)
++#define VPU_JPGC_GLBI		0xe0004
++#define JPGC_EN			BIT(0)
++#define JPGC_NCOL_3		(2 << 4)	/* components - 1 */
++#define JPGC_EFE		BIT(8)		/* MCUs from the EFE */
++#define JPGC_MCU_420		(0x0a << 16)	/* Y 2x2 blocks, Cb and Cr 1x1 */
++#define VPU_JPGC_STAT		0xe0008
++#define JPGC_STAT_ENDF		BIT(31)
++#define JPGC_STAT_SIZE		GENMASK(23, 0)	/* bitstream bytes */
++#define VPU_JPGC_BSA		0xe000c
++#define VPU_JPGC_P0A		0xe0010
++#define VPU_JPGC_NMCU		0xe0028
++#define VPU_JPGC_NRSM		0xe002c
++#define VPU_JPGC_PC(n)		(0xe0030 + 4 * (n))
++/* Component: blocks - 1 << 4 | table << 2 | AC table << 1 | DC table */
++#define JPGC_PC_Y		0x30
++#define JPGC_PC_C		0x07
++#define VPU_JPGC_QMEM		0xe1400
++#define VPU_JPGC_HUFE		0xe1800
++
++#define T20_JPEG_MIN_SIZE	32
++#define T20_JPEG_MAX_SIZE	4096
++#define T20_JPEG_QMEM_LEN	256
++#define T20_JPEG_HEADER_ALIGN	256	/* the bitstream address */
++
++/*
++ * The JPGC's Huffman encoder table: the codes of ITU-T T.81 Annex K
++ * (tables K.3-K.6), (length - 1) << 8 | the low 8 bits of the code: luma
++ * AC, chroma AC, luma DC, chroma DC.
++ */
++static const u16 t20_jpeg_huffenc[384] = {
++	0x100, 0x101, 0x204, 0x30b, 0x41a, 0x678, 0x7f8, 0x9f6,
++	0xf82, 0xf83, 0x30c, 0x41b, 0x679, 0x8f6, 0xaf6, 0xf84,
++	0xf85, 0xf86, 0xf87, 0xf88, 0x41c, 0x7f9, 0x9f7, 0xbf4,
++	0xf89, 0xf8a, 0xf8b, 0xf8c, 0xf8d, 0xf8e, 0x53a, 0x8f7,
++	0xbf5, 0xf8f, 0xf90, 0xf91, 0xf92, 0xf93, 0xf94, 0xf95,
++	0x53b, 0x9f8, 0xf96, 0xf97, 0xf98, 0xf99, 0xf9a, 0xf9b,
++	0xf9c, 0xf9d, 0x67a, 0xaf7, 0xf9e, 0xf9f, 0xfa0, 0xfa1,
++	0xfa2, 0xfa3, 0xfa4, 0xfa5, 0x67b, 0xbf6, 0xfa6, 0xfa7,
++	0xfa8, 0xfa9, 0xfaa, 0xfab, 0xfac, 0xfad, 0x7fa, 0xbf7,
++	0xfae, 0xfaf, 0xfb0, 0xfb1, 0xfb2, 0xfb3, 0xfb4, 0xfb5,
++	0x8f8, 0xec0, 0xfb6, 0xfb7, 0xfb8, 0xfb9, 0xfba, 0xfbb,
++	0xfbc, 0xfbd, 0x8f9, 0xfbe, 0xfbf, 0xfc0, 0xfc1, 0xfc2,
++	0xfc3, 0xfc4, 0xfc5, 0xfc6, 0x8fa, 0xfc7, 0xfc8, 0xfc9,
++	0xfca, 0xfcb, 0xfcc, 0xfcd, 0xfce, 0xfcf, 0x9f9, 0xfd0,
++	0xfd1, 0xfd2, 0xfd3, 0xfd4, 0xfd5, 0xfd6, 0xfd7, 0xfd8,
++	0x9fa, 0xfd9, 0xfda, 0xfdb, 0xfdc, 0xfdd, 0xfde, 0xfdf,
++	0xfe0, 0xfe1, 0xaf8, 0xfe2, 0xfe3, 0xfe4, 0xfe5, 0xfe6,
++	0xfe7, 0xfe8, 0xfe9, 0xfea, 0xfeb, 0xfec, 0xfed, 0xfee,
++	0xfef, 0xff0, 0xff1, 0xff2, 0xff3, 0xff4, 0xff5, 0xff6,
++	0xff7, 0xff8, 0xff9, 0xffa, 0xffb, 0xffc, 0xffd, 0xffe,
++	0x30a, 0xaf9, 0xfff, 0xfff, 0xfff, 0xfff, 0xfff, 0xfff,
++	0xfd0, 0xfd1, 0xfd2, 0xfd3, 0xfd4, 0xfd5, 0xfd6, 0xfd7,
++	0x101, 0x204, 0x30a, 0x418, 0x419, 0x538, 0x678, 0x8f4,
++	0x9f6, 0xbf4, 0x30b, 0x539, 0x7f6, 0x8f5, 0xaf6, 0xbf5,
++	0xf88, 0xf89, 0xf8a, 0xf8b, 0x41a, 0x7f7, 0x9f7, 0xbf6,
++	0xec2, 0xf8c, 0xf8d, 0xf8e, 0xf8f, 0xf90, 0x41b, 0x7f8,
++	0x9f8, 0xbf7, 0xf91, 0xf92, 0xf93, 0xf94, 0xf95, 0xf96,
++	0x53a, 0x8f6, 0xf97, 0xf98, 0xf99, 0xf9a, 0xf9b, 0xf9c,
++	0xf9d, 0xf9e, 0x53b, 0x9f9, 0xf9f, 0xfa0, 0xfa1, 0xfa2,
++	0xfa3, 0xfa4, 0xfa5, 0xfa6, 0x679, 0xaf7, 0xfa7, 0xfa8,
++	0xfa9, 0xfaa, 0xfab, 0xfac, 0xfad, 0xfae, 0x67a, 0xaf8,
++	0xfaf, 0xfb0, 0xfb1, 0xfb2, 0xfb3, 0xfb4, 0xfb5, 0xfb6,
++	0x7f9, 0xfb7, 0xfb8, 0xfb9, 0xfba, 0xfbb, 0xfbc, 0xfbd,
++	0xfbe, 0xfbf, 0x8f7, 0xfc0, 0xfc1, 0xfc2, 0xfc3, 0xfc4,
++	0xfc5, 0xfc6, 0xfc7, 0xfc8, 0x8f8, 0xfc9, 0xfca, 0xfcb,
++	0xfcc, 0xfcd, 0xfce, 0xfcf, 0xfd0, 0xfd1, 0x8f9, 0xfd2,
++	0xfd3, 0xfd4, 0xfd5, 0xfd6, 0xfd7, 0xfd8, 0xfd9, 0xfda,
++	0x8fa, 0xfdb, 0xfdc, 0xfdd, 0xfde, 0xfdf, 0xfe0, 0xfe1,
++	0xfe2, 0xfe3, 0xaf9, 0xfe4, 0xfe5, 0xfe6, 0xfe7, 0xfe8,
++	0xfe9, 0xfea, 0xfeb, 0xfec, 0xde0, 0xfed, 0xfee, 0xfef,
++	0xff0, 0xff1, 0xff2, 0xff3, 0xff4, 0xff5, 0xec3, 0xff6,
++	0xff7, 0xff8, 0xff9, 0xffa, 0xffb, 0xffc, 0xffd, 0xffe,
++	0x100, 0x9fa, 0xfff, 0xfff, 0xfff, 0xfff, 0xfff, 0xfff,
++	0xfd0, 0xfd1, 0xfd2, 0xfd3, 0xfd4, 0xfd5, 0xfd6, 0xfd7,
++	0x100, 0x202, 0x203, 0x204, 0x205, 0x206, 0x30e, 0x41e,
++	0x53e, 0x67e, 0x7fe, 0x8fe, 0xfff, 0xfff, 0xfff, 0xfff,
++	0x100, 0x101, 0x102, 0x206, 0x30e, 0x41e, 0x53e, 0x67e,
++	0x7fe, 0x8fe, 0x9fe, 0xafe, 0xfff, 0xfff, 0xfff, 0xfff,
++};
++
++struct t20_jpeg_ctx {
++	struct t20_vpu_ctx vpu_ctx;
++	struct v4l2_ctrl_handler ctrls;
++	struct v4l2_pix_format out_fmt;	/* NV12 */
++	struct v4l2_pix_format cap_fmt;	/* JPEG */
++	u8 dqt[2][64];			/* luma, chroma; zigzag order */
++	u32 header_len;
++};
++
++static inline struct t20_jpeg_ctx *to_jpeg_ctx(struct t20_vpu_ctx *ctx)
++{
++	return container_of(ctx, struct t20_jpeg_ctx, vpu_ctx);
++}
++
++static inline struct t20_jpeg_ctx *file_to_ctx(struct file *file)
++{
++	return container_of(file->private_data, struct t20_jpeg_ctx, vpu_ctx.fh);
++}
++
++/* Tables and headers */
++
++/* The IJG scaling of the T.81 Annex K tables; at least 2 (see t20_jpeg_qmem) */
++static void t20_jpeg_set_quality(struct t20_jpeg_ctx *ctx, int quality)
++{
++	const u8 *ref[2] = { v4l2_jpeg_ref_table_luma_qt, v4l2_jpeg_ref_table_chroma_qt };
++	int scale = quality < 50 ? 5000 / quality : 200 - 2 * quality;
++	int t, i, q;
++
++	for (t = 0; t < 2; t++) {
++		for (i = 0; i < 64; i++) {
++			q = (ref[t][v4l2_jpeg_zigzag_scan_index[i]] * scale + 50) / 100;
++			ctx->dqt[t][i] = clamp(q, 2, 255);
++		}
++	}
++}
++
++/*
++ * A quantisation memory entry: the reciprocal of q as s << 11 | 2^(11 + s) / q
++ * with an 11-bit mantissa (the vendor's tables all follow this), the largest s
++ * that keeps the mantissa in 11 bits. q = 1 would not fit, hence q >= 2.
++ */
++static u32 t20_jpeg_qmem(unsigned int q)
++{
++	unsigned int s = fls(q - 1) - 1;
++
++	return s << 11 | DIV_ROUND_CLOSEST(1U << (11 + s), q);
++}
++
++static u8 *t20_jpeg_put_marker(u8 *p, u8 marker, unsigned int len)
++{
++	*p++ = 0xff;
++	*p++ = marker;
++	if (len) {
++		*p++ = len >> 8;
++		*p++ = len;
++	}
++	return p;
++}
++
++/*
++ * SOI, DQT, SOF0, DHT and SOS, padded with fill bytes (0xff, allowed before
++ * a marker) so that the bitstream starts on a 256-byte boundary
++ */
++static u32 t20_jpeg_write_header(struct t20_jpeg_ctx *ctx, u8 *buf)
++{
++	static const struct {
++		u8 class_id;
++		const u8 *table;
++		unsigned int len;
++	} dht[] = {
++		{ 0x00, v4l2_jpeg_ref_table_luma_dc_ht, V4L2_JPEG_REF_HT_DC_LEN },
++		{ 0x10, v4l2_jpeg_ref_table_luma_ac_ht, V4L2_JPEG_REF_HT_AC_LEN },
++		{ 0x01, v4l2_jpeg_ref_table_chroma_dc_ht, V4L2_JPEG_REF_HT_DC_LEN },
++		{ 0x11, v4l2_jpeg_ref_table_chroma_ac_ht, V4L2_JPEG_REF_HT_AC_LEN },
++	};
++	static const u8 sos[] = { 3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0 };
++	u32 w = ctx->out_fmt.width, h = ctx->out_fmt.height;
++	u8 *p = buf;
++	unsigned int i, len;
++
++	p = t20_jpeg_put_marker(p, 0xd8, 0);			/* SOI */
++	for (i = 0; i < 2; i++) {				/* DQT */
++		p = t20_jpeg_put_marker(p, 0xdb, 2 + 1 + 64);
++		*p++ = i;
++		memcpy(p, ctx->dqt[i], 64);
++		p += 64;
++	}
++	p = t20_jpeg_put_marker(p, 0xc0, 2 + 6 + 3 * 3);	/* SOF0 */
++	*p++ = 8;
++	*p++ = h >> 8;
++	*p++ = h;
++	*p++ = w >> 8;
++	*p++ = w;
++	*p++ = 3;
++	for (i = 1; i <= 3; i++) {
++		*p++ = i;
++		*p++ = i == 1 ? 0x22 : 0x11;
++		*p++ = i == 1 ? 0 : 1;
++	}
++	for (i = 0; i < ARRAY_SIZE(dht); i++) {			/* DHT */
++		p = t20_jpeg_put_marker(p, 0xc4, 2 + 1 + dht[i].len);
++		*p++ = dht[i].class_id;
++		memcpy(p, dht[i].table, dht[i].len);
++		p += dht[i].len;
++	}
++	len = 2 + 2 + sizeof(sos);
++	i = ALIGN(p - buf + len, T20_JPEG_HEADER_ALIGN) - len;
++	memset(p, 0xff, buf + i - p);
++	p = t20_jpeg_put_marker(buf + i, 0xda, 2 + sizeof(sos));	/* SOS */
++	memcpy(p, sos, sizeof(sos));
++	return p + sizeof(sos) - buf;
++}
++
++/* Job */
++
++static void t20_jpeg_run(struct t20_vpu_ctx *vctx)
++{
++	struct t20_jpeg_ctx *ctx = to_jpeg_ctx(vctx);
++	struct t20_vpu *vpu = vctx->vpu;
++	struct v4l2_pix_format *f = &ctx->out_fmt;
++	u32 mbw = DIV_ROUND_UP(f->width, 16), mbh = DIV_ROUND_UP(f->height, 16);
++	u32 vram = vpu->phys + VPU_VRAM;
++	struct vb2_v4l2_buffer *src, *dst;
++	dma_addr_t raw, bs;
++	u32 *d = vpu->desc;
++	unsigned int i;
++
++	src = v4l2_m2m_next_src_buf(vctx->fh.m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(vctx->fh.m2m_ctx);
++	ctx->header_len = t20_jpeg_write_header(ctx, vb2_plane_vaddr(&dst->vb2_buf, 0));
++	raw = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
++	bs = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0) + ctx->header_len;
++
++	d = t20_vpu_acfg(d, VPU_TCSM_FLUSH, 0);
++	d = t20_vpu_acfg(d, VPU_JPGC_GLBI, JPGC_EN);		/* core clock on */
++	for (i = 0; i < ARRAY_SIZE(t20_jpeg_huffenc); i++)
++		d = t20_vpu_acfg(d, VPU_JPGC_HUFE + 4 * i, t20_jpeg_huffenc[i]);
++	for (i = 0; i < T20_JPEG_QMEM_LEN; i++)
++		d = t20_vpu_acfg(d, VPU_JPGC_QMEM + 4 * i,
++				 i < 128 ? t20_jpeg_qmem(ctx->dqt[i / 64][i % 64]) : 0);
++
++	d = t20_vpu_acfg(d, VPU_JPGC_STAT, 0);
++	d = t20_vpu_acfg(d, VPU_JPGC_BSA, bs);
++	d = t20_vpu_acfg(d, VPU_JPGC_P0A, vram);
++	d = t20_vpu_acfg(d, VPU_JPGC_NMCU, mbw * mbh - 1);
++	d = t20_vpu_acfg(d, VPU_JPGC_NRSM, 0);
++	d = t20_vpu_acfg(d, VPU_JPGC_PC(0), JPGC_PC_Y);
++	d = t20_vpu_acfg(d, VPU_JPGC_PC(1), JPGC_PC_C);
++	d = t20_vpu_acfg(d, VPU_JPGC_PC(2), JPGC_PC_C);
++	d = t20_vpu_acfg(d, VPU_JPGC_GLBI, JPGC_MCU_420 | JPGC_NCOL_3 | JPGC_EFE | JPGC_EN);
++	d = t20_vpu_acfg(d, VPU_JPGC_TRIG, JPGC_BS_TRIG | JPGC_PP_TRIG | JPGC_CORE_OPEN);
++
++	d = t20_vpu_acfg(d, VPU_EFE_GEOM, (mbh - 1) << 16 | (mbw - 1));
++	d = t20_vpu_acfg(d, VPU_EFE_RAWY_SBA, raw);
++	d = t20_vpu_acfg(d, VPU_EFE_RAWC_SBA, raw + f->bytesperline * f->height);
++	d = t20_vpu_acfg(d, VPU_EFE_RAWV_SBA, 0);
++	d = t20_vpu_acfg(d, VPU_EFE_RAW_STRD, f->bytesperline << 16 | f->bytesperline);
++	d = t20_vpu_acfg(d, VPU_EFE_RAW_DBA, vram);
++	d = t20_vpu_acfg(d, VPU_EFE_CTRL, EFE_PLANE_NV12 | EFE_ID_JPEG | EFE_EN | EFE_RUN);
++	t20_vpu_acfg_end(vpu, d);
++}
++
++static void t20_jpeg_done(struct t20_vpu_ctx *vctx, u32 stat)
++{
++	struct t20_jpeg_ctx *ctx = to_jpeg_ctx(vctx);
++	struct t20_vpu *vpu = vctx->vpu;
++	enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
++	struct vb2_v4l2_buffer *src, *dst;
++	u32 jstat = readl(vpu->regs + VPU_JPGC_STAT);
++	u32 bs_len = jstat & JPGC_STAT_SIZE;
++	u8 *p;
++
++	writel(jstat & ~JPGC_STAT_ENDF, vpu->regs + VPU_JPGC_STAT);
++	if ((stat & SCH_STAT_ENDF) && (stat & SCH_STAT_JPGEND)) {
++		if (ctx->header_len + bs_len + 2 <= ctx->cap_fmt.sizeimage)
++			state = VB2_BUF_STATE_DONE;
++		else
++			dev_err(vpu->dev, "JPEG: bitstream overflow (%u bytes)\n", bs_len);
++	} else if (stat) {
++		dev_err(vpu->dev, "JPEG: encode failed: status %#x\n", stat);
++	}
++
++	src = v4l2_m2m_src_buf_remove(vctx->fh.m2m_ctx);
++	dst = v4l2_m2m_dst_buf_remove(vctx->fh.m2m_ctx);
++	if (dst && state == VB2_BUF_STATE_DONE) {
++		/* EOI after the bitstream */
++		p = vb2_plane_vaddr(&dst->vb2_buf, 0) + ctx->header_len + bs_len;
++		p[0] = 0xff;
++		p[1] = 0xd9;
++		vb2_set_plane_payload(&dst->vb2_buf, 0, ctx->header_len + bs_len + 2);
++	}
++	if (src && dst)
++		v4l2_m2m_buf_copy_metadata(src, dst, true);
++	if (src)
++		v4l2_m2m_buf_done(src, state);
++	if (dst)
++		v4l2_m2m_buf_done(dst, state);
++}
++
++static const struct t20_vpu_codec t20_jpeg_codec = {
++	.run = t20_jpeg_run,
++	.done = t20_jpeg_done,
++};
++
++/* Formats */
++
++static void t20_jpeg_fill_fmt(struct v4l2_pix_format *out, struct v4l2_pix_format *cap,
++			      u32 width, u32 height)
++{
++	/* The EFE reads whole macroblocks: whole ones across, rows past the end */
++	out->width = clamp_t(u32, ALIGN(width, 16), T20_JPEG_MIN_SIZE, T20_JPEG_MAX_SIZE);
++	out->height = clamp_t(u32, ALIGN(height, 2), T20_JPEG_MIN_SIZE, T20_JPEG_MAX_SIZE);
++	out->pixelformat = V4L2_PIX_FMT_NV12;
++	out->field = V4L2_FIELD_NONE;
++	out->bytesperline = out->width;
++	out->sizeimage = out->bytesperline * ALIGN(out->height, 16) * 3 / 2;
++	/* JFIF: full-range BT.601, as the ISP writes by default */
++	out->colorspace = V4L2_COLORSPACE_JPEG;
++	out->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	out->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	out->xfer_func = V4L2_XFER_FUNC_SRGB;
++
++	*cap = *out;
++	cap->pixelformat = V4L2_PIX_FMT_JPEG;
++	cap->bytesperline = 0;
++	cap->sizeimage = out->width * out->height + 4096;
++	cap->colorspace = V4L2_COLORSPACE_JPEG;
++}
++
++static int t20_jpeg_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, "t20-jpeg", sizeof(cap->driver));
++	strscpy(cap->card, "Ingenic T20 JPEG encoder", sizeof(cap->card));
++	return 0;
++}
++
++static int t20_jpeg_enum_fmt_out(struct file *file, void *fh, struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_NV12;
++	return 0;
++}
++
++static int t20_jpeg_enum_fmt_cap(struct file *file, void *fh, struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_JPEG;
++	f->flags = V4L2_FMT_FLAG_COMPRESSED;
++	return 0;
++}
++
++static int t20_jpeg_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_jpeg_ctx *ctx = file_to_ctx(file);
++
++	f->fmt.pix = V4L2_TYPE_IS_OUTPUT(f->type) ? ctx->out_fmt : ctx->cap_fmt;
++	return 0;
++}
++
++/* The size comes from the output (raw) side; the capture side follows it */
++static int t20_jpeg_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_jpeg_ctx *ctx = file_to_ctx(file);
++	struct v4l2_pix_format out = ctx->out_fmt, cap = ctx->cap_fmt;
++
++	if (V4L2_TYPE_IS_OUTPUT(f->type))
++		t20_jpeg_fill_fmt(&out, &cap, f->fmt.pix.width, f->fmt.pix.height);
++	f->fmt.pix = V4L2_TYPE_IS_OUTPUT(f->type) ? out : cap;
++	return 0;
++}
++
++static int t20_jpeg_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_jpeg_ctx *ctx = file_to_ctx(file);
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->vpu_ctx.fh.m2m_ctx;
++
++	if (vb2_is_busy(v4l2_m2m_get_vq(m2m_ctx, f->type)))
++		return -EBUSY;
++	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++		if (vb2_is_busy(v4l2_m2m_get_vq(m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE)))
++			return -EBUSY;
++		t20_jpeg_fill_fmt(&ctx->out_fmt, &ctx->cap_fmt, f->fmt.pix.width,
++				  f->fmt.pix.height);
++	}
++	return t20_jpeg_g_fmt(file, fh, f);
++}
++
++const struct v4l2_ioctl_ops t20_vpu_jpeg_ioctl_ops = {
++	.vidioc_querycap = t20_jpeg_querycap,
++	.vidioc_enum_fmt_vid_out = t20_jpeg_enum_fmt_out,
++	.vidioc_enum_fmt_vid_cap = t20_jpeg_enum_fmt_cap,
++	.vidioc_g_fmt_vid_out = t20_jpeg_g_fmt,
++	.vidioc_g_fmt_vid_cap = t20_jpeg_g_fmt,
++	.vidioc_try_fmt_vid_out = t20_jpeg_try_fmt,
++	.vidioc_try_fmt_vid_cap = t20_jpeg_try_fmt,
++	.vidioc_s_fmt_vid_out = t20_jpeg_s_fmt,
++	.vidioc_s_fmt_vid_cap = t20_jpeg_s_fmt,
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/* Queues */
++
++static int t20_jpeg_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
++				unsigned int *nplanes, unsigned int sizes[],
++				struct device *alloc_devs[])
++{
++	struct t20_jpeg_ctx *ctx = vb2_get_drv_priv(q);
++
++	return t20_vpu_queue_setup(q, V4L2_TYPE_IS_OUTPUT(q->type) ? ctx->out_fmt.sizeimage :
++								    ctx->cap_fmt.sizeimage,
++				   nbuffers, nplanes, sizes);
++}
++
++static int t20_jpeg_buf_prepare(struct vb2_buffer *vb)
++{
++	struct t20_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct v4l2_pix_format *f = &ctx->out_fmt;
++
++	/* NV12 with the chroma right after the luma, as the ISP writes it */
++	if (V4L2_TYPE_IS_OUTPUT(vb->type))
++		return vb2_plane_size(vb, 0) < f->bytesperline * f->height * 3 / 2 ?
++		       -EINVAL : 0;
++	return vb2_plane_size(vb, 0) < ctx->cap_fmt.sizeimage ? -EINVAL : 0;
++}
++
++static void t20_jpeg_stop_streaming(struct vb2_queue *q)
++{
++	t20_vpu_return_bufs(vb2_get_drv_priv(q), q, VB2_BUF_STATE_ERROR);
++}
++
++static const struct vb2_ops t20_jpeg_vb2_ops = {
++	.queue_setup = t20_jpeg_queue_setup,
++	.buf_prepare = t20_jpeg_buf_prepare,
++	.buf_queue = t20_vpu_buf_queue,
++	.stop_streaming = t20_jpeg_stop_streaming,
++};
++
++/* The header is written through the kernel mapping, the bitstream by the VPU */
++static int t20_jpeg_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
++{
++	return t20_vpu_queue_init(priv, src, dst, &t20_jpeg_vb2_ops, &vb2_dma_contig_memops);
++}
++
++/* Controls */
++
++static int t20_jpeg_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct t20_jpeg_ctx *ctx = container_of(ctrl->handler, struct t20_jpeg_ctx, ctrls);
++
++	if (ctrl->id != V4L2_CID_JPEG_COMPRESSION_QUALITY)
++		return -EINVAL;
++	t20_jpeg_set_quality(ctx, ctrl->val);
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops t20_jpeg_ctrl_ops = {
++	.s_ctrl = t20_jpeg_s_ctrl,
++};
++
++/* File operations */
++
++static int t20_jpeg_open(struct file *file)
++{
++	struct t20_vpu *vpu = video_drvdata(file);
++	struct t20_jpeg_ctx *ctx;
++	struct v4l2_fh *fh;
++	int ret;
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	t20_vpu_ctx_init(&ctx->vpu_ctx, vpu, &vpu->jpeg_vdev, &t20_jpeg_codec);
++	fh = &ctx->vpu_ctx.fh;
++	t20_jpeg_fill_fmt(&ctx->out_fmt, &ctx->cap_fmt, 1920, 1080);
++
++	v4l2_ctrl_handler_init(&ctx->ctrls, 1);
++	v4l2_ctrl_new_std(&ctx->ctrls, &t20_jpeg_ctrl_ops,
++			  V4L2_CID_JPEG_COMPRESSION_QUALITY, 1, 100, 1, 80);
++	if (ctx->ctrls.error) {
++		ret = ctx->ctrls.error;
++		goto err_ctrls;
++	}
++	v4l2_ctrl_handler_setup(&ctx->ctrls);
++	fh->ctrl_handler = &ctx->ctrls;
++
++	fh->m2m_ctx = v4l2_m2m_ctx_init(vpu->m2m_dev, ctx, t20_jpeg_queue_init);
++	if (IS_ERR(fh->m2m_ctx)) {
++		ret = PTR_ERR(fh->m2m_ctx);
++		goto err_ctrls;
++	}
++	v4l2_fh_add(fh, file);
++	return 0;
++
++err_ctrls:
++	v4l2_ctrl_handler_free(&ctx->ctrls);
++	v4l2_fh_exit(fh);
++	kfree(ctx);
++	return ret;
++}
++
++const struct v4l2_file_operations t20_vpu_jpeg_fops = {
++	.owner = THIS_MODULE,
++	.open = t20_jpeg_open,
++	.release = t20_vpu_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};
+diff --git a/drivers/media/platform/ingenic/t20-vpu-h264.c b/drivers/media/platform/ingenic/t20-vpu-h264.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/media/platform/ingenic/t20-vpu-h264.c
+@@ -0,0 +1,1338 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Ingenic T20 VPU H.264 encoder: NV12 in, H.264 Main profile (CABAC,
++ * I and P frames, one slice per frame) out.
++ *
++ * The VPU encodes the macroblocks of a slice: the encoder front end (EFE)
++ * reads the frame, motion estimation (MCE) searches the previous
++ * reconstructed frame, the matrix unit (VMAU) decides the macroblock modes,
++ * transforms and quantises, the deblocking filter (DBLK) writes the
++ * reconstructed frame (the next frame's reference) and the stream encoder
++ * (SDE) writes the CABAC slice data. The scheduler chains the blocks one
++ * macroblock at a time. The software writes the parameter sets and the
++ * slice header.
++ *
++ * The T20's encoder is Ingenic's "Helix": the register names and fields are
++ * those of Ingenic's GPL-2.0 Helix encoder (T31 SDK ingenic-vcodec,
++ * helix.h and helix_x264_enc.c, Copyright (C) Ingenic Semiconductor Co.,
++ * Ltd.), the motion filters its GPL-2.0 IntpFMT table, the CABAC state
++ * table that of its GPL-2.0 x264 port (XBOMX). The T20's register values
++ * and their order are documented in docs/t20-isp-hardware.md. The CABAC
++ * initialisation values (ITU-T H.264 tables 9-12 to 9-33) are from x264
++ * (GPL-2.0, Copyright (C) 2003-2008 x264 project). The V4L2 side, the
++ * bitstream headers and the rate control are new.
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-vmalloc.h>
++
++#include "t20-vpu.h"
++
++/* Scheduler: channels 1 MCE, 2 VMAU, 3 DBLK, 4 SDE */
++#define VPU_SCH_SCHC		0x00060
++#define VPU_SCH_BND		0x00064
++#define VPU_SCH_SCHG0		0x00068
++#define VPU_SCH_SCHG1		0x0006c
++#define VPU_SCH_SCHE(n)		(0x00070 + 4 * ((n) - 1))	/* channels 1-4 */
++#define SCH_SCHC_P		BIT(2)		/* channel 1 (motion) in P frames */
++#define SCH_SCHC_H264E		(BIT(27) | BIT(26) | BIT(19) | BIT(18) | BIT(10))
++#define SCH_BND_H264E		(0x9 << 28 | 0x7 << 24 | 0x8 << 20 | 0x5 << 16 | \
++				 (16 - 1) << 8 | BIT(7) | BIT(6) | BIT(3) | \
++				 BIT(2) | BIT(1))
++#define SCH_BND_P		BIT(0)
++
++/* Encoder front end */
++#define VPU_EFE_CTRL		0x40000
++#define EFE_TSE			BIT(31)
++#define EFE_FMVP		BIT(30)
++#define EFE_X264_QP(qp)		((qp) << 8)
++#define EFE_DBLK_EN		BIT(5)
++#define EFE_SLICE_P		BIT(4)
++#define EFE_PLANE_NV12		(2 << 2)
++#define EFE_EN			BIT(1)
++#define EFE_RUN			BIT(0)
++#define VPU_EFE_GEOM		0x40004	/* first MB row << 24 | last row << 8 | last column */
++#define VPU_EFE_COEF_BA		0x4000c
++#define VPU_EFE_RAWY_SBA	0x40010
++#define VPU_EFE_RAWC_SBA	0x40014
++#define VPU_EFE_TOPMV_BA	0x40018
++#define VPU_EFE_TOPPA_BA	0x4001c
++#define VPU_EFE_MECHN_BA	0x40020
++#define VPU_EFE_MAUCHN_BA	0x40024
++#define VPU_EFE_DBLKCHN_BA	0x40028
++#define VPU_EFE_SDECHN_BA	0x4002c
++#define VPU_EFE_RAW_DBA		0x40030
++#define VPU_EFE_RAWV_SBA	0x40034
++#define VPU_EFE_RAW_STRD	0x40038	/* Y stride << 16 | C stride */
++#define VPU_EFE_ROI_MAX_QP	0x40040
++#define VPU_EFE_ROI_BASE(n)	(0x40044 + 4 * (n))	/* 2 words: regions 0-3, 4-7 */
++#define VPU_EFE_ROI_POS(n)	(0x4004c + 4 * (n))	/* 8 words */
++#define VPU_EFE_QP_GEN_TAB	0x4006c	/* MB QP table: on << 31 | words << 20 | address */
++#define VPU_EFE_SSAD		0x40108
++#define VPU_EFE_DCS		0x4010c
++#define EFE_DCS_T20		(3 << 24 | 4 << 20)	/* other thread 3, RT 4 */
++#define VPU_EFE_CQP_OFST	0x40120	/* chroma QP offset */
++
++/* Motion estimation and compensation (P frames) */
++#define VPU_MCE_GLB_CTRL	0x50000
++#define MCE_GLB_CTRL_RM		BIT(4)
++#define MCE_GLB_CTRL_INIT	BIT(0)
++#define VPU_MCE_COMP_CTRL	0x50010
++/* Chroma: 2 taps, bilinear, eighth pel; luma: 6 taps, quarter pel */
++#define MCE_COMP_H264		(BIT(31) | 2 << 18 | 2 << 16 | BIT(15) | 2 << 4 | 1)
++#define VPU_MCE_ESTI_CTRL	0x50040
++/*
++ * Lambda scale 8, top/left MV predictors, 63 search steps, quarter and half
++ * pel refinement, 16x16 partitions
++ */
++#define MCE_ESTI_H264		(8 << 28 | BIT(26) | 3 << 24 | 63 << 16 | \
++				 1 << 14 | 1 << 12 | BIT(3))
++#define VPU_MCE_MRGI		0x50044
++#define VPU_MCE_MVR		0x50048	/* MV range, quarter pels: y << 16 | x */
++#define MCE_MVR_500		(2000 << 16 | 2000)
++#define VPU_MCE_FSC		0x5004c
++#define VPU_MCE_FRM_SIZE	0x50060	/* height - 1 << 16 | width - 1 */
++#define VPU_MCE_FRM_STRD	0x50064	/* C << 16 | Y */
++#define VPU_MCE_SLC_SPOS	0x50068
++#define VPU_MCE_RLUT		0x50800	/* reference Y, C */
++#define VPU_MCE_ILUT_Y		0x50900	/* 2 words a position */
++#define VPU_MCE_ILUT_C		0x50980
++#define VPU_MCE_CLUT_Y		0x50a00	/* 4 words a position */
++#define VPU_MCE_CLUT_C		0x50b00
++#define VPU_MCE_TMV_BA		0x50104
++#define VPU_MCE_CHN_SYNC	0x50108
++#define VPU_MCE_CHN_BA		0x5010c
++
++/* Deblocking filter */
++#define VPU_DBLK_DHA		0x70000
++#define VPU_DBLK_TRIG		0x70060
++#define DBLK_RESET		BIT(2)
++#define DBLK_SLICE_RUN		BIT(3)
++#define VPU_DBLK_CTRL		0x70064
++#define DBLK_FILTER		BIT(0)
++#define VPU_DBLK_VTR		0x70068
++#define DBLK_VTR_P		(1 << 3)
++#define DBLK_VTR_H264		1
++#define VPU_DBLK_GSIZE		0x70074
++#define VPU_DBLK_GENDA		0x70078
++#define VPU_DBLK_GPOS		0x7007c
++#define VPU_DBLK_GPIC_STR	0x70080	/* C << 16 | Y, bytes a macroblock row */
++#define VPU_DBLK_GPIC_YA	0x70084
++#define VPU_DBLK_GPIC_CA	0x70088
++#define VPU_DBLK_GP_ENDA	0x7008c
++
++/* Matrix arithmetic unit: transform, quantisation and mode decision */
++#define VPU_VMAU_NCCHN_ADDR	0x8000c
++#define VPU_VMAU_TOP_BASE	0x80028
++#define VPU_VMAU_CTX		0x8002c	/* a FIFO: the CABAC states it uses */
++#define VPU_VMAU_MD_CFG0	0x80030	/* last row << 24 | last column << 16 | P 2, I 1 */
++#define VPU_VMAU_MD_CFG1	0x80034
++#define VMAU_MD_CFG1_T20	(BIT(15) | BIT(9) | BIT(1))	/* MV sums, info, chroma bias */
++#define VPU_VMAU_MD_CFG2	0x80038
++#define VMAU_MD_CFG2_T20	0xcccc0111	/* intra mode biases */
++#define VPU_VMAU_MD_CFG3	0x8003c
++#define VPU_VMAU_GBL_RUN	0x80040
++#define VMAU_RUN		BIT(0)
++#define VMAU_RESET		BIT(2)
++#define VPU_VMAU_GBL_CTR	0x80044
++#define VMAU_CTRL_FIFO_M	BIT(0)
++#define VMAU_CTRL_TO_DBLK	BIT(24)
++#define VPU_VMAU_VIDEO_TYPE	0x80050
++#define VMAU_H264E		(BIT(31) | BIT(11) | 6 << 7)
++#define VPU_VMAU_Y_GS		0x80054	/* height << 16 | width */
++#define VPU_VMAU_DEC_DONE	0x80058
++#define VPU_VMAU_ENC_DONE	0x8005c
++#define VPU_VMAU_DEADZONE	0x80078
++#define VMAU_DEADZONE		0x0b150b15	/* chroma, luma: inter 11 << 8 | intra 21 */
++#define VPU_VMAU_ACMASK		0x8007c
++#define VPU_VMAU_MD_CFG4	0x800d8
++#define VPU_VMAU_MD_CFG5	0x800dc
++
++/* Stream encoder */
++#define VPU_SDE_STAT		0x90000
++#define VPU_SDE_SL_CTRL		0x90004
++#define SDE_SLICE_INIT		BIT(1)
++#define VPU_SDE_SL_GEOM		0x90008
++#define VPU_SDE_GL_CTRL		0x9000c
++#define SDE_MODE_STEP		(1 << 4)
++#define SDE_EN			BIT(0)
++#define VPU_SDE_CODEC_ID	0x90010
++#define SDE_H264_ENC		BIT(1)
++#define VPU_SDE_CFG(n)		(0x90014 + 4 * (n))
++#define SDE_CFG1_T20		BIT(4)
++#define SDE_BS_LEN		GENMASK(23, 0)	/* in CFG9: bytes written */
++#define VPU_SDE_CTX_TBL		0x92000
++
++/*
++ * The VPU's internal RAM (bus addresses, offsets from the VPU's). In the
++ * TCSM: the residuals, the rows of prediction modes and of motion vectors
++ * above, the scheduler's channels to each block and the macroblock QP
++ * table; in the VRAM: the macroblock FIFO from the EFE.
++ */
++#define VRAM_MAU_RESA		0xc0000
++#define VRAM_TOPPA		0xc4000
++#define VRAM_TOPMV		0xc4800
++#define VRAM_MAU_CHN		0xc4c00
++#define VRAM_DBLK_CHN		0xc5000
++#define VRAM_ME_CHN		0xc5400
++#define VRAM_SDE_CHN		0xc5600
++#define VRAM_QP_TAB		0xc5800
++#define VRAM_RAWY		0xf0000
++#define VRAM_DUMMY		0xffffc
++
++#define T20_H264_MIN_SIZE	48
++#define T20_H264_MAX_SIZE	2048
++#define T20_H264_HDR_SIZE	256	/* SPS, PPS and slice header */
++#define T20_H264_LOG2_MAX_FRAME_NUM 16
++
++
++/*
++ * Reconstructed frames, the references of the next ones: the macroblocks
++ * one after the other (16x16 luma; 8 lines of 8 Cb then 8 Cr bytes), the
++ * chroma after the luma
++ */
++#define REF_SIZE(mbw, mbh)	((mbw) * (mbh) * 256 * 3 / 2)
++
++/*
++ * The SDE's CABAC state table: the LPS ranges of a probability state with
++ * the most probable symbol in bit 0, from XBOMX
++ */
++static const u32 t20_h264_lps_range[64] = {
++	0xeeceaefc, 0xe1c3a5fc, 0xd6b99cfc, 0xcbb094f2,
++	0xc1a78ce4, 0xb79e85da, 0xad967ece, 0xa48e78c4,
++	0x9c8772ba, 0x94806cb0, 0x8c7966a6, 0x8573619e,
++	0x7e6d5c96, 0x7867578e, 0x72625386, 0x6c5d4e80,
++	0x66584a78, 0x61544672, 0x5c4f436c, 0x574b3f66,
++	0x53473c62, 0x4e43395c, 0x4a403658, 0x463d3352,
++	0x4339304e, 0x3f362e4a, 0x3c342b46, 0x39312942,
++	0x362e273e, 0x332c253c, 0x30292338, 0x2e272136,
++	0x2b251f32, 0x29231d30, 0x27211c2c, 0x251f1a2a,
++	0x231e1928, 0x211c1826, 0x1f1b1624, 0x1d191522,
++	0x1c181420, 0x1a17131e, 0x1915121c, 0x1714111a,
++	0x16131018, 0x15120f18, 0x14110e16, 0x13100d14,
++	0x120f0c14, 0x110e0c12, 0x100d0b12, 0x0f0d0a10,
++	0x0e0c0a10, 0x0d0b090e, 0x0c0a090e, 0x0c0a080c,
++	0x0b09070c, 0x0a09070a, 0x0a08070a, 0x0908060a,
++	0x09070608, 0x08070508, 0x07060508, 0x00000000,
++};
++
++/* CABAC context initialisation (m, n), ITU-T H.264 tables 9-12 to 9-33 */
++static const s8 t20_h264_cabac_init[2][460][2] = {
++	{	/* I slices */
++		{ 20, -15 }, { 2, 54 }, { 3, 74 }, { 20, -15 }, { 2, 54 }, { 3, 74 },
++		{ -28, 127 }, { -23, 104 }, { -6, 53 }, { -1, 54 }, { 7, 51 }, { 0, 0 },
++		{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++		{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++		{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++		{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++		{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++		{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++		{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++		{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++		{ 0, 41 }, { 0, 63 }, { 0, 63 }, { 0, 63 }, { -9, 83 }, { 4, 86 },
++		{ 0, 97 }, { -7, 72 }, { 13, 41 }, { 3, 62 }, { 0, 11 }, { 1, 55 },
++		{ 0, 69 }, { -17, 127 }, { -13, 102 }, { 0, 82 }, { -7, 74 }, { -21, 107 },
++		{ -27, 127 }, { -31, 127 }, { -24, 127 }, { -18, 95 }, { -27, 127 }, { -21, 114 },
++		{ -30, 127 }, { -17, 123 }, { -12, 115 }, { -16, 122 }, { -11, 115 }, { -12, 63 },
++		{ -2, 68 }, { -15, 84 }, { -13, 104 }, { -3, 70 }, { -8, 93 }, { -10, 90 },
++		{ -30, 127 }, { -1, 74 }, { -6, 97 }, { -7, 91 }, { -20, 127 }, { -4, 56 },
++		{ -5, 82 }, { -7, 76 }, { -22, 125 }, { -7, 93 }, { -11, 87 }, { -3, 77 },
++		{ -5, 71 }, { -4, 63 }, { -4, 68 }, { -12, 84 }, { -7, 62 }, { -7, 65 },
++		{ 8, 61 }, { 5, 56 }, { -2, 66 }, { 1, 64 }, { 0, 61 }, { -2, 78 },
++		{ 1, 50 }, { 7, 52 }, { 10, 35 }, { 0, 44 }, { 11, 38 }, { 1, 45 },
++		{ 0, 46 }, { 5, 44 }, { 31, 17 }, { 1, 51 }, { 7, 50 }, { 28, 19 },
++		{ 16, 33 }, { 14, 62 }, { -13, 108 }, { -15, 100 }, { -13, 101 }, { -13, 91 },
++		{ -12, 94 }, { -10, 88 }, { -16, 84 }, { -10, 86 }, { -7, 83 }, { -13, 87 },
++		{ -19, 94 }, { 1, 70 }, { 0, 72 }, { -5, 74 }, { 18, 59 }, { -8, 102 },
++		{ -15, 100 }, { 0, 95 }, { -4, 75 }, { 2, 72 }, { -11, 75 }, { -3, 71 },
++		{ 15, 46 }, { -13, 69 }, { 0, 62 }, { 0, 65 }, { 21, 37 }, { -15, 72 },
++		{ 9, 57 }, { 16, 54 }, { 0, 62 }, { 12, 72 }, { 24, 0 }, { 15, 9 },
++		{ 8, 25 }, { 13, 18 }, { 15, 9 }, { 13, 19 }, { 10, 37 }, { 12, 18 },
++		{ 6, 29 }, { 20, 33 }, { 15, 30 }, { 4, 45 }, { 1, 58 }, { 0, 62 },
++		{ 7, 61 }, { 12, 38 }, { 11, 45 }, { 15, 39 }, { 11, 42 }, { 13, 44 },
++		{ 16, 45 }, { 12, 41 }, { 10, 49 }, { 30, 34 }, { 18, 42 }, { 10, 55 },
++		{ 17, 51 }, { 17, 46 }, { 0, 89 }, { 26, -19 }, { 22, -17 }, { 26, -17 },
++		{ 30, -25 }, { 28, -20 }, { 33, -23 }, { 37, -27 }, { 33, -23 }, { 40, -28 },
++		{ 38, -17 }, { 33, -11 }, { 40, -15 }, { 41, -6 }, { 38, 1 }, { 41, 17 },
++		{ 30, -6 }, { 27, 3 }, { 26, 22 }, { 37, -16 }, { 35, -4 }, { 38, -8 },
++		{ 38, -3 }, { 37, 3 }, { 38, 5 }, { 42, 0 }, { 35, 16 }, { 39, 22 },
++		{ 14, 48 }, { 27, 37 }, { 21, 60 }, { 12, 68 }, { 2, 97 }, { -3, 71 },
++		{ -6, 42 }, { -5, 50 }, { -3, 54 }, { -2, 62 }, { 0, 58 }, { 1, 63 },
++		{ -2, 72 }, { -1, 74 }, { -9, 91 }, { -5, 67 }, { -5, 27 }, { -3, 39 },
++		{ -2, 44 }, { 0, 46 }, { -16, 64 }, { -8, 68 }, { -10, 78 }, { -6, 77 },
++		{ -10, 86 }, { -12, 92 }, { -15, 55 }, { -10, 60 }, { -6, 62 }, { -4, 65 },
++		{ -12, 73 }, { -8, 76 }, { -7, 80 }, { -9, 88 }, { -17, 110 }, { -11, 97 },
++		{ -20, 84 }, { -11, 79 }, { -6, 73 }, { -4, 74 }, { -13, 86 }, { -13, 96 },
++		{ -11, 97 }, { -19, 117 }, { -8, 78 }, { -5, 33 }, { -4, 48 }, { -2, 53 },
++		{ -3, 62 }, { -13, 71 }, { -10, 79 }, { -12, 86 }, { -13, 90 }, { -14, 97 },
++		{ 0, 0 }, { -6, 93 }, { -6, 84 }, { -8, 79 }, { 0, 66 }, { -1, 71 },
++		{ 0, 62 }, { -2, 60 }, { -2, 59 }, { -5, 75 }, { -3, 62 }, { -4, 58 },
++		{ -9, 66 }, { -1, 79 }, { 0, 71 }, { 3, 68 }, { 10, 44 }, { -7, 62 },
++		{ 15, 36 }, { 14, 40 }, { 16, 27 }, { 12, 29 }, { 1, 44 }, { 20, 36 },
++		{ 18, 32 }, { 5, 42 }, { 1, 48 }, { 10, 62 }, { 17, 46 }, { 9, 64 },
++		{ -12, 104 }, { -11, 97 }, { -16, 96 }, { -7, 88 }, { -8, 85 }, { -7, 85 },
++		{ -9, 85 }, { -13, 88 }, { 4, 66 }, { -3, 77 }, { -3, 76 }, { -6, 76 },
++		{ 10, 58 }, { -1, 76 }, { -1, 83 }, { -7, 99 }, { -14, 95 }, { 2, 95 },
++		{ 0, 76 }, { -5, 74 }, { 0, 70 }, { -11, 75 }, { 1, 68 }, { 0, 65 },
++		{ -14, 73 }, { 3, 62 }, { 4, 62 }, { -1, 68 }, { -13, 75 }, { 11, 55 },
++		{ 5, 64 }, { 12, 70 }, { 15, 6 }, { 6, 19 }, { 7, 16 }, { 12, 14 },
++		{ 18, 13 }, { 13, 11 }, { 13, 15 }, { 15, 16 }, { 12, 23 }, { 13, 23 },
++		{ 15, 20 }, { 14, 26 }, { 14, 44 }, { 17, 40 }, { 17, 47 }, { 24, 17 },
++		{ 21, 21 }, { 25, 22 }, { 31, 27 }, { 22, 29 }, { 19, 35 }, { 14, 50 },
++		{ 10, 57 }, { 7, 63 }, { -2, 77 }, { -4, 82 }, { -3, 94 }, { 9, 69 },
++		{ -12, 109 }, { 36, -35 }, { 36, -34 }, { 32, -26 }, { 37, -30 }, { 44, -32 },
++		{ 34, -18 }, { 34, -15 }, { 40, -15 }, { 33, -7 }, { 35, -5 }, { 33, 0 },
++		{ 38, 2 }, { 33, 13 }, { 23, 35 }, { 13, 58 }, { 29, -3 }, { 26, 0 },
++		{ 22, 30 }, { 31, -7 }, { 35, -15 }, { 34, -3 }, { 34, 3 }, { 36, -1 },
++		{ 34, 5 }, { 32, 11 }, { 35, 5 }, { 34, 12 }, { 39, 11 }, { 30, 29 },
++		{ 34, 26 }, { 29, 39 }, { 19, 66 }, { 31, 21 }, { 31, 31 }, { 25, 50 },
++		{ -17, 120 }, { -20, 112 }, { -18, 114 }, { -11, 85 }, { -15, 92 }, { -14, 89 },
++		{ -26, 71 }, { -15, 81 }, { -14, 80 }, { 0, 68 }, { -14, 70 }, { -24, 56 },
++		{ -23, 68 }, { -24, 50 }, { -11, 74 }, { 23, -13 }, { 26, -13 }, { 40, -15 },
++		{ 49, -14 }, { 44, 3 }, { 45, 6 }, { 44, 34 }, { 33, 54 }, { 19, 82 },
++		{ -3, 75 }, { -1, 23 }, { 1, 34 }, { 1, 43 }, { 0, 54 }, { -2, 55 },
++		{ 0, 61 }, { 1, 64 }, { 0, 68 }, { -9, 92 }, { -14, 106 }, { -13, 97 },
++		{ -15, 90 }, { -12, 90 }, { -18, 88 }, { -10, 73 }, { -9, 79 }, { -14, 86 },
++		{ -10, 73 }, { -10, 70 }, { -10, 69 }, { -5, 66 }, { -9, 64 }, { -5, 58 },
++		{ 2, 59 }, { 21, -10 }, { 24, -11 }, { 28, -8 }, { 28, -1 }, { 29, 3 },
++		{ 29, 9 }, { 35, 20 }, { 29, 36 }, { 14, 67 },
++	},
++	{	/* P slices, cabac_init_idc 0 */
++		{ 20, -15 }, { 2, 54 }, { 3, 74 }, { 20, -15 }, { 2, 54 }, { 3, 74 },
++		{ -28, 127 }, { -23, 104 }, { -6, 53 }, { -1, 54 }, { 7, 51 }, { 23, 33 },
++		{ 23, 2 }, { 21, 0 }, { 1, 9 }, { 0, 49 }, { -37, 118 }, { 5, 57 },
++		{ -13, 78 }, { -11, 65 }, { 1, 62 }, { 12, 49 }, { -4, 73 }, { 17, 50 },
++		{ 18, 64 }, { 9, 43 }, { 29, 0 }, { 26, 67 }, { 16, 90 }, { 9, 104 },
++		{ -46, 127 }, { -20, 104 }, { 1, 67 }, { -13, 78 }, { -11, 65 }, { 1, 62 },
++		{ -6, 86 }, { -17, 95 }, { -6, 61 }, { 9, 45 }, { -3, 69 }, { -6, 81 },
++		{ -11, 96 }, { 6, 55 }, { 7, 67 }, { -5, 86 }, { 2, 88 }, { 0, 58 },
++		{ -3, 76 }, { -10, 94 }, { 5, 54 }, { 4, 69 }, { -3, 81 }, { 0, 88 },
++		{ -7, 67 }, { -5, 74 }, { -4, 74 }, { -5, 80 }, { -7, 72 }, { 1, 58 },
++		{ 0, 41 }, { 0, 63 }, { 0, 63 }, { 0, 63 }, { -9, 83 }, { 4, 86 },
++		{ 0, 97 }, { -7, 72 }, { 13, 41 }, { 3, 62 }, { 0, 45 }, { -4, 78 },
++		{ -3, 96 }, { -27, 126 }, { -28, 98 }, { -25, 101 }, { -23, 67 }, { -28, 82 },
++		{ -20, 94 }, { -16, 83 }, { -22, 110 }, { -21, 91 }, { -18, 102 }, { -13, 93 },
++		{ -29, 127 }, { -7, 92 }, { -5, 89 }, { -7, 96 }, { -13, 108 }, { -3, 46 },
++		{ -1, 65 }, { -1, 57 }, { -9, 93 }, { -3, 74 }, { -9, 92 }, { -8, 87 },
++		{ -23, 126 }, { 5, 54 }, { 6, 60 }, { 6, 59 }, { 6, 69 }, { -1, 48 },
++		{ 0, 68 }, { -4, 69 }, { -8, 88 }, { -2, 85 }, { -6, 78 }, { -1, 75 },
++		{ -7, 77 }, { 2, 54 }, { 5, 50 }, { -3, 68 }, { 1, 50 }, { 6, 42 },
++		{ -4, 81 }, { 1, 63 }, { -4, 70 }, { 0, 67 }, { 2, 57 }, { -2, 76 },
++		{ 11, 35 }, { 4, 64 }, { 1, 61 }, { 11, 35 }, { 18, 25 }, { 12, 24 },
++		{ 13, 29 }, { 13, 36 }, { -10, 93 }, { -7, 73 }, { -2, 73 }, { 13, 46 },
++		{ 9, 49 }, { -7, 100 }, { 9, 53 }, { 2, 53 }, { 5, 53 }, { -2, 61 },
++		{ 0, 56 }, { 0, 56 }, { -13, 63 }, { -5, 60 }, { -1, 62 }, { 4, 57 },
++		{ -6, 69 }, { 4, 57 }, { 14, 39 }, { 4, 51 }, { 13, 68 }, { 3, 64 },
++		{ 1, 61 }, { 9, 63 }, { 7, 50 }, { 16, 39 }, { 5, 44 }, { 4, 52 },
++		{ 11, 48 }, { -5, 60 }, { -1, 59 }, { 0, 59 }, { 22, 33 }, { 5, 44 },
++		{ 14, 43 }, { -1, 78 }, { 0, 60 }, { 9, 69 }, { 11, 28 }, { 2, 40 },
++		{ 3, 44 }, { 0, 49 }, { 0, 46 }, { 2, 44 }, { 2, 51 }, { 0, 47 },
++		{ 4, 39 }, { 2, 62 }, { 6, 46 }, { 0, 54 }, { 3, 54 }, { 2, 58 },
++		{ 4, 63 }, { 6, 51 }, { 6, 57 }, { 7, 53 }, { 6, 52 }, { 6, 55 },
++		{ 11, 45 }, { 14, 36 }, { 8, 53 }, { -1, 82 }, { 7, 55 }, { -3, 78 },
++		{ 15, 46 }, { 22, 31 }, { -1, 84 }, { 25, 7 }, { 30, -7 }, { 28, 3 },
++		{ 28, 4 }, { 32, 0 }, { 34, -1 }, { 30, 6 }, { 30, 6 }, { 32, 9 },
++		{ 31, 19 }, { 26, 27 }, { 26, 30 }, { 37, 20 }, { 28, 34 }, { 17, 70 },
++		{ 1, 67 }, { 5, 59 }, { 9, 67 }, { 16, 30 }, { 18, 32 }, { 18, 35 },
++		{ 22, 29 }, { 24, 31 }, { 23, 38 }, { 18, 43 }, { 20, 41 }, { 11, 63 },
++		{ 9, 59 }, { 9, 64 }, { -1, 94 }, { -2, 89 }, { -9, 108 }, { -6, 76 },
++		{ -2, 44 }, { 0, 45 }, { 0, 52 }, { -3, 64 }, { -2, 59 }, { -4, 70 },
++		{ -4, 75 }, { -8, 82 }, { -17, 102 }, { -9, 77 }, { 3, 24 }, { 0, 42 },
++		{ 0, 48 }, { 0, 55 }, { -6, 59 }, { -7, 71 }, { -12, 83 }, { -11, 87 },
++		{ -30, 119 }, { 1, 58 }, { -3, 29 }, { -1, 36 }, { 1, 38 }, { 2, 43 },
++		{ -6, 55 }, { 0, 58 }, { 0, 64 }, { -3, 74 }, { -10, 90 }, { 0, 70 },
++		{ -4, 29 }, { 5, 31 }, { 7, 42 }, { 1, 59 }, { -2, 58 }, { -3, 72 },
++		{ -3, 81 }, { -11, 97 }, { 0, 58 }, { 8, 5 }, { 10, 14 }, { 14, 18 },
++		{ 13, 27 }, { 2, 40 }, { 0, 58 }, { -3, 70 }, { -6, 79 }, { -8, 85 },
++		{ 0, 0 }, { -13, 106 }, { -16, 106 }, { -10, 87 }, { -21, 114 }, { -18, 110 },
++		{ -14, 98 }, { -22, 110 }, { -21, 106 }, { -18, 103 }, { -21, 107 }, { -23, 108 },
++		{ -26, 112 }, { -10, 96 }, { -12, 95 }, { -5, 91 }, { -9, 93 }, { -22, 94 },
++		{ -5, 86 }, { 9, 67 }, { -4, 80 }, { -10, 85 }, { -1, 70 }, { 7, 60 },
++		{ 9, 58 }, { 5, 61 }, { 12, 50 }, { 15, 50 }, { 18, 49 }, { 17, 54 },
++		{ 10, 41 }, { 7, 46 }, { -1, 51 }, { 7, 49 }, { 8, 52 }, { 9, 41 },
++		{ 6, 47 }, { 2, 55 }, { 13, 41 }, { 10, 44 }, { 6, 50 }, { 5, 53 },
++		{ 13, 49 }, { 4, 63 }, { 6, 64 }, { -2, 69 }, { -2, 59 }, { 6, 70 },
++		{ 10, 44 }, { 9, 31 }, { 12, 43 }, { 3, 53 }, { 14, 34 }, { 10, 38 },
++		{ -3, 52 }, { 13, 40 }, { 17, 32 }, { 7, 44 }, { 7, 38 }, { 13, 50 },
++		{ 10, 57 }, { 26, 43 }, { 14, 11 }, { 11, 14 }, { 9, 11 }, { 18, 11 },
++		{ 21, 9 }, { 23, -2 }, { 32, -15 }, { 32, -15 }, { 34, -21 }, { 39, -23 },
++		{ 42, -33 }, { 41, -31 }, { 46, -28 }, { 38, -12 }, { 21, 29 }, { 45, -24 },
++		{ 53, -45 }, { 48, -26 }, { 65, -43 }, { 43, -19 }, { 39, -10 }, { 30, 9 },
++		{ 18, 26 }, { 20, 27 }, { 0, 57 }, { -14, 82 }, { -5, 75 }, { -19, 97 },
++		{ -35, 125 }, { 27, 0 }, { 28, 0 }, { 31, -4 }, { 27, 6 }, { 34, 8 },
++		{ 30, 10 }, { 24, 22 }, { 33, 19 }, { 22, 32 }, { 26, 31 }, { 21, 41 },
++		{ 26, 44 }, { 23, 47 }, { 16, 65 }, { 14, 71 }, { 8, 60 }, { 6, 63 },
++		{ 17, 65 }, { 21, 24 }, { 23, 20 }, { 26, 23 }, { 27, 32 }, { 28, 23 },
++		{ 28, 24 }, { 23, 40 }, { 24, 32 }, { 28, 29 }, { 23, 42 }, { 19, 57 },
++		{ 22, 53 }, { 22, 61 }, { 11, 86 }, { 12, 40 }, { 11, 51 }, { 14, 59 },
++		{ -4, 79 }, { -7, 71 }, { -5, 69 }, { -9, 70 }, { -8, 66 }, { -10, 68 },
++		{ -19, 73 }, { -12, 69 }, { -16, 70 }, { -15, 67 }, { -20, 62 }, { -19, 70 },
++		{ -16, 66 }, { -22, 65 }, { -20, 63 }, { 9, -2 }, { 26, -9 }, { 33, -9 },
++		{ 39, -7 }, { 41, -2 }, { 45, 3 }, { 49, 9 }, { 45, 27 }, { 36, 59 },
++		{ -6, 66 }, { -7, 35 }, { -7, 42 }, { -8, 45 }, { -5, 48 }, { -12, 56 },
++		{ -6, 60 }, { -5, 62 }, { -8, 66 }, { -8, 76 }, { -5, 85 }, { -6, 81 },
++		{ -10, 77 }, { -7, 81 }, { -17, 80 }, { -18, 73 }, { -4, 74 }, { -10, 83 },
++		{ -9, 71 }, { -9, 67 }, { -1, 61 }, { -8, 66 }, { -14, 66 }, { 0, 59 },
++		{ 2, 59 }, { 21, -13 }, { 33, -14 }, { 39, -7 }, { 46, -2 }, { 51, 2 },
++		{ 60, 6 }, { 61, 17 }, { 55, 34 }, { 42, 62 },
++	},
++};
++
++/*
++ * Motion compensation filters for the 16 quarter-pel positions (H0V0 to
++ * H3V3), from the H264_QPEL and H264_EPEL entries of Ingenic's GPL-2.0
++ * IntpFMT table packed as helix.h's MCE_ILUT_INFO (two filter passes) and
++ * MCE_CLUT_INFO (taps). Luma: the 6-tap filter, rounding 16, shift 5;
++ * chroma: bilinear, only on the half-pel grid as in the vendor's table.
++ */
++static const u32 t20_h264_luma_ilut[16][2] = {
++	{ 0x00000000, 0x00000000 },	/* H0V0 */
++	{ 0x80100506, 0x00000000 },	/* H1V0 */
++	{ 0x80100500, 0x00000000 },	/* H2V0 */
++	{ 0x80100507, 0x00000000 },	/* H3V0 */
++	{ 0x81100506, 0x00000000 },	/* H0V1 */
++	{ 0x8c100500, 0x8d100506 },	/* H1V1 */
++	{ 0x80100500, 0x81000a06 },	/* H2V1 */
++	{ 0x8c100501, 0x8d100506 },	/* H3V1 */
++	{ 0x81100500, 0x00000000 },	/* H0V2 */
++	{ 0x81100500, 0x80000a06 },	/* H1V2 */
++	{ 0x80100500, 0x81000a00 },	/* H2V2 */
++	{ 0x81100500, 0x80000a07 },	/* H3V2 */
++	{ 0x81100507, 0x00000000 },	/* H0V3 */
++	{ 0x8c100500, 0x8d100507 },	/* H1V3 */
++	{ 0x80100500, 0x81000a07 },	/* H2V3 */
++	{ 0x8c100501, 0x8d100507 },	/* H3V3 */
++};
++#define T20_H264_LUMA_TAPS_L	0x1414fb01	/* 1, -5, 20, 20 */
++#define T20_H264_LUMA_TAPS_M	0x000001fb	/* -5, 1 */
++
++static const u32 t20_h264_chroma_ilut[16][2] = {
++	[2]  = { 0x80040300, 0 },		/* H2V0: horizontal, (s + 4) >> 3 */
++	[8]  = { 0x81040300, 0 },		/* H0V2: vertical */
++	[10] = { 0x80000000, 0x81200600 },	/* H2V2: both, (s + 32) >> 6 */
++};
++
++struct t20_h264_ctx {
++	struct t20_vpu_ctx vpu_ctx;
++	struct v4l2_ctrl_handler ctrls;
++	struct v4l2_pix_format out_fmt;	/* NV12 */
++	struct v4l2_pix_format cap_fmt;	/* H.264 */
++	u32 mbw, mbh;
++
++	/* Controls */
++	u32 gop_size;
++	u32 i_qp, p_qp;			/* without rate control */
++	bool force_key;
++	bool rc;
++	u32 bitrate;
++	u32 min_qp, max_qp;
++	struct v4l2_fract timeperframe;
++
++	/* Rate control: the P frame QP, the bits over the budget so far */
++	u32 rc_qp;
++	s64 rc_debt;
++
++	/* Streaming state */
++	void *ref;			/* two reconstructed frames */
++	dma_addr_t ref_dma;
++	size_t ref_size;
++	void *bs;			/* the hardware's slice data, cached */
++	void *bs_alloc;
++	dma_addr_t bs_dma;
++	size_t bs_size;
++	unsigned int cur;		/* reconstructed frame written next */
++	bool idr;			/* the frame being encoded */
++	u32 qp;
++	u32 gop_pos;
++	u32 frame_num;
++	u32 idr_pic_id;
++	u8 hdr[T20_H264_HDR_SIZE];	/* the frame's NAL units up to the slice data */
++	u32 hdr_len;
++	unsigned int hdr_zeros;		/* zero bytes at the end of hdr */
++};
++
++static inline struct t20_h264_ctx *to_h264_ctx(struct t20_vpu_ctx *ctx)
++{
++	return container_of(ctx, struct t20_h264_ctx, vpu_ctx);
++}
++
++static inline struct t20_h264_ctx *file_to_ctx(struct file *file)
++{
++	return container_of(file->private_data, struct t20_h264_ctx, vpu_ctx.fh);
++}
++
++
++/* Bitstream headers */
++
++struct t20_h264_bits {
++	u8 *buf;
++	u32 pos;			/* in bits */
++};
++
++static void t20_h264_put(struct t20_h264_bits *b, unsigned int n, u32 v)
++{
++	while (n--) {
++		if (v >> n & 1)
++			b->buf[b->pos >> 3] |= 0x80 >> (b->pos & 7);
++		b->pos++;
++	}
++}
++
++static void t20_h264_put_ue(struct t20_h264_bits *b, u32 v)
++{
++	t20_h264_put(b, 2 * fls(v + 1) - 1, v + 1);
++}
++
++static void t20_h264_put_se(struct t20_h264_bits *b, int v)
++{
++	t20_h264_put_ue(b, v > 0 ? 2 * v - 1 : -2 * v);
++}
++
++static void t20_h264_trailing(struct t20_h264_bits *b)
++{
++	t20_h264_put(b, 1, 1);
++	b->pos = ALIGN(b->pos, 8);
++}
++
++/* Copy with emulation prevention bytes; zeros: zero bytes just written */
++static u8 *t20_h264_escape(u8 *dst, u8 *end, const u8 *src, u32 len, unsigned int *zeros)
++{
++	while (len--) {
++		u8 c = *src++;
++
++		if (end - dst < 2)
++			return NULL;
++		if (*zeros >= 2 && c <= 3) {
++			*dst++ = 3;
++			*zeros = 0;
++		}
++		*dst++ = c;
++		*zeros = c ? 0 : *zeros + 1;
++	}
++	return dst;
++}
++
++/* A NAL unit of rbsp: start code, header, the escaped payload */
++static u8 *t20_h264_nal(u8 *dst, u8 *end, unsigned int ref_idc, unsigned int type,
++			const u8 *rbsp, u32 len, unsigned int *zeros)
++{
++	static const u8 start[4] = { 0, 0, 0, 1 };
++
++	if (end - dst < 5)
++		return NULL;
++	memcpy(dst, start, 4);
++	dst[4] = ref_idc << 5 | type;
++	*zeros = 0;
++	return t20_h264_escape(dst + 5, end, rbsp, len, zeros);
++}
++
++static u32 t20_h264_level(struct t20_h264_ctx *ctx)
++{
++	u32 mbs = ctx->mbw * ctx->mbh;
++
++	/* By frame size, for up to 30 frames per second */
++	if (mbs <= 396)
++		return 20;
++	if (mbs <= 1620)
++		return 30;
++	if (mbs <= 3600)
++		return 31;
++	if (mbs <= 5120)
++		return 32;
++	if (mbs <= 8192)
++		return 40;
++	return 50;
++}
++
++static u32 t20_h264_sps(struct t20_h264_ctx *ctx, u8 *buf)
++{
++	struct v4l2_pix_format *f = &ctx->out_fmt;
++	struct t20_h264_bits b = { buf };
++	u32 crop_r = (ctx->mbw * 16 - f->width) / 2;
++	u32 crop_b = (ctx->mbh * 16 - f->height) / 2;
++
++	t20_h264_put(&b, 8, 77);		/* Main profile */
++	t20_h264_put(&b, 8, 0x40);		/* constraint_set1: Main */
++	t20_h264_put(&b, 8, t20_h264_level(ctx));
++	t20_h264_put_ue(&b, 0);			/* seq_parameter_set_id */
++	t20_h264_put_ue(&b, T20_H264_LOG2_MAX_FRAME_NUM - 4);
++	t20_h264_put_ue(&b, 2);			/* pic_order_cnt_type: from frame_num */
++	t20_h264_put_ue(&b, 1);			/* max_num_ref_frames */
++	t20_h264_put(&b, 1, 0);			/* gaps_in_frame_num_value_allowed */
++	t20_h264_put_ue(&b, ctx->mbw - 1);
++	t20_h264_put_ue(&b, ctx->mbh - 1);
++	t20_h264_put(&b, 1, 1);			/* frame_mbs_only */
++	t20_h264_put(&b, 1, 1);			/* direct_8x8_inference */
++	t20_h264_put(&b, 1, crop_r || crop_b);	/* frame_cropping */
++	if (crop_r || crop_b) {
++		t20_h264_put_ue(&b, 0);
++		t20_h264_put_ue(&b, crop_r);
++		t20_h264_put_ue(&b, 0);
++		t20_h264_put_ue(&b, crop_b);
++	}
++	t20_h264_put(&b, 1, 1);			/* vui_parameters_present */
++	t20_h264_put(&b, 1, 0);			/* aspect_ratio_info_present */
++	t20_h264_put(&b, 1, 0);			/* overscan_info_present */
++	t20_h264_put(&b, 1, 1);			/* video_signal_type_present */
++	t20_h264_put(&b, 3, 5);			/* video_format: unspecified */
++	t20_h264_put(&b, 1, f->quantization == V4L2_QUANTIZATION_FULL_RANGE);
++	t20_h264_put(&b, 1, 1);			/* colour_description_present */
++	t20_h264_put(&b, 8, 1);			/* primaries: BT.709 (sRGB) */
++	t20_h264_put(&b, 8, 13);		/* transfer: sRGB */
++	t20_h264_put(&b, 8, 6);			/* matrix: BT.601 */
++	t20_h264_put(&b, 1, 0);			/* chroma_loc_info_present */
++	t20_h264_put(&b, 1, 0);			/* timing_info_present */
++	t20_h264_put(&b, 1, 0);			/* nal_hrd_parameters_present */
++	t20_h264_put(&b, 1, 0);			/* vcl_hrd_parameters_present */
++	t20_h264_put(&b, 1, 0);			/* pic_struct_present */
++	t20_h264_put(&b, 1, 1);			/* bitstream_restriction */
++	t20_h264_put(&b, 1, 1);			/* motion_vectors_over_pic_boundaries */
++	t20_h264_put_ue(&b, 0);			/* max_bytes_per_pic_denom */
++	t20_h264_put_ue(&b, 0);			/* max_bits_per_mb_denom */
++	t20_h264_put_ue(&b, 13);		/* log2_max_mv_length_horizontal */
++	t20_h264_put_ue(&b, 11);		/* log2_max_mv_length_vertical */
++	t20_h264_put_ue(&b, 0);			/* max_num_reorder_frames */
++	t20_h264_put_ue(&b, 1);			/* max_dec_frame_buffering */
++	t20_h264_trailing(&b);
++	return b.pos / 8;
++}
++
++static u32 t20_h264_pps(u8 *buf)
++{
++	struct t20_h264_bits b = { buf };
++
++	t20_h264_put_ue(&b, 0);			/* pic_parameter_set_id */
++	t20_h264_put_ue(&b, 0);			/* seq_parameter_set_id */
++	t20_h264_put(&b, 1, 1);			/* entropy_coding_mode: CABAC */
++	t20_h264_put(&b, 1, 0);			/* bottom_field_pic_order_in_frame_present */
++	t20_h264_put_ue(&b, 0);			/* num_slice_groups_minus1 */
++	t20_h264_put_ue(&b, 0);			/* num_ref_idx_l0_default_active_minus1 */
++	t20_h264_put_ue(&b, 0);			/* num_ref_idx_l1_default_active_minus1 */
++	t20_h264_put(&b, 1, 0);			/* weighted_pred */
++	t20_h264_put(&b, 2, 0);			/* weighted_bipred_idc */
++	t20_h264_put_se(&b, 0);			/* pic_init_qp_minus26 */
++	t20_h264_put_se(&b, 0);			/* pic_init_qs_minus26 */
++	t20_h264_put_se(&b, 0);			/* chroma_qp_index_offset */
++	t20_h264_put(&b, 1, 1);			/* deblocking_filter_control_present */
++	t20_h264_put(&b, 1, 0);			/* constrained_intra_pred */
++	t20_h264_put(&b, 1, 0);			/* redundant_pic_cnt_present */
++	t20_h264_trailing(&b);
++	return b.pos / 8;
++}
++
++/* Up to the CABAC slice data, which starts byte aligned */
++static u32 t20_h264_slice_header(struct t20_h264_ctx *ctx, u8 *buf)
++{
++	struct t20_h264_bits b = { buf };
++
++	t20_h264_put_ue(&b, 0);			/* first_mb_in_slice */
++	t20_h264_put_ue(&b, ctx->idr ? 7 : 5);	/* slice_type: all I or all P */
++	t20_h264_put_ue(&b, 0);			/* pic_parameter_set_id */
++	t20_h264_put(&b, T20_H264_LOG2_MAX_FRAME_NUM, ctx->frame_num);
++	if (ctx->idr)
++		t20_h264_put_ue(&b, ctx->idr_pic_id);
++	else {
++		t20_h264_put(&b, 1, 0);		/* num_ref_idx_active_override */
++		t20_h264_put(&b, 1, 0);		/* ref_pic_list_modification_flag_l0 */
++	}
++	if (ctx->idr) {
++		t20_h264_put(&b, 1, 0);		/* no_output_of_prior_pics */
++		t20_h264_put(&b, 1, 0);		/* long_term_reference */
++	} else {
++		t20_h264_put(&b, 1, 0);		/* adaptive_ref_pic_marking_mode */
++		t20_h264_put_ue(&b, 0);		/* cabac_init_idc */
++	}
++	t20_h264_put_se(&b, ctx->qp - 26);	/* slice_qp_delta */
++	t20_h264_put_ue(&b, 0);			/* disable_deblocking_filter_idc */
++	t20_h264_put_se(&b, 0);			/* slice_alpha_c0_offset_div2 */
++	t20_h264_put_se(&b, 0);			/* slice_beta_offset_div2 */
++	while (b.pos & 7)
++		t20_h264_put(&b, 1, 1);		/* cabac_alignment_one_bit */
++	return b.pos / 8;
++}
++
++/* The frame's NAL units up to the slice data, into ctx->hdr */
++static void t20_h264_write_header(struct t20_h264_ctx *ctx)
++{
++	u8 rbsp[64], *p = ctx->hdr, *end = ctx->hdr + sizeof(ctx->hdr);
++	u32 len;
++
++	if (ctx->idr) {
++		memset(rbsp, 0, sizeof(rbsp));
++		len = t20_h264_sps(ctx, rbsp);
++		p = t20_h264_nal(p, end, 3, 7, rbsp, len, &ctx->hdr_zeros);
++		memset(rbsp, 0, sizeof(rbsp));
++		len = t20_h264_pps(rbsp);
++		p = t20_h264_nal(p, end, 3, 8, rbsp, len, &ctx->hdr_zeros);
++	}
++	memset(rbsp, 0, sizeof(rbsp));
++	len = t20_h264_slice_header(ctx, rbsp);
++	p = t20_h264_nal(p, end, ctx->idr ? 3 : 2, ctx->idr ? 5 : 1, rbsp, len,
++			 &ctx->hdr_zeros);
++	ctx->hdr_len = p - ctx->hdr;
++}
++
++/* Job */
++
++/* CABAC context: the initial state (preCtxState, 1-126) */
++static u32 t20_h264_ctx_init(const s8 *mn, int qp)
++{
++	return clamp(((mn[0] * qp) >> 4) + mn[1], 1, 126);
++}
++
++/* For the SDE: pStateIdx's LPS ranges | valMPS */
++static u32 t20_h264_ctx_state(u32 s)
++{
++	return s <= 63 ? t20_h264_lps_range[63 - s] : t20_h264_lps_range[s - 64] | 1;
++}
++
++/*
++ * The contexts the VMAU's mode decision codes with: mb_type (I: 3-12, P:
++ * 14-23), coded_block_pattern (73-84), the intra prediction modes (64-69)
++ * and mvd (40-53)
++ */
++static unsigned int t20_h264_vmau_ctx(bool p, unsigned int i)
++{
++	if (i < 10)
++		return i + (p ? 14 : 3);
++	if (i < 22)
++		return i - 10 + 73;
++	if (i < 28)
++		return i - 22 + 64;
++	return i - 28 + 40;
++}
++
++static void t20_h264_build_desc(struct t20_vpu *t20vpu, struct t20_h264_ctx *ctx,
++				dma_addr_t src)
++{
++	struct v4l2_pix_format *f = &ctx->out_fmt;
++	u32 mbw = ctx->mbw, mbh = ctx->mbh, vpu = t20vpu->phys, p = !ctx->idr;
++	u32 luma = mbw * mbh * 256, one = luma * 3 / 2;
++	u32 rec = ctx->ref_dma + ctx->cur * one;
++	u32 ref = ctx->ref_dma + (ctx->cur ^ 1) * one;
++	const s8 (*cabac)[2] = t20_h264_cabac_init[p];
++	u32 *d = t20vpu->desc;
++	unsigned int i;
++
++	d = t20_vpu_acfg(d, VPU_TCSM_FLUSH, 0);
++
++	/* Front end: the NV12 frame; no regions of interest, no QP table */
++	d = t20_vpu_acfg(d, VPU_EFE_GEOM, (mbh - 1) << 8 | (mbw - 1));
++	d = t20_vpu_acfg(d, VPU_EFE_COEF_BA, vpu + VRAM_MAU_RESA);
++	d = t20_vpu_acfg(d, VPU_EFE_RAWY_SBA, src);
++	d = t20_vpu_acfg(d, VPU_EFE_RAWC_SBA, src + f->bytesperline * f->height);
++	d = t20_vpu_acfg(d, VPU_EFE_RAWV_SBA, 0);
++	d = t20_vpu_acfg(d, VPU_EFE_RAW_STRD, f->bytesperline << 16 | f->bytesperline);
++	d = t20_vpu_acfg(d, VPU_EFE_TOPMV_BA, vpu + VRAM_TOPMV);
++	d = t20_vpu_acfg(d, VPU_EFE_TOPPA_BA, vpu + VRAM_TOPPA);
++	d = t20_vpu_acfg(d, VPU_EFE_MECHN_BA, vpu + VRAM_ME_CHN);
++	d = t20_vpu_acfg(d, VPU_EFE_MAUCHN_BA, vpu + VRAM_MAU_CHN);
++	d = t20_vpu_acfg(d, VPU_EFE_DBLKCHN_BA, vpu + VRAM_DBLK_CHN);
++	d = t20_vpu_acfg(d, VPU_EFE_SDECHN_BA, vpu + VRAM_SDE_CHN);
++	d = t20_vpu_acfg(d, VPU_EFE_RAW_DBA, vpu + VRAM_RAWY);
++	d = t20_vpu_acfg(d, VPU_EFE_ROI_MAX_QP, 51);
++	for (i = 0; i < 2; i++)
++		d = t20_vpu_acfg(d, VPU_EFE_ROI_BASE(i), 0);
++	for (i = 0; i < 8; i++)
++		d = t20_vpu_acfg(d, VPU_EFE_ROI_POS(i), 0);
++	d = t20_vpu_acfg(d, VPU_EFE_QP_GEN_TAB, VRAM_QP_TAB);
++	d = t20_vpu_acfg(d, VPU_EFE_CQP_OFST, 0);
++	d = t20_vpu_acfg(d, VPU_EFE_SSAD, 0);
++	d = t20_vpu_acfg(d, VPU_EFE_DCS, EFE_DCS_T20);
++
++	/* Motion: search the reference, interpolate */
++	if (p) {
++		d = t20_vpu_acfg(d, VPU_MCE_CHN_BA, vpu + VRAM_ME_CHN);
++		d = t20_vpu_acfg(d, VPU_MCE_TMV_BA, vpu + VRAM_TOPMV);
++		d = t20_vpu_acfg(d, VPU_MCE_CHN_SYNC, vpu + VPU_SCH_SCHE(1));
++		d = t20_vpu_acfg(d, VPU_MCE_FRM_SIZE, (f->height - 1) << 16 | (f->width - 1));
++		d = t20_vpu_acfg(d, VPU_MCE_FRM_STRD, mbw * 16 << 16 | mbw * 16);
++		d = t20_vpu_acfg(d, VPU_MCE_COMP_CTRL, MCE_COMP_H264);
++		d = t20_vpu_acfg(d, VPU_MCE_ESTI_CTRL, MCE_ESTI_H264);
++		d = t20_vpu_acfg(d, VPU_MCE_MRGI, 0);
++		d = t20_vpu_acfg(d, VPU_MCE_MVR, MCE_MVR_500);
++		d = t20_vpu_acfg(d, VPU_MCE_RLUT, ref);
++		d = t20_vpu_acfg(d, VPU_MCE_RLUT + 4, ref + luma);
++		for (i = 0; i < 16; i++) {
++			bool two = t20_h264_luma_ilut[i][1];
++
++			d = t20_vpu_acfg(d, VPU_MCE_ILUT_Y + 8 * i, t20_h264_luma_ilut[i][0]);
++			d = t20_vpu_acfg(d, VPU_MCE_ILUT_Y + 8 * i + 4, t20_h264_luma_ilut[i][1]);
++			d = t20_vpu_acfg(d, VPU_MCE_CLUT_Y + 16 * i,
++					  i ? T20_H264_LUMA_TAPS_L : 1);
++			d = t20_vpu_acfg(d, VPU_MCE_CLUT_Y + 16 * i + 4,
++					  i ? T20_H264_LUMA_TAPS_M : 0);
++			d = t20_vpu_acfg(d, VPU_MCE_CLUT_Y + 16 * i + 8,
++					  two ? T20_H264_LUMA_TAPS_L : 0);
++			d = t20_vpu_acfg(d, VPU_MCE_CLUT_Y + 16 * i + 12,
++					  two ? T20_H264_LUMA_TAPS_M : 0);
++		}
++		for (i = 0; i < 16; i++) {
++			d = t20_vpu_acfg(d, VPU_MCE_ILUT_C + 8 * i, t20_h264_chroma_ilut[i][0]);
++			d = t20_vpu_acfg(d, VPU_MCE_ILUT_C + 8 * i + 4, t20_h264_chroma_ilut[i][1]);
++			d = t20_vpu_acfg(d, VPU_MCE_CLUT_C + 16 * i, i ? 0 : 1);
++			d = t20_vpu_acfg(d, VPU_MCE_CLUT_C + 16 * i + 8, 0);
++		}
++		d = t20_vpu_acfg(d, VPU_MCE_SLC_SPOS, 0);
++		d = t20_vpu_acfg(d, VPU_MCE_FSC, 0);
++		d = t20_vpu_acfg(d, VPU_MCE_GLB_CTRL, MCE_GLB_CTRL_RM | MCE_GLB_CTRL_INIT);
++	}
++
++	/* Transform, quantisation and mode decision */
++	d = t20_vpu_acfg(d, VPU_VMAU_GBL_RUN, VMAU_RESET);
++	d = t20_vpu_acfg(d, VPU_VMAU_VIDEO_TYPE, VMAU_H264E);
++	d = t20_vpu_acfg(d, VPU_VMAU_NCCHN_ADDR, vpu + VRAM_MAU_CHN);
++	d = t20_vpu_acfg(d, VPU_VMAU_ENC_DONE, vpu + VRAM_DUMMY);
++	d = t20_vpu_acfg(d, VPU_VMAU_DEC_DONE, vpu + VPU_SCH_SCHE(2));
++	d = t20_vpu_acfg(d, VPU_VMAU_Y_GS, mbh * 16 << 16 | mbw * 16);
++	d = t20_vpu_acfg(d, VPU_VMAU_GBL_CTR, VMAU_CTRL_TO_DBLK | VMAU_CTRL_FIFO_M);
++	d = t20_vpu_acfg(d, VPU_VMAU_DEADZONE, VMAU_DEADZONE);
++	d = t20_vpu_acfg(d, VPU_VMAU_TOP_BASE, vpu + VRAM_TOPPA);
++	d = t20_vpu_acfg(d, VPU_VMAU_MD_CFG0, (mbh - 1) << 24 | (mbw - 1) << 16 | (p ? 2 : 1));
++	d = t20_vpu_acfg(d, VPU_VMAU_MD_CFG1, VMAU_MD_CFG1_T20);
++	d = t20_vpu_acfg(d, VPU_VMAU_MD_CFG2, VMAU_MD_CFG2_T20);
++	d = t20_vpu_acfg(d, VPU_VMAU_MD_CFG3, 0);
++	d = t20_vpu_acfg(d, VPU_VMAU_MD_CFG4, 0);
++	d = t20_vpu_acfg(d, VPU_VMAU_MD_CFG5, 0);
++	for (i = 0; i < 42; i++)
++		d = t20_vpu_acfg(d, VPU_VMAU_CTX,
++				  t20_h264_ctx_init(cabac[t20_h264_vmau_ctx(p, i)], ctx->qp));
++	d = t20_vpu_acfg(d, VPU_VMAU_ACMASK, 2);
++	d = t20_vpu_acfg(d, VPU_VMAU_GBL_RUN, VMAU_RUN);
++
++	/* Deblocking into the reconstructed frame */
++	d = t20_vpu_acfg(d, VPU_DBLK_TRIG, DBLK_RESET);
++	d = t20_vpu_acfg(d, VPU_DBLK_DHA, vpu + VRAM_DBLK_CHN);
++	d = t20_vpu_acfg(d, VPU_DBLK_GENDA, vpu + VPU_SCH_SCHE(3));
++	d = t20_vpu_acfg(d, VPU_DBLK_GSIZE, mbh << 16 | mbw);
++	d = t20_vpu_acfg(d, VPU_DBLK_GPOS, 0);
++	d = t20_vpu_acfg(d, VPU_DBLK_CTRL, DBLK_FILTER);
++	d = t20_vpu_acfg(d, VPU_DBLK_GPIC_YA, rec);
++	d = t20_vpu_acfg(d, VPU_DBLK_GPIC_CA, rec + luma);
++	d = t20_vpu_acfg(d, VPU_DBLK_GP_ENDA, vpu + VRAM_DUMMY);
++	d = t20_vpu_acfg(d, VPU_DBLK_GPIC_STR, mbw * 128 << 16 | mbw * 256);
++	d = t20_vpu_acfg(d, VPU_DBLK_VTR, (p ? DBLK_VTR_P : 0) | DBLK_VTR_H264);
++	d = t20_vpu_acfg(d, VPU_DBLK_TRIG, DBLK_SLICE_RUN);
++
++	/* Stream encoder: slice data after our slice header */
++	d = t20_vpu_acfg(d, VPU_SDE_STAT, 0);
++	d = t20_vpu_acfg(d, VPU_SDE_GL_CTRL, SDE_MODE_STEP | SDE_EN);
++	d = t20_vpu_acfg(d, VPU_SDE_SL_GEOM, mbh << 24 | mbw << 16);
++	d = t20_vpu_acfg(d, VPU_SDE_CODEC_ID, SDE_H264_ENC);
++	d = t20_vpu_acfg(d, VPU_SDE_CFG(0), 0x3);	/* descriptor link, auto sync */
++	d = t20_vpu_acfg(d, VPU_SDE_CFG(1), ctx->qp << 8 | SDE_CFG1_T20 | (p + 1));
++	d = t20_vpu_acfg(d, VPU_SDE_CFG(2), vpu + VRAM_SDE_CHN);
++	d = t20_vpu_acfg(d, VPU_SDE_CFG(3), vpu + VPU_SCH_SCHE(4));
++	d = t20_vpu_acfg(d, VPU_SDE_CFG(4), ctx->bs_dma);
++	for (i = 0; i < 460; i++)
++		d = t20_vpu_acfg(d, VPU_SDE_CTX_TBL + 4 * i,
++				  t20_h264_ctx_state(t20_h264_ctx_init(cabac[i], ctx->qp)));
++	d = t20_vpu_acfg(d, VPU_SDE_SL_CTRL, SDE_SLICE_INIT);
++
++	/* Scheduler: MCE (P frames only), VMAU, DBLK, SDE */
++	d = t20_vpu_acfg(d, VPU_SCH_SCHC, 0);
++	d = t20_vpu_acfg(d, VPU_SCH_BND, 0);
++	d = t20_vpu_acfg(d, VPU_SCH_SCHG0, 0);
++	d = t20_vpu_acfg(d, VPU_SCH_SCHG1, 0);
++	for (i = 1; i <= 4; i++)
++		d = t20_vpu_acfg(d, VPU_SCH_SCHE(i), 0);
++	d = t20_vpu_acfg(d, VPU_SCH_SCHC, SCH_SCHC_H264E | (p ? SCH_SCHC_P : 0));
++	d = t20_vpu_acfg(d, VPU_SCH_BND, SCH_BND_H264E | (p ? SCH_BND_P : 0));
++
++	d = t20_vpu_acfg(d, VPU_EFE_CTRL, EFE_TSE | EFE_FMVP | EFE_X264_QP(ctx->qp) |
++			  EFE_DBLK_EN | (p ? EFE_SLICE_P : 0) | EFE_PLANE_NV12 |
++			  EFE_EN | EFE_RUN);
++	t20_vpu_acfg_end(t20vpu, d);
++}
++
++/* The frame's NAL units into the capture buffer: header, then slice data */
++static int t20_h264_output(struct t20_h264_ctx *ctx, struct vb2_v4l2_buffer *dst,
++			   u32 bs_len)
++{
++	u8 *start = vb2_plane_vaddr(&dst->vb2_buf, 0);
++	u8 *end = start + vb2_plane_size(&dst->vb2_buf, 0), *p;
++	unsigned int zeros = ctx->hdr_zeros;
++
++	if (bs_len > ctx->bs_size || ctx->hdr_len > end - start)
++		return -ENOSPC;
++	memcpy(start, ctx->hdr, ctx->hdr_len);
++	p = t20_h264_escape(start + ctx->hdr_len, end, ctx->bs, bs_len, &zeros);
++	if (!p)
++		return -ENOSPC;
++	vb2_set_plane_payload(&dst->vb2_buf, 0, p - start);
++	return 0;
++}
++
++/* log2(x) in 1/256 */
++static int t20_h264_log2(u32 x)
++{
++	int n = fls(x) - 1;
++
++	return n * 256 + (n >= 8 ? x >> (n - 8) : x << (8 - n)) % 256;
++}
++
++/*
++ * Frame-level rate control: the bits of a frame halve every 6 QP. The next
++ * frames aim at the budget less 1/8 of the debt (an I frame's excess is paid
++ * back over the following P frames); the P frame QP follows that, at most 3
++ * a frame.
++ */
++static void t20_h264_rc_update(struct t20_h264_ctx *ctx, u32 bits)
++{
++	struct v4l2_fract *t = &ctx->timeperframe;
++	s64 budget = div_u64((u64)ctx->bitrate * t->numerator, t->denominator);
++	s64 target;
++	int delta;
++
++	ctx->rc_debt = clamp_t(s64, ctx->rc_debt + bits - budget,
++			       -(s64)ctx->bitrate, ctx->bitrate);
++	if (ctx->idr)
++		return;
++	target = clamp_t(s64, budget - div_s64(ctx->rc_debt, 8), budget / 4, budget * 2);
++	delta = 6 * (t20_h264_log2(bits) - t20_h264_log2(target));
++	delta = clamp(DIV_ROUND_CLOSEST(delta, 256), -3, 3);
++	ctx->rc_qp = clamp_t(int, ctx->rc_qp + delta, ctx->min_qp, ctx->max_qp);
++}
++
++/* The first QP: about 0.1 bit a pixel at QP 30 (P frames of a lit room) */
++static u32 t20_h264_rc_start_qp(struct t20_h264_ctx *ctx)
++{
++	struct v4l2_fract *t = &ctx->timeperframe;
++	u32 budget = div_u64((u64)ctx->bitrate * t->numerator, t->denominator);
++	u32 bits_qp30 = ctx->out_fmt.width * ctx->out_fmt.height / 10;
++	int qp = 30 + DIV_ROUND_CLOSEST(6 * (t20_h264_log2(bits_qp30) -
++					     t20_h264_log2(max(budget, 1U))), 256);
++
++	return clamp_t(int, qp, ctx->min_qp, ctx->max_qp);
++}
++
++static void t20_h264_done(struct t20_vpu_ctx *vctx, u32 stat)
++{
++	struct t20_h264_ctx *ctx = to_h264_ctx(vctx);
++	struct t20_vpu *vpu = vctx->vpu;
++	enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
++	struct vb2_v4l2_buffer *src, *dst;
++	u32 bs_len = 0;
++
++	if (stat & SCH_STAT_ENDF) {
++		bs_len = readl(vpu->regs + VPU_SDE_CFG(9)) & SDE_BS_LEN;
++		state = VB2_BUF_STATE_DONE;
++	} else if (stat) {
++		dev_err(vpu->dev, "H.264: encode failed: status %#x\n", stat);
++	}
++
++	src = v4l2_m2m_src_buf_remove(vctx->fh.m2m_ctx);
++	dst = v4l2_m2m_dst_buf_remove(vctx->fh.m2m_ctx);
++	if (dst && state == VB2_BUF_STATE_DONE && t20_h264_output(ctx, dst, bs_len)) {
++		dev_err(vpu->dev, "H.264: frame too large (%u bytes)\n", bs_len);
++		state = VB2_BUF_STATE_ERROR;
++	}
++	if (state == VB2_BUF_STATE_DONE) {
++		if (ctx->rc)
++			t20_h264_rc_update(ctx, vb2_get_plane_payload(&dst->vb2_buf, 0) * 8);
++		/* This frame is the next one's reference */
++		ctx->cur ^= 1;
++		ctx->frame_num = (ctx->frame_num + 1) % BIT(T20_H264_LOG2_MAX_FRAME_NUM);
++		if (++ctx->gop_pos >= ctx->gop_size)
++			ctx->gop_pos = 0;
++	} else {
++		ctx->gop_pos = 0;	/* start again with an IDR frame */
++	}
++	if (src && dst) {
++		v4l2_m2m_buf_copy_metadata(src, dst, true);
++		dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME);
++		dst->flags |= ctx->idr ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
++	}
++	if (src)
++		v4l2_m2m_buf_done(src, state);
++	if (dst)
++		v4l2_m2m_buf_done(dst, state);
++}
++
++static void t20_h264_run(struct t20_vpu_ctx *vctx)
++{
++	struct t20_h264_ctx *ctx = to_h264_ctx(vctx);
++	struct t20_vpu *vpu = vctx->vpu;
++	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(vctx->fh.m2m_ctx);
++
++	ctx->idr = ctx->gop_pos == 0 || ctx->force_key;
++	if (ctx->idr) {
++		/* Consecutive IDR frames differ in idr_pic_id */
++		ctx->idr_pic_id = (ctx->idr_pic_id + 1) & 0xffff;
++		ctx->force_key = false;
++		ctx->gop_pos = 0;
++		ctx->frame_num = 0;
++	}
++	if (!ctx->rc)
++		ctx->qp = ctx->idr ? ctx->i_qp : ctx->p_qp;
++	else	/* I frames a little better: the P frames predict from them */
++		ctx->qp = clamp(ctx->rc_qp - (ctx->idr ? 2 : 0), ctx->min_qp, ctx->max_qp);
++	t20_h264_write_header(ctx);
++	dma_sync_single_for_device(vpu->dev, ctx->bs_dma, ctx->bs_size, DMA_FROM_DEVICE);
++	t20_h264_build_desc(vpu, ctx, vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0));
++}
++
++static const struct t20_vpu_codec t20_h264_codec = {
++	.run = t20_h264_run,
++	.done = t20_h264_done,
++};
++
++/* Formats */
++
++static void t20_h264_fill_fmt(struct t20_h264_ctx *ctx, u32 width, u32 height)
++{
++	struct v4l2_pix_format *out = &ctx->out_fmt, *cap = &ctx->cap_fmt;
++
++	/* The EFE reads whole macroblocks: whole ones across, rows past the end */
++	out->width = clamp_t(u32, ALIGN(width, 16), T20_H264_MIN_SIZE, T20_H264_MAX_SIZE);
++	out->height = clamp_t(u32, ALIGN(height, 2), T20_H264_MIN_SIZE, T20_H264_MAX_SIZE);
++	out->pixelformat = V4L2_PIX_FMT_NV12;
++	out->field = V4L2_FIELD_NONE;
++	out->bytesperline = out->width;
++	out->sizeimage = out->bytesperline * ALIGN(out->height, 16) * 3 / 2;
++	/* As the ISP writes by default; the range goes into the VUI */
++	out->colorspace = V4L2_COLORSPACE_SRGB;
++	out->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	if (out->quantization != V4L2_QUANTIZATION_LIM_RANGE)
++		out->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	out->xfer_func = V4L2_XFER_FUNC_SRGB;
++	ctx->mbw = out->width / 16;
++	ctx->mbh = DIV_ROUND_UP(out->height, 16);
++
++	*cap = *out;
++	cap->pixelformat = V4L2_PIX_FMT_H264;
++	cap->bytesperline = 0;
++	cap->sizeimage = out->width * out->height / 2 + T20_H264_HDR_SIZE;
++}
++
++static int t20_h264_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, "t20-h264", sizeof(cap->driver));
++	strscpy(cap->card, "Ingenic T20 H.264 encoder", sizeof(cap->card));
++	return 0;
++}
++
++static int t20_h264_enum_fmt_out(struct file *file, void *fh, struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_NV12;
++	return 0;
++}
++
++static int t20_h264_enum_fmt_cap(struct file *file, void *fh, struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_H264;
++	f->flags = V4L2_FMT_FLAG_COMPRESSED;
++	return 0;
++}
++
++static int t20_h264_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_h264_ctx *ctx = file_to_ctx(file);
++
++	f->fmt.pix = V4L2_TYPE_IS_OUTPUT(f->type) ? ctx->out_fmt : ctx->cap_fmt;
++	return 0;
++}
++
++/* The size comes from the output (raw) side; the capture side follows it */
++static int t20_h264_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_h264_ctx *ctx = file_to_ctx(file), tmp;
++
++	tmp.out_fmt = ctx->out_fmt;
++	tmp.cap_fmt = ctx->cap_fmt;
++	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++		tmp.out_fmt.quantization = f->fmt.pix.quantization;
++		t20_h264_fill_fmt(&tmp, f->fmt.pix.width, f->fmt.pix.height);
++	}
++	f->fmt.pix = V4L2_TYPE_IS_OUTPUT(f->type) ? tmp.out_fmt : tmp.cap_fmt;
++	return 0;
++}
++
++static int t20_h264_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct t20_h264_ctx *ctx = file_to_ctx(file);
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->vpu_ctx.fh.m2m_ctx;
++
++	if (vb2_is_busy(v4l2_m2m_get_vq(m2m_ctx, f->type)))
++		return -EBUSY;
++	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++		if (vb2_is_busy(v4l2_m2m_get_vq(m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE)))
++			return -EBUSY;
++		ctx->out_fmt.quantization = f->fmt.pix.quantization;
++		t20_h264_fill_fmt(ctx, f->fmt.pix.width, f->fmt.pix.height);
++	}
++	return t20_h264_g_fmt(file, fh, f);
++}
++
++/* The frame rate, for the rate control */
++static int t20_h264_g_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
++{
++	struct t20_h264_ctx *ctx = file_to_ctx(file);
++
++	if (!V4L2_TYPE_IS_OUTPUT(a->type))
++		return -EINVAL;
++	a->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
++	a->parm.output.timeperframe = ctx->timeperframe;
++	return 0;
++}
++
++static int t20_h264_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
++{
++	struct t20_h264_ctx *ctx = file_to_ctx(file);
++	struct v4l2_fract *t = &a->parm.output.timeperframe;
++
++	if (!V4L2_TYPE_IS_OUTPUT(a->type))
++		return -EINVAL;
++	if (t->numerator && t->denominator)
++		ctx->timeperframe = *t;
++	return t20_h264_g_parm(file, fh, a);
++}
++
++const struct v4l2_ioctl_ops t20_vpu_h264_ioctl_ops = {
++	.vidioc_querycap = t20_h264_querycap,
++	.vidioc_enum_fmt_vid_out = t20_h264_enum_fmt_out,
++	.vidioc_enum_fmt_vid_cap = t20_h264_enum_fmt_cap,
++	.vidioc_g_fmt_vid_out = t20_h264_g_fmt,
++	.vidioc_g_fmt_vid_cap = t20_h264_g_fmt,
++	.vidioc_try_fmt_vid_out = t20_h264_try_fmt,
++	.vidioc_try_fmt_vid_cap = t20_h264_try_fmt,
++	.vidioc_s_fmt_vid_out = t20_h264_s_fmt,
++	.vidioc_s_fmt_vid_cap = t20_h264_s_fmt,
++	.vidioc_g_parm = t20_h264_g_parm,
++	.vidioc_s_parm = t20_h264_s_parm,
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/* Queues */
++
++static int t20_h264_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
++				unsigned int *nplanes, unsigned int sizes[],
++				struct device *alloc_devs[])
++{
++	struct t20_h264_ctx *ctx = vb2_get_drv_priv(q);
++
++	return t20_vpu_queue_setup(q, V4L2_TYPE_IS_OUTPUT(q->type) ? ctx->out_fmt.sizeimage :
++								    ctx->cap_fmt.sizeimage,
++				   nbuffers, nplanes, sizes);
++}
++
++static int t20_h264_buf_prepare(struct vb2_buffer *vb)
++{
++	struct t20_h264_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct v4l2_pix_format *f = &ctx->out_fmt;
++
++	/* NV12 with the chroma right after the luma, as the ISP writes it */
++	if (V4L2_TYPE_IS_OUTPUT(vb->type))
++		return vb2_plane_size(vb, 0) < f->bytesperline * f->height * 3 / 2 ?
++		       -EINVAL : 0;
++	return vb2_plane_size(vb, 0) < ctx->cap_fmt.sizeimage ? -EINVAL : 0;
++}
++
++static void t20_h264_free_bufs(struct t20_h264_ctx *ctx)
++{
++	struct device *dev = ctx->vpu_ctx.vpu->dev;
++
++	if (ctx->ref)
++		dma_free_coherent(dev, ctx->ref_size, ctx->ref, ctx->ref_dma);
++	if (ctx->bs_alloc)
++		dma_free_coherent(dev, ctx->bs_size, ctx->bs_alloc, ctx->bs_dma);
++	ctx->ref = NULL;
++	ctx->bs_alloc = NULL;
++}
++
++/* The reference frames and the slice data buffer, with the capture queue */
++static int t20_h264_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct t20_h264_ctx *ctx = vb2_get_drv_priv(q);
++	struct device *dev = ctx->vpu_ctx.vpu->dev;
++
++	if (V4L2_TYPE_IS_OUTPUT(q->type))
++		return 0;
++	ctx->ref_size = 2 * REF_SIZE(ctx->mbw, ctx->mbh);
++	ctx->ref = dma_alloc_coherent(dev, ctx->ref_size, &ctx->ref_dma, GFP_KERNEL);
++	/* As large as the raw frame: no QP makes more (I_PCM would not) */
++	ctx->bs_size = ctx->mbw * ctx->mbh * 384;
++	ctx->bs_alloc = dma_alloc_coherent(dev, ctx->bs_size, &ctx->bs_dma, GFP_KERNEL);
++	if (!ctx->ref || !ctx->bs_alloc) {
++		t20_h264_free_bufs(ctx);
++		t20_vpu_return_bufs(&ctx->vpu_ctx, q, VB2_BUF_STATE_QUEUED);
++		return -ENOMEM;
++	}
++	/*
++	 * Read through the cached mapping (KSEG0): reading the slice data
++	 * uncached runs at 4 MB/s. Invalidated before each job (no
++	 * speculative loads on the XBurst core).
++	 */
++	ctx->bs = phys_to_virt(ctx->bs_dma);
++	ctx->cur = 0;
++	ctx->gop_pos = 0;
++	ctx->frame_num = 0;
++	ctx->rc_qp = t20_h264_rc_start_qp(ctx);
++	ctx->rc_debt = 0;
++	return 0;
++}
++
++static void t20_h264_stop_streaming(struct vb2_queue *q)
++{
++	struct t20_h264_ctx *ctx = vb2_get_drv_priv(q);
++
++	t20_vpu_return_bufs(&ctx->vpu_ctx, q, VB2_BUF_STATE_ERROR);
++	if (!V4L2_TYPE_IS_OUTPUT(q->type))
++		t20_h264_free_bufs(ctx);
++}
++
++static const struct vb2_ops t20_h264_vb2_ops = {
++	.queue_setup = t20_h264_queue_setup,
++	.buf_prepare = t20_h264_buf_prepare,
++	.buf_queue = t20_vpu_buf_queue,
++	.start_streaming = t20_h264_start_streaming,
++	.stop_streaming = t20_h264_stop_streaming,
++};
++
++/* The CPU writes the capture buffers (the VPU the slice data elsewhere): cached */
++static int t20_h264_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
++{
++	return t20_vpu_queue_init(priv, src, dst, &t20_h264_vb2_ops, &vb2_vmalloc_memops);
++}
++
++/* Controls */
++static int t20_h264_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct t20_h264_ctx *ctx = container_of(ctrl->handler, struct t20_h264_ctx, ctrls);
++
++	switch (ctrl->id) {
++	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
++		ctx->gop_size = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP:
++		ctx->i_qp = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP:
++		ctx->p_qp = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
++		ctx->force_key = true;
++		break;
++	case V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE:
++		ctx->rc = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_BITRATE:
++		ctx->bitrate = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_MIN_QP:
++		ctx->min_qp = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_MAX_QP:
++		ctx->max_qp = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_PROFILE:
++	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops t20_h264_ctrl_ops = {
++	.s_ctrl = t20_h264_s_ctrl,
++};
++
++/* File operations */
++
++static int t20_h264_open(struct file *file)
++{
++	struct t20_vpu *vpu = video_drvdata(file);
++	struct v4l2_ctrl_handler *hdl;
++	struct t20_h264_ctx *ctx;
++	struct v4l2_fh *fh;
++	int ret;
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	t20_vpu_ctx_init(&ctx->vpu_ctx, vpu, &vpu->h264_vdev, &t20_h264_codec);
++	fh = &ctx->vpu_ctx.fh;
++	ctx->out_fmt.quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	t20_h264_fill_fmt(ctx, 1920, 1080);
++	ctx->timeperframe = (struct v4l2_fract){ 1, 25 };
++
++	hdl = &ctx->ctrls;
++	v4l2_ctrl_handler_init(hdl, 10);
++	v4l2_ctrl_new_std(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
++			  1, 1000, 1, 50);
++	/* Below 10 the frames could overrun the buffers */
++	v4l2_ctrl_new_std(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
++			  10, 51, 1, 28);
++	v4l2_ctrl_new_std(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP,
++			  10, 51, 1, 30);
++	v4l2_ctrl_new_std(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
++			  0, 0, 0, 0);
++	v4l2_ctrl_new_std(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE,
++			  0, 1, 1, 1);
++	v4l2_ctrl_new_std(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_BITRATE,
++			  64000, 40000000, 1000, 4000000);
++	v4l2_ctrl_new_std(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
++			  10, 51, 1, 18);
++	v4l2_ctrl_new_std(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
++			  10, 51, 1, 45);
++	v4l2_ctrl_new_std_menu(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
++			       V4L2_MPEG_VIDEO_H264_PROFILE_MAIN,
++			       ~BIT(V4L2_MPEG_VIDEO_H264_PROFILE_MAIN),
++			       V4L2_MPEG_VIDEO_H264_PROFILE_MAIN);
++	v4l2_ctrl_new_std_menu(hdl, &t20_h264_ctrl_ops, V4L2_CID_MPEG_VIDEO_HEADER_MODE,
++			       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
++			       ~BIT(V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME),
++			       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
++	if (hdl->error) {
++		ret = hdl->error;
++		goto err_ctrls;
++	}
++	v4l2_ctrl_handler_setup(hdl);
++	ctx->force_key = false;
++	fh->ctrl_handler = hdl;
++
++	fh->m2m_ctx = v4l2_m2m_ctx_init(vpu->m2m_dev, ctx, t20_h264_queue_init);
++	if (IS_ERR(fh->m2m_ctx)) {
++		ret = PTR_ERR(fh->m2m_ctx);
++		goto err_ctrls;
++	}
++	v4l2_fh_add(fh, file);
++	return 0;
++
++err_ctrls:
++	v4l2_ctrl_handler_free(hdl);
++	v4l2_fh_exit(fh);
++	kfree(ctx);
++	return ret;
++}
++
++const struct v4l2_file_operations t20_vpu_h264_fops = {
++	.owner = THIS_MODULE,
++	.open = t20_h264_open,
++	.release = t20_vpu_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};

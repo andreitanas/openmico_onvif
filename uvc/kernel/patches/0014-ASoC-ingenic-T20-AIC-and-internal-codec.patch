@@ -1,0 +1,448 @@
+From: openmico_onvif <andrei.tanas@gmail.com>
+Subject: [PATCH] ASoC: ingenic: T20 AIC and internal codec
+
+The T20's AIC is the JZ4780 generation's (FIFO thresholds, separate capture
+and playback dividers); its internal codec is the I2S master but runs on the
+AIC's system clock, so the AIC selects it as internal (AICFR bit 7) and
+outputs the system clock in every mode.
+
+The codec driver covers the microphone ADC: power-up and microphone
+sequences from Ingenic's GPL-2.0 T10/T20 OSS driver, sample rates 8-96 kHz,
+the PGA and the 20 dB boost as controls.
+---
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index 91ac99bc3..6fab220cf 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -1093,6 +1093,17 @@ config SND_SOC_CX2072X
+ 	help
+ 	  Enable support for Conexant CX20721 and CX20723 codec chips.
+ 
++config SND_SOC_T20_CODEC
++	tristate "Ingenic T20 internal audio codec"
++	depends on MACH_INGENIC || COMPILE_TEST
++	depends on OF
++	select REGMAP_MMIO
++	help
++	  The audio codec inside the Ingenic T20 SoC: its microphone ADC.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called snd-soc-t20-codec.
++
+ config SND_SOC_JZ4740_CODEC
+ 	depends on MACH_INGENIC || COMPILE_TEST
+ 	depends on OF
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index da4077463..f52ddc59d 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -148,6 +148,7 @@ snd-soc-idt821034-y := idt821034.o
+ snd-soc-inno-rk3036-y := inno_rk3036.o
+ snd-soc-isabelle-y := isabelle.o
+ snd-soc-jz4740-codec-y := jz4740.o
++snd-soc-t20-codec-y := t20-codec.o
+ snd-soc-jz4725b-codec-y := jz4725b.o
+ snd-soc-jz4760-codec-y := jz4760.o
+ snd-soc-jz4770-codec-y := jz4770.o
+@@ -580,6 +581,7 @@ obj-$(CONFIG_SND_SOC_IDT821034)	+= snd-soc-idt821034.o
+ obj-$(CONFIG_SND_SOC_INNO_RK3036)	+= snd-soc-inno-rk3036.o
+ obj-$(CONFIG_SND_SOC_ISABELLE)	+= snd-soc-isabelle.o
+ obj-$(CONFIG_SND_SOC_JZ4740_CODEC)	+= snd-soc-jz4740-codec.o
++obj-$(CONFIG_SND_SOC_T20_CODEC)	+= snd-soc-t20-codec.o
+ obj-$(CONFIG_SND_SOC_JZ4725B_CODEC)	+= snd-soc-jz4725b-codec.o
+ obj-$(CONFIG_SND_SOC_JZ4760_CODEC)      += snd-soc-jz4760-codec.o
+ obj-$(CONFIG_SND_SOC_JZ4770_CODEC)	+= snd-soc-jz4770-codec.o
+diff --git a/sound/soc/codecs/t20-codec.c b/sound/soc/codecs/t20-codec.c
+new file mode 100644
+index 000000000..606689488
+--- /dev/null
++++ b/sound/soc/codecs/t20-codec.c
+@@ -0,0 +1,319 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Ingenic T20 internal audio codec: the microphone ADC.
++ *
++ * The codec is memory mapped next to the AIC and is its I2S master: it makes
++ * the bit and frame clocks from the AIC's system clock (256 fs). The register
++ * names and the power-up and microphone sequences are from Ingenic's GPL-2.0
++ * OSS driver for the T10/T20 codec (jz_t10_codec.c, Copyright (c) Ingenic
++ * Semiconductor Co., Ltd.); the ASoC driver around them is new. The DAC
++ * (speaker) side is not supported yet.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/tlv.h>
++
++#define CODEC_CGR	0x00	/* reset: bits 1:0 */
++#define CODEC_CACR	0x08	/* ADC interface */
++#define CACR_MONO	BIT(0)
++#define CACR_MODE	GENMASK(4, 3)
++#define CACR_MODE_I2S	2
++#define CACR_LEN	GENMASK(6, 5)	/* 16, 20, 24, 32 bits */
++#define CODEC_CMCR	0x0c	/* master mode */
++#define CMCR_MASTER	0x3e
++#define CODEC_CDCR1	0x10	/* DAC interface */
++#define CDCR1_I2S	0x10
++#define CODEC_CDCR2	0x14
++#define CDCR2_DEFAULT	0x0e
++#define CODEC_CAACR	0x84	/* ADC analog */
++#define CAACR_MICBIAS	GENMASK(2, 0)	/* 6: 1.6 x VCC */
++#define CAACR_ZERO_CROSS BIT(5)
++#define CAACR_BIAS_EN	BIT(6)
++#define CAACR_CURRENT	BIT(7)
++#define CODEC_CMICCR	0x88	/* microphone */
++#define CMICCR_ALC_EN	BIT(0)
++#define CMICCR_ALC_RUN	BIT(1)
++#define CMICCR_BST_RUN	BIT(4)
++#define CMICCR_BST_20DB	BIT(5)
++#define CMICCR_BST_EN	BIT(6)
++#define CODEC_CACR2	0x8c
++#define CACR2_GAIN	GENMASK(4, 0)	/* -18 dB + 1.5 dB steps */
++#define CACR2_SINGLE	BIT(5)		/* single-ended microphone */
++#define CODEC_CAMPCR	0x90	/* ADC power */
++#define CAMPCR_AMP	BIT(5)
++#define CAMPCR_CLK	BIT(6)
++#define CAMPCR_VREF	BIT(7)
++#define CODEC_CHCR	0x9c	/* precharge (bits 7:6), DAC volume */
++#define CHCR_PRECHARGE	GENMASK(7, 6)
++#define CODEC_CCR	0xa0	/* reference ramp */
++#define CCR_RAMP	GENMASK(6, 0)
++#define CCR_EN		BIT(7)
++#define CODEC_CSRR	0x110	/* sample rate */
++#define CSRR_RATE	GENMASK(2, 0)
++#define CODEC_MAX	0x130
++
++struct t20_codec {
++	struct device *dev;
++	struct regmap *regmap;
++	struct clk *mclk;
++};
++
++/* CSRR codes 7..0: 8, 12, 16, 24, 32, 44.1, 48, 96 kHz */
++static const unsigned int t20_codec_rates[] = {
++	96000, 48000, 44100, 32000, 24000, 16000, 12000, 8000,
++};
++
++static const struct snd_pcm_hw_constraint_list t20_codec_rate_list = {
++	.count = ARRAY_SIZE(t20_codec_rates),
++	.list = t20_codec_rates,
++};
++
++/* Out of reset, the reference voltage up in steps (the vendor's T20 order) */
++static void t20_codec_power_up(struct t20_codec *codec)
++{
++	struct regmap *map = codec->regmap;
++	int i;
++
++	regmap_update_bits(map, CODEC_CGR, 0x3, 0);
++	fsleep(10000);
++	regmap_update_bits(map, CODEC_CGR, 0x3, 0x3);
++	fsleep(10000);
++
++	regmap_write(map, CODEC_CMCR, CMCR_MASTER);
++	regmap_write(map, CODEC_CDCR1, CDCR1_I2S);
++	regmap_write(map, CODEC_CDCR2, CDCR2_DEFAULT);
++
++	regmap_update_bits(map, CODEC_CHCR, CHCR_PRECHARGE, FIELD_PREP(CHCR_PRECHARGE, 1));
++	msleep(20);
++	regmap_update_bits(map, CODEC_CCR, CCR_EN, CCR_EN);
++	msleep(20);
++	for (i = 0; i < 6; i++) {
++		regmap_update_bits(map, CODEC_CCR, CCR_RAMP, 0x3f >> (6 - i));
++		msleep(30);
++	}
++	msleep(20);
++	regmap_update_bits(map, CODEC_CCR, CCR_RAMP, 0x3f);
++	msleep(20);
++}
++
++/* The microphone and the ADC on, in the vendor's order */
++static void t20_codec_adc_on(struct t20_codec *codec)
++{
++	struct regmap *map = codec->regmap;
++
++	regmap_update_bits(map, CODEC_CACR2, CACR2_SINGLE, CACR2_SINGLE);
++	regmap_update_bits(map, CODEC_CAACR, CAACR_CURRENT, CAACR_CURRENT);
++	regmap_update_bits(map, CODEC_CAACR, CAACR_BIAS_EN, CAACR_BIAS_EN);
++	regmap_update_bits(map, CODEC_CAACR, CAACR_MICBIAS, 6);
++	regmap_update_bits(map, CODEC_CAMPCR, CAMPCR_VREF, CAMPCR_VREF);
++	fsleep(10000);
++	regmap_update_bits(map, CODEC_CMICCR, CMICCR_BST_EN, CMICCR_BST_EN);
++	regmap_update_bits(map, CODEC_CMICCR, CMICCR_ALC_EN, CMICCR_ALC_EN);
++	regmap_update_bits(map, CODEC_CAMPCR, CAMPCR_CLK, CAMPCR_CLK);
++	regmap_update_bits(map, CODEC_CAMPCR, CAMPCR_AMP, CAMPCR_AMP);
++	fsleep(10000);
++	regmap_update_bits(map, CODEC_CMICCR, CMICCR_ALC_RUN, CMICCR_ALC_RUN);
++	regmap_update_bits(map, CODEC_CMICCR, CMICCR_BST_RUN, CMICCR_BST_RUN);
++	regmap_update_bits(map, CODEC_CAACR, CAACR_ZERO_CROSS, CAACR_ZERO_CROSS);
++}
++
++static void t20_codec_adc_off(struct t20_codec *codec)
++{
++	regmap_update_bits(codec->regmap, CODEC_CAMPCR,
++			   CAMPCR_VREF | CAMPCR_CLK | CAMPCR_AMP, 0);
++}
++
++/* DAI */
++
++static int t20_codec_startup(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
++{
++	struct t20_codec *codec = snd_soc_component_get_drvdata(dai->component);
++	int ret;
++
++	ret = snd_pcm_hw_constraint_list(substream->runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
++					 &t20_codec_rate_list);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(codec->mclk);
++	if (ret)
++		return ret;
++	t20_codec_adc_on(codec);
++	return 0;
++}
++
++static void t20_codec_shutdown(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
++{
++	struct t20_codec *codec = snd_soc_component_get_drvdata(dai->component);
++
++	t20_codec_adc_off(codec);
++	clk_disable_unprepare(codec->mclk);
++}
++
++static int t20_codec_hw_params(struct snd_pcm_substream *substream,
++			       struct snd_pcm_hw_params *params, struct snd_soc_dai *dai)
++{
++	struct t20_codec *codec = snd_soc_component_get_drvdata(dai->component);
++	unsigned int rate = params_rate(params), i, len;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(t20_codec_rates); i++)
++		if (t20_codec_rates[i] == rate)
++			break;
++	if (i == ARRAY_SIZE(t20_codec_rates))
++		return -EINVAL;
++
++	switch (params_width(params)) {
++	case 16:
++		len = 0;
++		break;
++	case 20:
++		len = 1;
++		break;
++	case 24:
++		len = 2;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/* The codec runs on the AIC's system clock: 256 fs */
++	ret = clk_set_rate(codec->mclk, rate * 256);
++	if (ret) {
++		dev_err(codec->dev, "system clock %u Hz: %d\n", rate * 256, ret);
++		return ret;
++	}
++	regmap_update_bits(codec->regmap, CODEC_CSRR, CSRR_RATE, FIELD_PREP(CSRR_RATE, i));
++	/*
++	 * One ADC, in the vendor's mono mode: its samples are in the right
++	 * channel (the left has a stray copy every 8th frame)
++	 */
++	regmap_update_bits(codec->regmap, CODEC_CACR, CACR_LEN | CACR_MODE | CACR_MONO,
++			   FIELD_PREP(CACR_LEN, len) | FIELD_PREP(CACR_MODE, CACR_MODE_I2S) |
++			   CACR_MONO);
++	return 0;
++}
++
++static int t20_codec_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	/* The codec makes both clocks */
++	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_CBP_CFP)
++		return -EINVAL;
++	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
++		return -EINVAL;
++	return 0;
++}
++
++static const struct snd_soc_dai_ops t20_codec_dai_ops = {
++	.startup = t20_codec_startup,
++	.shutdown = t20_codec_shutdown,
++	.hw_params = t20_codec_hw_params,
++	.set_fmt = t20_codec_set_fmt,
++};
++
++static struct snd_soc_dai_driver t20_codec_dai = {
++	.name = "t20-codec",
++	.capture = {
++		.stream_name = "Capture",
++		.channels_min = 2,
++		.channels_max = 2,
++		.rates = SNDRV_PCM_RATE_8000_96000,
++		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_LE |
++			   SNDRV_PCM_FMTBIT_S24_LE,
++	},
++	.ops = &t20_codec_dai_ops,
++};
++
++/* Controls */
++
++static const DECLARE_TLV_DB_SCALE(t20_codec_gain_tlv, -1800, 150, 0);
++static const DECLARE_TLV_DB_SCALE(t20_codec_boost_tlv, 0, 2000, 0);
++
++static const struct snd_kcontrol_new t20_codec_controls[] = {
++	SOC_SINGLE_TLV("Mic Capture Volume", CODEC_CACR2, 0, 31, 0, t20_codec_gain_tlv),
++	SOC_SINGLE_TLV("Mic Boost Capture Volume", CODEC_CMICCR, 5, 1, 0,
++		       t20_codec_boost_tlv),
++};
++
++static int t20_codec_probe(struct snd_soc_component *component)
++{
++	struct t20_codec *codec = snd_soc_component_get_drvdata(component);
++	int ret;
++
++	ret = clk_prepare_enable(codec->mclk);
++	if (ret)
++		return ret;
++	t20_codec_power_up(codec);
++	/* The vendor's defaults: +10.5 dB and the 20 dB boost */
++	regmap_update_bits(codec->regmap, CODEC_CACR2, CACR2_GAIN, 0x13);
++	regmap_update_bits(codec->regmap, CODEC_CMICCR, CMICCR_BST_20DB, CMICCR_BST_20DB);
++	clk_disable_unprepare(codec->mclk);
++	return 0;
++}
++
++static const struct snd_soc_component_driver t20_codec_component = {
++	.probe = t20_codec_probe,
++	.controls = t20_codec_controls,
++	.num_controls = ARRAY_SIZE(t20_codec_controls),
++	.idle_bias_on = 1,
++	.endianness = 1,
++};
++
++static const struct regmap_config t20_codec_regmap_config = {
++	.reg_bits = 32,
++	.reg_stride = 4,
++	.val_bits = 32,
++	.max_register = CODEC_MAX,
++};
++
++static int t20_codec_platform_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct t20_codec *codec;
++	void __iomem *base;
++
++	codec = devm_kzalloc(dev, sizeof(*codec), GFP_KERNEL);
++	if (!codec)
++		return -ENOMEM;
++	codec->dev = dev;
++
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++	codec->regmap = devm_regmap_init_mmio(dev, base, &t20_codec_regmap_config);
++	if (IS_ERR(codec->regmap))
++		return PTR_ERR(codec->regmap);
++	codec->mclk = devm_clk_get(dev, "mclk");
++	if (IS_ERR(codec->mclk))
++		return dev_err_probe(dev, PTR_ERR(codec->mclk), "mclk\n");
++
++	platform_set_drvdata(pdev, codec);
++	return devm_snd_soc_register_component(dev, &t20_codec_component, &t20_codec_dai, 1);
++}
++
++static const struct of_device_id t20_codec_of_match[] = {
++	{ .compatible = "ingenic,t20-codec" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, t20_codec_of_match);
++
++static struct platform_driver t20_codec_driver = {
++	.driver = {
++		.name = "t20-codec",
++		.of_match_table = t20_codec_of_match,
++	},
++	.probe = t20_codec_platform_probe,
++};
++module_platform_driver(t20_codec_driver);
++
++MODULE_DESCRIPTION("Ingenic T20 internal audio codec");
++MODULE_LICENSE("GPL");
+diff --git a/sound/soc/jz4740/jz4740-i2s.c b/sound/soc/jz4740/jz4740-i2s.c
+index 517619531..9e1f3e4e3 100644
+--- a/sound/soc/jz4740/jz4740-i2s.c
++++ b/sound/soc/jz4740/jz4740-i2s.c
+@@ -31,6 +31,7 @@
+ #define JZ_REG_AIC_CLK_DIV	0x30
+ #define JZ_REG_AIC_FIFO		0x34
+ 
++#define JZ_AIC_CONF_INTERNAL_CODEC_SEL	BIT(7)
+ #define JZ_AIC_CONF_OVERFLOW_PLAY_LAST	BIT(6)
+ #define JZ_AIC_CONF_INTERNAL_CODEC	BIT(5)
+ #define JZ_AIC_CONF_I2S			BIT(4)
+@@ -72,6 +73,11 @@ struct i2s_soc_info {
+ 	struct reg_field field_i2sdiv_playback;
+ 
+ 	bool shared_fifo_flush;
++	/*
++	 * The internal codec is the I2S master but runs on the AIC's system
++	 * clock (T20): select it, and output the clock in every mode
++	 */
++	bool internal_codec_sysclk;
+ };
+ 
+ struct jz4740_i2s {
+@@ -195,6 +201,9 @@ static int jz4740_i2s_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ 		return -EINVAL;
+ 	}
+ 
++	if (i2s->soc_info->internal_codec_sysclk)
++		format |= JZ_AIC_I2S_FMT_ENABLE_SYS_CLK;
++
+ 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
+ 	case SND_SOC_DAIFMT_MSB:
+ 		format |= JZ_AIC_I2S_FMT_MSB;
+@@ -415,6 +424,15 @@ static const struct i2s_soc_info jz4780_i2s_soc_info = {
+ 	.field_i2sdiv_playback	= REG_FIELD(JZ_REG_AIC_CLK_DIV, 0, 3),
+ };
+ 
++static const struct i2s_soc_info t20_i2s_soc_info = {
++	.dai			= &jz4770_i2s_dai,
++	.field_rx_fifo_thresh	= REG_FIELD(JZ_REG_AIC_CONF, 24, 27),
++	.field_tx_fifo_thresh	= REG_FIELD(JZ_REG_AIC_CONF, 16, 20),
++	.field_i2sdiv_capture	= REG_FIELD(JZ_REG_AIC_CLK_DIV, 8, 11),
++	.field_i2sdiv_playback	= REG_FIELD(JZ_REG_AIC_CLK_DIV, 0, 3),
++	.internal_codec_sysclk	= true,
++};
++
+ static int jz4740_i2s_suspend(struct snd_soc_component *component)
+ {
+ 	struct jz4740_i2s *i2s = snd_soc_component_get_drvdata(component);
+@@ -464,7 +482,9 @@ static int jz4740_i2s_probe(struct snd_soc_component *component)
+ 
+ 	regmap_write(i2s->regmap, JZ_REG_AIC_CONF,
+ 		     JZ_AIC_CONF_OVERFLOW_PLAY_LAST |
+-		     JZ_AIC_CONF_I2S | JZ_AIC_CONF_INTERNAL_CODEC);
++		     JZ_AIC_CONF_I2S | JZ_AIC_CONF_INTERNAL_CODEC |
++		     (i2s->soc_info->internal_codec_sysclk ?
++		      JZ_AIC_CONF_INTERNAL_CODEC_SEL : 0));
+ 
+ 	regmap_field_write(i2s->field_rx_fifo_thresh, 7);
+ 	regmap_field_write(i2s->field_tx_fifo_thresh, 8);
+@@ -494,6 +514,7 @@ static const struct of_device_id jz4740_of_matches[] = {
+ 	{ .compatible = "ingenic,jz4770-i2s", .data = &jz4770_i2s_soc_info },
+ 	{ .compatible = "ingenic,jz4780-i2s", .data = &jz4780_i2s_soc_info },
+ 	{ .compatible = "ingenic,x1000-i2s", .data = &x1000_i2s_soc_info },
++	{ .compatible = "ingenic,t20-i2s", .data = &t20_i2s_soc_info },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, jz4740_of_matches);

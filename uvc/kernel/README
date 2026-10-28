@@ -8,18 +8,27 @@ dts/          T20 SoC and Wyze Cam v2 device trees (copied into the tree)
 patches/      applied in order to Linux v6.18.59:
   0001-0005   gtxaspec/thingino-linux ingenic-7.1-rc1 (T31 on mainline):
               pinctrl and machine plumbing, the SFC SPI flash controller
-              driver, an MMC clock fix. Unchanged; build.
-  0006        T20 machine, Wyze Cam v2 board option. Ours; builds.
-  0007        T20 CGU (clocks), from the vendor soc-t20/common/clk. Ours;
-              builds.
+              driver, an MMC clock fix. Unchanged; run.
+  0006        T20 machine, Wyze Cam v2 board option. Ours; runs.
+  0007        T20 CGU (clocks), from the vendor soc-t20/common/clk; the
+              audio clock's M/N divider as mainline's X1000. Ours; runs.
   0008        T20 pinctrl, from the vendor soc-t20 gpio.c/platform.h. Ours;
-              builds.
-  0009        SFC: T20 compatible (X1000 registers). Ours; builds.
-  0010        spi-nor: erase in 32 KiB blocks. Ours; builds.
+              runs.
+  0009        SFC: T20 compatible (X1000 registers). Ours; runs.
+  0010        spi-nor: erase in 32 KiB blocks. Ours; runs.
   0011        JX-F22/JX-F23 sensor, V4L2 subdevice. Ours (register tables
-              from Ingenic's GPL-2.0+ sensor drivers); builds.
-  0012        T20 camera input and ISP, V4L2 (NV12 out, no 3A yet), and the
-              DVP pin group. Ours, from docs/t20-isp-hardware.md; builds.
-Out of tree:  rtl8189fs (WiFi), jwrdegoede/rtl8189ES_linux 13bbdbc; builds.
+              from Ingenic's GPL-2.0+ sensor drivers); runs (JX-F22).
+  0012        T20 camera input and ISP, V4L2 (NV12 out, white balance,
+              colour, two outputs), and the DVP pin group. Ours, from
+              docs/t20-isp-hardware.md; runs.
+  0013        T20 VPU JPEG and H.264 encoders, V4L2 mem2mem. Ours (VPU
+              sequences and register names from Ingenic's GPL-2.0 drivers,
+              the T20 H.264 values in docs/t20-isp-hardware.md); runs.
+  0014        T20 AIC (mainline jz4740-i2s) and internal codec (microphone).
+              Ours (codec sequences from Ingenic's GPL-2.0 OSS driver); runs.
+  0015        dma-jz4780: no oops on the status of a terminated transfer
+              (every close of a capture stream). Ours; runs.
+Out of tree:  rtl8189fs (WiFi), jwrdegoede/rtl8189ES_linux 13bbdbc; runs.
 
-Nothing has run on a camera yet.
+All of it boots and runs on a Wyze Cam v2 (docs/kernel-modern.md, "Bring-up
+on hardware").

@@ -66,11 +66,32 @@
 		};
 	};
 
-	/* RTL8189FS power: WL_REG_EN, PC16 (GPIO 80), high = on */
+	/*
+	 * RTL8189FS power: PB30 (GPIO 62), high = on. The camera's U-Boot
+	 * calls it wifi_enable_gpio and leaves it high; the vendor board.h's
+	 * WL_REG_EN (PC16) is not this board's.
+	 */
 	wlan_pwrseq: wlan-pwrseq {
 		compatible = "mmc-pwrseq-simple";
-		reset-gpios = <&gpc 16 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&gpb 30 GPIO_ACTIVE_LOW>;
 		post-power-on-delay-ms = <200>;
+	};
+
+	/* The microphone through the internal codec (the speaker: not yet) */
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "wyze-cam-v2";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,bitclock-master = <&dai_codec>;
+		simple-audio-card,frame-master = <&dai_codec>;
+
+		simple-audio-card,cpu {
+			sound-dai = <&aic>;
+		};
+
+		dai_codec: simple-audio-card,codec {
+			sound-dai = <&codec>;
+		};
 	};
 };
 
@@ -187,6 +208,10 @@
 		clocks = <&cgu T20_CLK_CIM>;
 		reset-gpios = <&gpa 18 GPIO_ACTIVE_LOW>;
 
+		/* MCLK on its pin before the sensor is probed */
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_cim_mclk>;
+
 		port {
 			sensor_out: endpoint {
 				remote-endpoint = <&isp_in>;
@@ -218,6 +243,23 @@
 	};
 };
 
+&vpu {
+	memory-region = <&camera_mem>;
+	status = "okay";
+};
+
+&pdma {
+	status = "okay";
+};
+
+&aic {
+	status = "okay";
+};
+
+&codec {
+	status = "okay";
+};
+
 &pinctrl {
 	pins_uart1: uart1 {
 		function = "uart1";
@@ -239,10 +281,16 @@
 		groups = "mmc1-1bit", "mmc1-4bit";
 	};
 
-	/* Sensor data, sync and pixel clock in, MCLK (24 MHz) out */
+	/* Sensor data, sync and pixel clock in */
 	pins_dvp: dvp {
 		function = "cim";
-		groups = "dvp-10bit", "cim-mclk";
+		groups = "dvp-10bit";
+	};
+
+	/* Sensor clock out (24 MHz): without it the sensor does not answer on I2C */
+	pins_cim_mclk: cim-mclk {
+		function = "cim";
+		groups = "cim-mclk";
 	};
 
 	pins_i2c0: i2c0 {

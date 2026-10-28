@@ -67,13 +67,16 @@ new file mode 100644
 index 000000000..076de7775
 --- /dev/null
 +++ b/drivers/media/platform/ingenic/t20-isp.c
-@@ -0,0 +1,849 @@
+@@ -0,0 +1,1604 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
-+ * Ingenic T20 camera input (VIC) and ISP core, first version: a parallel
-+ * Bayer sensor in, NV12 out of the DS1 path (the T20's main stream; the SoC
-+ * has no full-resolution writer), with the image processing blocks that need
-+ * memory tables bypassed. No statistics or parameters yet.
++ * Ingenic T20 camera input (VIC) and ISP core: a parallel Bayer sensor in,
++ * NV12 out of two paths, each a video node: DS1 at the sensor's size (the
++ * main stream; the SoC has no full-resolution writer) and DS2 scaled down
++ * (the second stream). Black level, white balance (automatic from the
++ * ISP's statistics, or set by hand), a colour matrix, sRGB gamma and the
++ * colour space converter with brightness, contrast and saturation; the blocks that need
++ * calibration tables (shading, noise reduction, Iridix) are bypassed.
 + *
 + * Written from docs/t20-isp-hardware.md (openmico_onvif), which records the
 + * register map and sequences used here.
@@ -90,6 +93,7 @@ index 000000000..076de7775
 +
 +#include <media/media-device.h>
 +#include <media/v4l2-async.h>
++#include <media/v4l2-ctrls.h>
 +#include <media/v4l2-device.h>
 +#include <media/v4l2-fwnode.h>
 +#include <media/v4l2-ioctl.h>
@@ -120,12 +124,12 @@ index 000000000..076de7775
 +/* ISP core */
 +#define ISP_ACTIVE_WIDTH	0x010
 +#define ISP_ACTIVE_HEIGHT	0x014
-+#define ISP_RGGB_START		0x018
-+#define ISP_RGGB_BGGR		3
++#define ISP_RGGB_START		0x018	/* 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR */
 +#define ISP_CONFIG_BUFFER_MODE	0x030
 +#define ISP_CONFIG_IN_VBLANK	2
 +#define ISP_BYPASS_LOW		0x040
 +#define ISP_BYPASS_HIGH		0x044
++#define ISP_BYPASS_SINTER	BIT(9)
 +#define ISP_IRQ_SOURCE(n)	(0x080 + 4 * ((n) / 2))
 +#define ISP_IRQ_SOURCE_SHIFT(n)	(((n) & 1) ? 16 : 0)
 +#define ISP_IRQ_STATUS		0x0a0
@@ -135,15 +139,59 @@ index 000000000..076de7775
 +#define ISP_INPUT_MODE		0x130
 +#define ISP_INPUT_SAFE_STOP	0
 +#define ISP_INPUT_SAFE_START	1
-+#define ISP_DS1_CSC_ENABLE	0x6b0
++#define ISP_SINTER_THRESH(n)	(0x290 + 4 * (n))	/* two 8-bit bands each */
++#define ISP_SENSOR_OFFSET(n)	(0x140 + 4 * (n))	/* n: 0 R, 1 Gr, 2 Gb, 3 B */
++#define ISP_WB_GAIN(n)		(0x300 + 4 * (n))	/* the same order */
++#define ISP_WB_GAIN_ONE		0x100
++#define ISP_WB_GAIN_MAX		0xfff
++#define ISP_CCM_COEF(n)		(0x480 + 4 * (n))	/* row-major 3x3 */
++#define ISP_DS1_GAMMA		0x4e4
++#define ISP_DS2_GAMMA		0x4e8
++#define ISP_GAMMA_ENABLE	BIT(0)
++#define ISP_DS1_GAMMA_LUT	0x11000
++#define ISP_DS2_GAMMA_LUT	0x12000
++#define ISP_COEF_SIGN		BIT(15)		/* matrices: sign and magnitude, 1/256 */
++/* Colour space converters, DS1 at 0x680 and DS2 at 0x780 */
++#define ISP_DS1_CSC		0x680
++#define ISP_DS2_CSC		0x780
++#define CSC_COEF(n)		(4 * (n))		/* row-major 3x3 */
++#define CSC_OFFSET(n)		(0x24 + 4 * (n))	/* 11-bit two's complement */
++#define CSC_ENABLE		0x30
 +#define ISP_CSC_MATRIX		BIT(0)
 +#define ISP_CSC_FILTER		BIT(1)
 +#define ISP_CSC_HDOWN		BIT(2)
 +#define ISP_CSC_VDOWN		BIT(3)
++#define ISP_AWB_RG		0x858	/* 4.8 fixed point, 12 bits */
++#define ISP_AWB_BG		0x85c
++#define ISP_AWB_SUM		0x860	/* pixels counted */
++#define ISP_AWB_STATS_MODE	0x868
++#define ISP_AWB_STATS_RG_BG	1	/* R/G and B/G (0: G/R and G/B) */
++#define ISP_NOISE_PROFILE_LUT	0x1d00	/* 128 8-bit entries, by intensity */
++/* Output n's sharpening: on bit 0 (coring bits 3:2 at reset); strength */
++#define ISP_DS_SHARPEN(n)	(0x620 + 0x100 * (n))
++#define ISP_SHARPEN_ON		BIT(0)
++#define ISP_DS_SHARPEN_STRENGTH(n) (0x624 + 0x100 * (n))
++#define ISP_BYPASS_DS1_SHARPEN	BIT(27)
++#define ISP_BYPASS_DS2_SHARPEN	BIT(4)		/* in ISP_BYPASS_HIGH */
 +
-+/* Video DMA writers: DS1 Y and UV */
++/* DS2 scaler; tinc is input / output in 4.20 fixed point */
++#define ISP_DS2_SCALER		0x740
++#define SCALER_WIDTH		0x08
++#define SCALER_HEIGHT		0x0c
++#define SCALER_OWIDTH		0x10
++#define SCALER_OHEIGHT		0x14
++#define SCALER_HTINC		0x18
++#define SCALER_HCOEFSET		0x1c
++#define SCALER_VTINC		0x20
++#define SCALER_VCOEFSET		0x24
++#define ISP_DS2_HFILT		0x18000	/* 4 sets x 32 phases x 8 taps */
++#define ISP_DS2_VFILT		0x1a000
++
++/* Video DMA writers: Y and UV of DS1 and DS2 */
 +#define ISP_DS1_Y_WRITER	0xc00
 +#define ISP_DS1_UV_WRITER	0xc80
++#define ISP_DS2_Y_WRITER	0xd00
++#define ISP_DS2_UV_WRITER	0xd80
 +#define WRITER_FORMAT		0x00
 +#define WRITER_NV12		13
 +#define WRITER_PLANE_UV		(1 << 6)
@@ -155,29 +203,293 @@ index 000000000..076de7775
 +#define WRITER_AXI		0x24
 +#define WRITER_AXI_ENABLE	BIT(1)
 +
-+/* Interrupt line the DS1 output end is routed to, and its source */
++/* Interrupt lines the output ends are routed to, and their sources */
 +#define ISP_LINE_DS1_DONE	13
 +#define ISP_SRC_DS1_DONE	50
++#define ISP_LINE_DS2_DONE	14
++#define ISP_SRC_DS2_DONE	53
 +
 +/*
-+ * Bypassed: mirror, sensor offset, digital gain, frontend LUT, RAW frontend,
-+ * defect pixel, frame stitch, sinter, temper, radial and mesh shading,
-+ * Iridix, the whole FR path, and on DS1 crop, scaler, gamma, sharpen, logo.
-+ * Kept: white balance, demosaic, colour matrix, DS1 colour space converter.
-+ * Bit 8 keeps its reset value. The DS2 path is bypassed.
++ * Bypassed: mirror, digital gain, frontend LUT, RAW frontend, defect pixel,
++ * frame stitch, temper, radial and mesh shading, Iridix, the whole FR path,
++ * and on DS1 crop, scaler, sharpen, logo. Kept: sensor offset, white
++ * balance, demosaic, colour matrix, DS1 gamma and colour space converter.
++ * Sinter is on or off with the noise reduction control. Bit 8 keeps its
++ * reset value. The DS2 path is bypassed but when it streams: then its
++ * scaler, gamma and colour space converter run.
 + */
-+#define ISP_BYPASS_LOW_MIN	(GENMASK(7, 1) | BIT(8) | GENMASK(10, 9) | \
-+				 GENMASK(15, 13) | GENMASK(22, 18) | GENMASK(28, 24))
++#define ISP_BYPASS_LOW_MIN	(BIT(1) | GENMASK(7, 3) | BIT(8) | \
++				 GENMASK(10, 9) | GENMASK(15, 13) | GENMASK(22, 18) | \
++				 GENMASK(25, 24) | GENMASK(28, 27))
 +#define ISP_BYPASS_HIGH_MIN	GENMASK(6, 1)
++#define ISP_BYPASS_DS2_SCALER	BIT(2)
++#define ISP_BYPASS_DS2_RUN	(ISP_BYPASS_DS2_SCALER | BIT(3) | BIT(6))	/* + gamma, CSC */
 +
 +#define T20_ISP_CLK_RATE	100000000
 +#define T20_ISP_MIN_BUFFERS	2
++#define T20_ISP_MIN_SIZE	64
++#define T20_ISP_SUB_WIDTH	640
++#define T20_ISP_SUB_HEIGHT	360
 +
-+enum { T20_ISP_PAD_SINK, T20_ISP_PAD_SOURCE, T20_ISP_PADS };
++/*
++ * The JX-F22's black level in the ISP's 12-bit units, measured at the
++ * shortest exposure: steady at every analog gain.
++ */
++#define T20_ISP_BLACK_LEVEL	40
++
++/*
++ * Sinter (spatial noise reduction) with a flat noise profile until the
++ * sensor is calibrated; the control sets the thresholds of all its bands
++ */
++#define T20_ISP_NOISE_PROFILE	32
++#define T20_ISP_CID_NOISE_REDUCTION	(V4L2_CID_USER_BASE + 0x1300)
++#define T20_ISP_NOISE_REDUCTION_DEFAULT	32
++#define T20_ISP_SHARPNESS_DEFAULT	0x30	/* the block's reset strength */
++
++/* Auto white balance: least pixels for a valid measure, damping (1/n per frame) */
++#define T20_ISP_AWB_MIN_PIXELS	10000
++#define T20_ISP_AWB_DAMPING	4
++
++/*
++ * DS1 gamma: the sRGB curve at 129 points, 12 bits, as
++ * round(4095 * srgb(i / 128)) with srgb(x) = 12.92 x below 0.0031308 and
++ * 1.055 x^(1 / 2.4) - 0.055 above.
++ */
++static const u16 t20_isp_gamma_srgb[129] = {
++	   0,  347,  538,  679,  794,  894,  982, 1062, 1136, 1204,
++	1268, 1329, 1386, 1441, 1493, 1543, 1591, 1638, 1683, 1726,
++	1768, 1809, 1849, 1888, 1926, 1962, 1998, 2034, 2068, 2102,
++	2135, 2168, 2199, 2231, 2261, 2292, 2321, 2351, 2379, 2408,
++	2436, 2463, 2490, 2517, 2543, 2570, 2595, 2621, 2646, 2670,
++	2695, 2719, 2743, 2767, 2790, 2813, 2836, 2859, 2881, 2903,
++	2925, 2947, 2969, 2990, 3011, 3032, 3053, 3074, 3094, 3114,
++	3134, 3154, 3174, 3194, 3213, 3232, 3252, 3271, 3289, 3308,
++	3327, 3345, 3363, 3382, 3400, 3418, 3435, 3453, 3471, 3488,
++	3505, 3523, 3540, 3557, 3574, 3590, 3607, 3624, 3640, 3656,
++	3673, 3689, 3705, 3721, 3737, 3753, 3769, 3784, 3800, 3815,
++	3831, 3846, 3861, 3876, 3891, 3906, 3921, 3936, 3951, 3966,
++	3980, 3995, 4009, 4024, 4038, 4053, 4067, 4081, 4095,
++};
++
++/*
++ * Colour matrix (linear RGB, 1/256) until the sensor is calibrated: a
++ * saturation of 1.6 around BT.709 luma, s * I + (1 - s) * [w; w; w] with
++ * w = (0.2126, 0.7152, 0.0722). The raw JX-F22 colours are flat without it.
++ */
++static const s16 t20_isp_ccm[9] = {
++	377, -110, -11,
++	-33,  300, -11,
++	-33, -110, 399,
++};
++
++/*
++ * RGB to BT.601 YCbCr, 10 bits, in 1/256. Full range (JPEG's, the default):
++ * offsets 0 and 512. Limited range: Y rows scaled by 876/1023, Cb and Cr by
++ * 896/1023, offsets 64 and 512.
++ */
++static const s16 t20_isp_bt601_full[9] = {
++	 77, 150,  29,
++	-43, -85, 128,
++	128, -107, -21,
++};
++
++static const s16 t20_isp_bt601_lim[9] = {
++	 66, 129,  25,
++	-38, -74, 112,
++	112, -94, -18,
++};
++
++/*
++ * DS2 scaler filters: 7 taps (in 1/64) for each of 32 phases, sets for
++ * downscaling by up to 1.25, 1.67, 2.5 and more. Hann-windowed sinc, half
++ * width 3.5 taps, cut off at 1, 3/4, 1/2 and 1/3 of the input's Nyquist
++ * frequency. Phase p puts the output at tap 3.5 - p / 32 (horizontal); the
++ * vertical filter takes the taps in the reverse order.
++ */
++static const s8 t20_isp_scaler_filters[4][32][7] = {
++	{	/* cutoff 1 */
++		{   0,   2,  -8,  37,  39,  -8,   2 },
++		{   0,   2,  -9,  42,  36,  -8,   1 },
++		{   0,   2,  -9,  44,  33,  -7,   1 },
++		{   0,   2,  -9,  46,  31,  -7,   1 },
++		{   0,   2,  -9,  48,  28,  -6,   1 },
++		{   0,   2,  -9,  51,  25,  -6,   1 },
++		{   0,   2,  -9,  53,  22,  -5,   1 },
++		{   0,   2,  -9,  55,  20,  -5,   1 },
++		{   0,   2,  -8,  56,  17,  -4,   1 },
++		{   0,   2,  -8,  59,  15,  -4,   0 },
++		{   0,   2,  -7,  60,  12,  -3,   0 },
++		{   0,   1,  -6,  61,  10,  -2,   0 },
++		{   0,   1,  -5,  62,   8,  -2,   0 },
++		{   0,   1,  -4,  62,   6,  -1,   0 },
++		{   0,   1,  -3,  63,   4,  -1,   0 },
++		{   0,   0,  -2,  64,   2,   0,   0 },
++		{   0,   0,   0,  64,   0,   0,   0 },
++		{   0,   0,   2,  64,  -2,   0,   0 },
++		{   0,  -1,   4,  63,  -3,   1,   0 },
++		{   0,  -1,   6,  62,  -4,   1,   0 },
++		{   0,  -2,   8,  62,  -5,   1,   0 },
++		{   0,  -2,  10,  61,  -6,   1,   0 },
++		{   0,  -3,  12,  60,  -7,   2,   0 },
++		{   0,  -4,  15,  59,  -8,   2,   0 },
++		{   1,  -4,  17,  56,  -8,   2,   0 },
++		{   1,  -5,  20,  55,  -9,   2,   0 },
++		{   1,  -5,  22,  53,  -9,   2,   0 },
++		{   1,  -6,  25,  51,  -9,   2,   0 },
++		{   1,  -6,  28,  48,  -9,   2,   0 },
++		{   1,  -7,  31,  46,  -9,   2,   0 },
++		{   1,  -7,  33,  44,  -9,   2,   0 },
++		{   1,  -8,  36,  42,  -9,   2,   0 },
++	},
++	{	/* cutoff 3/4 */
++		{   0,  -1,  -3,  36,  36,  -3,  -1 },
++		{   0,  -1,  -3,  38,  34,  -4,   0 },
++		{   0,  -1,  -2,  38,  33,  -4,   0 },
++		{   0,  -1,  -2,  40,  31,  -4,   0 },
++		{   0,  -1,  -1,  40,  30,  -4,   0 },
++		{   0,  -1,   0,  42,  28,  -5,   0 },
++		{   0,  -2,   1,  43,  27,  -5,   0 },
++		{   0,  -2,   1,  45,  25,  -5,   0 },
++		{   0,  -2,   2,  45,  24,  -5,   0 },
++		{   0,  -2,   3,  46,  22,  -5,   0 },
++		{   0,  -3,   4,  47,  21,  -5,   0 },
++		{   0,  -3,   5,  48,  19,  -5,   0 },
++		{   0,  -3,   7,  47,  18,  -5,   0 },
++		{   0,  -3,   8,  47,  16,  -4,   0 },
++		{   0,  -4,   9,  48,  15,  -4,   0 },
++		{   0,  -4,  10,  49,  13,  -4,   0 },
++		{   0,  -4,  12,  48,  12,  -4,   0 },
++		{   0,  -4,  13,  49,  10,  -4,   0 },
++		{   0,  -4,  15,  48,   9,  -4,   0 },
++		{   0,  -4,  16,  47,   8,  -3,   0 },
++		{   0,  -5,  18,  47,   7,  -3,   0 },
++		{   0,  -5,  19,  48,   5,  -3,   0 },
++		{   0,  -5,  21,  47,   4,  -3,   0 },
++		{   0,  -5,  22,  46,   3,  -2,   0 },
++		{   0,  -5,  24,  45,   2,  -2,   0 },
++		{   0,  -5,  25,  45,   1,  -2,   0 },
++		{   0,  -5,  27,  43,   1,  -2,   0 },
++		{   0,  -5,  28,  42,   0,  -1,   0 },
++		{   0,  -4,  30,  40,  -1,  -1,   0 },
++		{   0,  -4,  31,  40,  -2,  -1,   0 },
++		{   0,  -4,  33,  38,  -2,  -1,   0 },
++		{   0,  -4,  34,  38,  -3,  -1,   0 },
++	},
++	{	/* cutoff 1/2 */
++		{   0,  -1,   6,  27,  27,   6,  -1 },
++		{   0,  -1,   6,  28,  27,   5,  -1 },
++		{   0,  -1,   7,  28,  26,   5,  -1 },
++		{   0,  -1,   8,  28,  26,   4,  -1 },
++		{   0,  -1,   8,  29,  25,   4,  -1 },
++		{   0,  -1,   9,  30,  24,   3,  -1 },
++		{   0,  -1,   9,  30,  24,   3,  -1 },
++		{   0,  -1,  10,  30,  23,   3,  -1 },
++		{   0,  -1,  11,  31,  22,   2,  -1 },
++		{   0,  -1,  11,  31,  22,   2,  -1 },
++		{   0,  -1,  12,  31,  21,   2,  -1 },
++		{   0,  -1,  13,  32,  20,   1,  -1 },
++		{   0,  -1,  14,  32,  19,   1,  -1 },
++		{   0,   0,  14,  30,  19,   1,   0 },
++		{   0,   0,  15,  31,  18,   0,   0 },
++		{   0,   0,  16,  31,  17,   0,   0 },
++		{   0,   0,  16,  32,  16,   0,   0 },
++		{   0,   0,  17,  31,  16,   0,   0 },
++		{   0,   0,  18,  31,  15,   0,   0 },
++		{   0,   1,  19,  30,  14,   0,   0 },
++		{  -1,   1,  19,  32,  14,  -1,   0 },
++		{  -1,   1,  20,  32,  13,  -1,   0 },
++		{  -1,   2,  21,  31,  12,  -1,   0 },
++		{  -1,   2,  22,  31,  11,  -1,   0 },
++		{  -1,   2,  22,  31,  11,  -1,   0 },
++		{  -1,   3,  23,  30,  10,  -1,   0 },
++		{  -1,   3,  24,  30,   9,  -1,   0 },
++		{  -1,   3,  24,  30,   9,  -1,   0 },
++		{  -1,   4,  25,  29,   8,  -1,   0 },
++		{  -1,   4,  26,  28,   8,  -1,   0 },
++		{  -1,   5,  26,  28,   7,  -1,   0 },
++		{  -1,   5,  27,  28,   6,  -1,   0 },
++	},
++	{	/* cutoff 1/3 */
++		{   0,   1,   9,  22,  22,   9,   1 },
++		{   0,   1,  10,  21,  22,   9,   1 },
++		{   0,   1,  10,  22,  21,   9,   1 },
++		{   0,   1,  11,  22,  21,   8,   1 },
++		{   0,   1,  11,  23,  21,   8,   0 },
++		{   0,   2,  11,  24,  20,   7,   0 },
++		{   0,   2,  12,  23,  20,   7,   0 },
++		{   0,   2,  12,  23,  20,   7,   0 },
++		{   0,   2,  13,  24,  19,   6,   0 },
++		{   0,   2,  13,  24,  19,   6,   0 },
++		{   0,   2,  14,  23,  19,   6,   0 },
++		{   0,   3,  14,  24,  18,   5,   0 },
++		{   0,   3,  14,  24,  18,   5,   0 },
++		{   0,   3,  15,  24,  17,   5,   0 },
++		{   0,   3,  15,  25,  17,   4,   0 },
++		{   0,   4,  16,  23,  17,   4,   0 },
++		{   0,   4,  16,  24,  16,   4,   0 },
++		{   0,   4,  17,  23,  16,   4,   0 },
++		{   0,   4,  17,  25,  15,   3,   0 },
++		{   0,   5,  17,  24,  15,   3,   0 },
++		{   0,   5,  18,  24,  14,   3,   0 },
++		{   0,   5,  18,  24,  14,   3,   0 },
++		{   0,   6,  19,  23,  14,   2,   0 },
++		{   0,   6,  19,  24,  13,   2,   0 },
++		{   0,   6,  19,  24,  13,   2,   0 },
++		{   0,   7,  20,  23,  12,   2,   0 },
++		{   0,   7,  20,  23,  12,   2,   0 },
++		{   0,   7,  20,  24,  11,   2,   0 },
++		{   0,   8,  21,  23,  11,   1,   0 },
++		{   1,   8,  21,  22,  11,   1,   0 },
++		{   1,   9,  21,  22,  10,   1,   0 },
++		{   1,   9,  22,  21,  10,   1,   0 },
++	},
++};
++
++enum { T20_ISP_PAD_SINK, T20_ISP_PAD_SOURCE, T20_ISP_PAD_SOURCE_SUB, T20_ISP_PADS };
++
++/* Sensor Bayer orders, in the order of the ISP's RGGB start codes */
++static const u32 t20_isp_bayer[] = {
++	MEDIA_BUS_FMT_SRGGB10_1X10, MEDIA_BUS_FMT_SGRBG10_1X10,
++	MEDIA_BUS_FMT_SGBRG10_1X10, MEDIA_BUS_FMT_SBGGR10_1X10,
++};
++
++/* The RGGB start code of a Bayer format; BGGR, the sensor's default, if none */
++static u32 t20_isp_rggb_start(u32 code)
++{
++	u32 i;
++
++	for (i = 0; i < ARRAY_SIZE(t20_isp_bayer) - 1; i++)
++		if (t20_isp_bayer[i] == code)
++			break;
++	return i;
++}
 +
 +struct t20_isp_buffer {
 +	struct vb2_v4l2_buffer vb;
 +	struct list_head list;
++};
++
++enum { T20_ISP_MAIN, T20_ISP_SUB, T20_ISP_PATHS };
++
++/* An output path: DMA writers, interrupt and video node */
++struct t20_isp_path {
++	struct t20_isp *isp;
++	const char *name;
++	u32 y_writer, uv_writer;
++	unsigned int line, source;	/* output end interrupt */
++	unsigned int pad;		/* the ISP subdevice's source pad */
++
++	struct video_device vdev;
++	struct media_pad vpad;
++	struct vb2_queue queue;
++	struct mutex lock;		/* video device and queue */
++	struct v4l2_pix_format pix;
++	bool streaming;			/* read by the interrupt handler */
++
++	spinlock_t buf_lock;		/* the fields below */
++	struct list_head pending;
++	struct t20_isp_buffer *active;	/* being written by the hardware */
++	u32 sequence;
 +};
 +
 +struct t20_isp {
@@ -199,16 +511,21 @@ index 000000000..076de7775
 +	struct v4l2_subdev sd;
 +	struct media_pad pads[T20_ISP_PADS];
 +
-+	struct video_device vdev;
-+	struct media_pad vpad;
-+	struct vb2_queue queue;
-+	struct mutex lock;		/* video device and queue */
-+	struct v4l2_pix_format pix;
++	struct t20_isp_path paths[T20_ISP_PATHS];
++	struct mutex hw_lock;		/* the fields below */
++	unsigned int streaming;		/* paths streaming */
++	u32 width, height;		/* the sensor's frame */
++	u32 rggb_start;			/* the sensor's Bayer order */
 +
-+	spinlock_t buf_lock;		/* the fields below */
-+	struct list_head pending;
-+	struct t20_isp_buffer *active;	/* being written by the hardware */
-+	u32 sequence;
++	struct v4l2_ctrl_handler ctrls;
++	struct v4l2_ctrl *awb;		/* cluster: auto, red, blue */
++	struct v4l2_ctrl *red;
++	struct v4l2_ctrl *blue;
++	struct v4l2_ctrl *brightness;	/* cluster: brightness, contrast, saturation */
++	struct v4l2_ctrl *contrast;
++	struct v4l2_ctrl *saturation;
++	bool awb_on;			/* read by the interrupt handler */
++	int wb_red, wb_blue;		/* the AWB's gains, 4.8 fixed point */
 +};
 +
 +static void isp_write(struct t20_isp *isp, u32 reg, u32 val)
@@ -228,30 +545,168 @@ index 000000000..076de7775
 +
 +/* Hardware programming */
 +
-+static void t20_isp_set_buffer(struct t20_isp *isp, struct t20_isp_buffer *buf)
++static u32 t20_isp_coef(int c)
 +{
++	return min(abs(c), 0x7fff) | (c < 0 ? ISP_COEF_SIGN : 0);
++}
++
++static void t20_isp_set_wb(struct t20_isp *isp, int red, int blue)
++{
++	isp_write(isp, ISP_WB_GAIN(0), red);
++	isp_write(isp, ISP_WB_GAIN(1), ISP_WB_GAIN_ONE);
++	isp_write(isp, ISP_WB_GAIN(2), ISP_WB_GAIN_ONE);
++	isp_write(isp, ISP_WB_GAIN(3), blue);
++}
++
++/*
++ * A path's colour space converter, for its range: brightness adds to Y (in
++ * 8-bit steps), contrast (128 = 1) scales Y around mid grey, saturation
++ * (128 = 1) scales Cb and Cr.
++ */
++static void t20_isp_set_csc(struct t20_isp_path *path)
++{
++	struct t20_isp *isp = path->isp;
++	bool lim = path->pix.quantization == V4L2_QUANTIZATION_LIM_RANGE;
++	const s16 *m = lim ? t20_isp_bt601_lim : t20_isp_bt601_full;
++	int contrast = isp->contrast->val, saturation = isp->saturation->val;
++	u32 base = path == &isp->paths[T20_ISP_MAIN] ? ISP_DS1_CSC : ISP_DS2_CSC;
++	int i, c, black = lim ? 64 : 0, grey = lim ? 438 : 512, y_offset;
++
++	for (i = 0; i < 9; i++) {
++		c = m[i] * (i < 3 ? contrast : saturation) / 128;
++		isp_write(isp, base + CSC_COEF(i), t20_isp_coef(c));
++	}
++	y_offset = black + grey * (128 - contrast) / 128 + isp->brightness->val * 4;
++	isp_write(isp, base + CSC_OFFSET(0), clamp(y_offset, -1024, 1023) & 0x7ff);
++	isp_write(isp, base + CSC_OFFSET(1), 512);
++	isp_write(isp, base + CSC_OFFSET(2), 512);
++}
++
++/* Noise reduction: 0 bypasses Sinter */
++static void t20_isp_set_sinter(struct t20_isp *isp, int thresh)
++{
++	int i;
++
++	for (i = 0; i < 4; i++)
++		isp_write(isp, ISP_SINTER_THRESH(i), thresh | thresh << 16);
++	isp_update(isp, ISP_BYPASS_LOW, ISP_BYPASS_SINTER,
++		   thresh ? 0 : ISP_BYPASS_SINTER);
++}
++
++/* Sharpening of both outputs: 0 bypasses it */
++static void t20_isp_set_sharpen(struct t20_isp *isp, int strength)
++{
++	int n;
++
++	for (n = 0; n < 2; n++) {
++		isp_update(isp, ISP_DS_SHARPEN_STRENGTH(n), 0xff, strength);
++		isp_update(isp, ISP_DS_SHARPEN(n), ISP_SHARPEN_ON, strength ? ISP_SHARPEN_ON : 0);
++	}
++	isp_update(isp, ISP_BYPASS_LOW, ISP_BYPASS_DS1_SHARPEN,
++		   strength ? 0 : ISP_BYPASS_DS1_SHARPEN);
++	isp_update(isp, ISP_BYPASS_HIGH, ISP_BYPASS_DS2_SHARPEN,
++		   strength ? 0 : ISP_BYPASS_DS2_SHARPEN);
++}
++
++/*
++ * Grey world: the statistics are R/G and B/G after the gains, before the
++ * colour matrix. Each frame moves the red and blue gains part of the way to
++ * where the averages would be grey.
++ */
++static void t20_isp_awb(struct t20_isp *isp)
++{
++	int rg = isp_read(isp, ISP_AWB_RG) & 0xfff;
++	int bg = isp_read(isp, ISP_AWB_BG) & 0xfff;
++	int r = isp->wb_red, b = isp->wb_blue;
++
++	if (isp_read(isp, ISP_AWB_SUM) < T20_ISP_AWB_MIN_PIXELS || !rg || !bg)
++		return;
++	r += (r * ISP_WB_GAIN_ONE / rg - r) / T20_ISP_AWB_DAMPING;
++	b += (b * ISP_WB_GAIN_ONE / bg - b) / T20_ISP_AWB_DAMPING;
++	isp->wb_red = clamp(r, ISP_WB_GAIN_ONE / 4, ISP_WB_GAIN_MAX);
++	isp->wb_blue = clamp(b, ISP_WB_GAIN_ONE / 4, ISP_WB_GAIN_MAX);
++	t20_isp_set_wb(isp, isp->wb_red, isp->wb_blue);
++}
++
++static void t20_isp_set_buffer(struct t20_isp_path *path, struct t20_isp_buffer *buf)
++{
++	struct t20_isp *isp = path->isp;
 +	dma_addr_t y;
 +
 +	if (!buf) {
-+		isp_update(isp, ISP_DS1_Y_WRITER + WRITER_FORMAT, WRITER_FRAME_WRITE, 0);
-+		isp_update(isp, ISP_DS1_UV_WRITER + WRITER_FORMAT, WRITER_FRAME_WRITE, 0);
++		isp_update(isp, path->y_writer + WRITER_FORMAT, WRITER_FRAME_WRITE, 0);
++		isp_update(isp, path->uv_writer + WRITER_FORMAT, WRITER_FRAME_WRITE, 0);
 +		return;
 +	}
 +	y = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-+	isp_write(isp, ISP_DS1_Y_WRITER + WRITER_BANK0, y);
-+	isp_write(isp, ISP_DS1_UV_WRITER + WRITER_BANK0,
-+		  y + isp->pix.bytesperline * isp->pix.height);
-+	isp_update(isp, ISP_DS1_Y_WRITER + WRITER_FORMAT, WRITER_FRAME_WRITE,
++	isp_write(isp, path->y_writer + WRITER_BANK0, y);
++	isp_write(isp, path->uv_writer + WRITER_BANK0,
++		  y + path->pix.bytesperline * path->pix.height);
++	isp_update(isp, path->y_writer + WRITER_FORMAT, WRITER_FRAME_WRITE,
 +		   WRITER_FRAME_WRITE);
-+	isp_update(isp, ISP_DS1_UV_WRITER + WRITER_FORMAT, WRITER_FRAME_WRITE,
++	isp_update(isp, path->uv_writer + WRITER_FORMAT, WRITER_FRAME_WRITE,
 +		   WRITER_FRAME_WRITE);
 +}
 +
++static u32 t20_isp_pack_taps(const s8 *t)
++{
++	return (u8)t[0] | (u8)t[1] << 8 | (u8)t[2] << 16 | (u32)(u8)t[3] << 24;
++}
++
++static void t20_isp_load_scaler_filters(struct t20_isp *isp)
++{
++	unsigned int set, phase, k;
++	s8 v[8];
++	u32 at;
++
++	for (set = 0; set < ARRAY_SIZE(t20_isp_scaler_filters); set++) {
++		for (phase = 0; phase < 32; phase++) {
++			const s8 *h = t20_isp_scaler_filters[set][phase];
++
++			at = 0x100 * set + 8 * phase;
++			memcpy(v, h, 7);
++			v[7] = 0;
++			isp_write(isp, ISP_DS2_HFILT + at, t20_isp_pack_taps(v));
++			isp_write(isp, ISP_DS2_HFILT + at + 4, t20_isp_pack_taps(v + 4));
++			for (k = 0; k < 7; k++)
++				v[k] = h[6 - k];
++			isp_write(isp, ISP_DS2_VFILT + at, t20_isp_pack_taps(v));
++			isp_write(isp, ISP_DS2_VFILT + at + 4, t20_isp_pack_taps(v + 4));
++		}
++	}
++}
++
++/* The filter set for downscaling by in / out */
++static u32 t20_isp_scaler_coefset(u32 in, u32 out)
++{
++	if (in * 4 <= out * 5)
++		return 0;
++	if (in * 3 <= out * 5)
++		return 1;
++	if (in * 2 <= out * 5)
++		return 2;
++	return 3;
++}
++
++static void t20_isp_set_scaler(struct t20_isp *isp, u32 base, u32 w, u32 h,
++			       u32 ow, u32 oh)
++{
++	isp_write(isp, base + SCALER_WIDTH, w);
++	isp_write(isp, base + SCALER_HEIGHT, h);
++	isp_write(isp, base + SCALER_OWIDTH, ow);
++	isp_write(isp, base + SCALER_OHEIGHT, oh);
++	isp_write(isp, base + SCALER_HTINC, (w << 20) / ow);
++	isp_write(isp, base + SCALER_HCOEFSET, t20_isp_scaler_coefset(w, ow));
++	isp_write(isp, base + SCALER_VTINC, (h << 20) / oh);
++	isp_write(isp, base + SCALER_VCOEFSET, t20_isp_scaler_coefset(h, oh));
++}
++
++/* Input, core and the settings both paths share; the input starts later */
 +static void t20_isp_hw_start(struct t20_isp *isp)
 +{
-+	u32 w = isp->pix.width, h = isp->pix.height, cfg = VIC_DB_RAW10;
++	u32 w = isp->width, h = isp->height, cfg = VIC_DB_RAW10;
 +	unsigned int flags = isp->ep.bus.parallel.flags;
-+	u32 base;
++	int i;
 +
 +	/* VIC: parallel RAW10 in */
 +	if (flags & V4L2_MBUS_VSYNC_ACTIVE_LOW)
@@ -265,54 +720,128 @@ index 000000000..076de7775
 +	writel(VIC_CONTROL_REG_ENABLE, isp->vic + VIC_CONTROL);
 +	writel(VIC_CONTROL_START, isp->vic + VIC_CONTROL);
 +
-+	/* Core: geometry, minimal pipeline */
++	/* Core: geometry, pipeline */
 +	isp_write(isp, ISP_CONFIG_BUFFER_MODE, ISP_CONFIG_IN_VBLANK);
 +	isp_write(isp, ISP_INPUT_PORT, ISP_INPUT_PORT_DVP);
 +	isp_write(isp, ISP_ACTIVE_WIDTH, w);
 +	isp_write(isp, ISP_ACTIVE_HEIGHT, h);
-+	isp_write(isp, ISP_RGGB_START, ISP_RGGB_BGGR);
++	isp_write(isp, ISP_RGGB_START, isp->rggb_start);
 +	isp_write(isp, ISP_BYPASS_LOW, ISP_BYPASS_LOW_MIN);
 +	isp_write(isp, ISP_BYPASS_HIGH, ISP_BYPASS_HIGH_MIN);
-+	isp_write(isp, ISP_DS1_CSC_ENABLE, ISP_CSC_MATRIX | ISP_CSC_FILTER |
-+		  ISP_CSC_HDOWN | ISP_CSC_VDOWN);
-+
-+	/* DS1 writers: NV12, one bank, reprogrammed every frame */
-+	for (base = ISP_DS1_Y_WRITER; base <= ISP_DS1_UV_WRITER; base += 0x80) {
-+		isp_write(isp, base + WRITER_FORMAT, WRITER_NV12 |
-+			  (base == ISP_DS1_UV_WRITER ? WRITER_PLANE_UV : 0));
-+		isp_write(isp, base + WRITER_SIZE, w | h << 16);
-+		isp_write(isp, base + WRITER_BANKS, 0);
-+		isp_write(isp, base + WRITER_LINE_OFFSET, isp->pix.bytesperline);
-+		isp_write(isp, base + WRITER_AXI, WRITER_AXI_ENABLE);
++	for (i = 0; i < 4; i++)
++		isp_write(isp, ISP_SENSOR_OFFSET(i), T20_ISP_BLACK_LEVEL);
++	isp_write(isp, ISP_AWB_STATS_MODE, ISP_AWB_STATS_RG_BG);
++	for (i = 0; i < ARRAY_SIZE(t20_isp_ccm); i++)
++		isp_write(isp, ISP_CCM_COEF(i), t20_isp_coef(t20_isp_ccm[i]));
++	for (i = 0; i < 128; i += 4)
++		isp_write(isp, ISP_NOISE_PROFILE_LUT + i, T20_ISP_NOISE_PROFILE * 0x01010101);
++	for (i = 0; i < ARRAY_SIZE(t20_isp_gamma_srgb); i++) {
++		isp_write(isp, ISP_DS1_GAMMA_LUT + 4 * i, t20_isp_gamma_srgb[i]);
++		isp_write(isp, ISP_DS2_GAMMA_LUT + 4 * i, t20_isp_gamma_srgb[i]);
 +	}
++	isp_update(isp, ISP_DS1_GAMMA, ISP_GAMMA_ENABLE, ISP_GAMMA_ENABLE);
++	isp_update(isp, ISP_DS2_GAMMA, ISP_GAMMA_ENABLE, ISP_GAMMA_ENABLE);
++	isp_write(isp, ISP_DS1_CSC + CSC_ENABLE, ISP_CSC_MATRIX | ISP_CSC_FILTER |
++		  ISP_CSC_HDOWN | ISP_CSC_VDOWN);
++	isp_write(isp, ISP_DS2_CSC + CSC_ENABLE, ISP_CSC_MATRIX | ISP_CSC_FILTER |
++		  ISP_CSC_HDOWN | ISP_CSC_VDOWN);
++	t20_isp_load_scaler_filters(isp);
 +
-+	/* DS1 output end on line 13 */
-+	isp_update(isp, ISP_IRQ_SOURCE(ISP_LINE_DS1_DONE),
-+		   0x3f << ISP_IRQ_SOURCE_SHIFT(ISP_LINE_DS1_DONE),
-+		   ISP_SRC_DS1_DONE << ISP_IRQ_SOURCE_SHIFT(ISP_LINE_DS1_DONE));
++	/* Interrupts: each path turns its line on */
 +	isp_write(isp, ISP_IRQ_CLEAR, 0);
 +	isp_write(isp, ISP_IRQ_CLEAR, 0xffff);
 +	writel(GENMASK(22, 0), isp->irqc + IRQC_CLEAR);
-+	writel(~BIT(ISP_LINE_DS1_DONE), isp->irqc + IRQC_MASK);
-+	writel(BIT(ISP_LINE_DS1_DONE), isp->irqc + IRQC_ENABLE);
-+
-+	isp_write(isp, ISP_INPUT_MODE, ISP_INPUT_SAFE_START);
++	writel(GENMASK(22, 0), isp->irqc + IRQC_MASK);
++	writel(0, isp->irqc + IRQC_ENABLE);
 +}
 +
 +static void t20_isp_hw_stop(struct t20_isp *isp)
 +{
 +	isp_write(isp, ISP_INPUT_MODE, ISP_INPUT_SAFE_STOP);
-+	t20_isp_set_buffer(isp, NULL);
 +	writel(0, isp->irqc + IRQC_ENABLE);
 +	writel(GENMASK(22, 0), isp->irqc + IRQC_MASK);
 +	writel(VIC_CONTROL_SAFE_RESET, isp->vic + VIC_CONTROL);
 +}
 +
++/* Writers, DS2's blocks and the path's interrupt line; latched in vertical blanking */
++static void t20_isp_path_start(struct t20_isp_path *path)
++{
++	struct t20_isp *isp = path->isp;
++	u32 w = path->pix.width, h = path->pix.height, bypass = ISP_BYPASS_DS2_RUN;
++	u32 base, bit = BIT(path->line);
++
++	for (base = path->y_writer; base <= path->uv_writer; base += 0x80) {
++		isp_write(isp, base + WRITER_FORMAT, WRITER_NV12 |
++			  (base == path->uv_writer ? WRITER_PLANE_UV : 0));
++		isp_write(isp, base + WRITER_SIZE, w | h << 16);
++		isp_write(isp, base + WRITER_BANKS, 0);
++		isp_write(isp, base + WRITER_LINE_OFFSET, path->pix.bytesperline);
++		isp_write(isp, base + WRITER_AXI, WRITER_AXI_ENABLE);
++	}
++
++	t20_isp_set_csc(path);
++	if (path == &isp->paths[T20_ISP_SUB]) {
++		/* The scaler runs only to change the size */
++		if (w == isp->width && h == isp->height)
++			bypass &= ~ISP_BYPASS_DS2_SCALER;
++		else
++			t20_isp_set_scaler(isp, ISP_DS2_SCALER, isp->width, isp->height,
++					   w, h);
++		isp_update(isp, ISP_BYPASS_HIGH, bypass, 0);
++	}
++
++	isp_update(isp, ISP_IRQ_SOURCE(path->line),
++		   0x3f << ISP_IRQ_SOURCE_SHIFT(path->line),
++		   path->source << ISP_IRQ_SOURCE_SHIFT(path->line));
++	WRITE_ONCE(path->streaming, true);
++	writel(bit, isp->irqc + IRQC_CLEAR);
++	writel(readl(isp->irqc + IRQC_ENABLE) | bit, isp->irqc + IRQC_ENABLE);
++	writel(readl(isp->irqc + IRQC_MASK) & ~bit, isp->irqc + IRQC_MASK);
++}
++
++static void t20_isp_path_stop(struct t20_isp_path *path)
++{
++	struct t20_isp *isp = path->isp;
++	u32 bit = BIT(path->line);
++
++	WRITE_ONCE(path->streaming, false);
++	writel(readl(isp->irqc + IRQC_MASK) | bit, isp->irqc + IRQC_MASK);
++	writel(readl(isp->irqc + IRQC_ENABLE) & ~bit, isp->irqc + IRQC_ENABLE);
++	t20_isp_set_buffer(path, NULL);
++	if (path == &isp->paths[T20_ISP_SUB])
++		isp_update(isp, ISP_BYPASS_HIGH, ISP_BYPASS_DS2_RUN, ISP_BYPASS_DS2_RUN);
++}
++
++/* A frame out of the path: the next frame's address latches in this vertical blanking */
++static void t20_isp_path_done(struct t20_isp_path *path)
++{
++	struct t20_isp_buffer *done, *next = NULL;
++
++	spin_lock(&path->buf_lock);
++	done = path->active;
++	if (!list_empty(&path->pending)) {
++		next = list_first_entry(&path->pending, struct t20_isp_buffer, list);
++		list_del(&next->list);
++	}
++	path->active = next;
++	t20_isp_set_buffer(path, next);
++	spin_unlock(&path->buf_lock);
++
++	if (done) {
++		done->vb.vb2_buf.timestamp = ktime_get_ns();
++		done->vb.sequence = path->sequence;
++		done->vb.field = V4L2_FIELD_NONE;
++		vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
++	}
++	path->sequence++;
++}
++
 +static irqreturn_t t20_isp_irq(int irq, void *data)
 +{
 +	struct t20_isp *isp = data;
-+	struct t20_isp_buffer *done, *next = NULL;
++	struct t20_isp_path *awb_path;
 +	u32 pending, status;
++	int i;
 +
 +	pending = readl(isp->irqc + IRQC_STATUS) & ~readl(isp->irqc + IRQC_MASK);
 +	if (!pending)
@@ -323,151 +852,203 @@ index 000000000..076de7775
 +	isp_write(isp, ISP_IRQ_CLEAR, 0);
 +	isp_write(isp, ISP_IRQ_CLEAR, status);
 +
-+	if (!(status & BIT(ISP_LINE_DS1_DONE)))
-+		return IRQ_HANDLED;
++	/* White balance once a frame, on the main path's end if it runs */
++	awb_path = &isp->paths[READ_ONCE(isp->paths[T20_ISP_MAIN].streaming) ?
++			       T20_ISP_MAIN : T20_ISP_SUB];
++	if (READ_ONCE(isp->awb_on) && (status & BIT(awb_path->line)))
++		t20_isp_awb(isp);
 +
-+	/* The next frame's address latches in this vertical blanking */
-+	spin_lock(&isp->buf_lock);
-+	done = isp->active;
-+	if (!list_empty(&isp->pending)) {
-+		next = list_first_entry(&isp->pending, struct t20_isp_buffer, list);
-+		list_del(&next->list);
-+	}
-+	isp->active = next;
-+	t20_isp_set_buffer(isp, next);
-+	spin_unlock(&isp->buf_lock);
-+
-+	if (done) {
-+		done->vb.vb2_buf.timestamp = ktime_get_ns();
-+		done->vb.sequence = isp->sequence;
-+		done->vb.field = V4L2_FIELD_NONE;
-+		vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
-+	}
-+	isp->sequence++;
++	for (i = 0; i < T20_ISP_PATHS; i++)
++		if ((status & BIT(isp->paths[i].line)) &&
++		    READ_ONCE(isp->paths[i].streaming))
++			t20_isp_path_done(&isp->paths[i]);
 +	return IRQ_HANDLED;
 +}
 +
 +/* Video device and queue */
 +
-+static void t20_isp_fill_pix(struct v4l2_pix_format *pix, u32 w, u32 h)
++static int t20_isp_sd_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
++			      struct v4l2_subdev_format *fmt);
++
++/* Full range unless limited range is asked for */
++static void t20_isp_fill_pix(struct v4l2_pix_format *pix, u32 w, u32 h, u32 quantization)
 +{
 +	pix->width = ALIGN(w, 2);
 +	pix->height = ALIGN(h, 2);
 +	pix->pixelformat = V4L2_PIX_FMT_NV12;
 +	pix->field = V4L2_FIELD_NONE;
 +	pix->bytesperline = ALIGN(pix->width, 8);
-+	pix->sizeimage = pix->bytesperline * pix->height * 3 / 2;
++	/* Room past the frame for the JPEG encoder's whole 16-line macroblock rows */
++	pix->sizeimage = pix->bytesperline * ALIGN(pix->height, 16) * 3 / 2;
 +	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
 +	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
-+	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
-+	pix->xfer_func = V4L2_XFER_FUNC_NONE;
++	pix->quantization = quantization == V4L2_QUANTIZATION_LIM_RANGE ?
++			    quantization : V4L2_QUANTIZATION_FULL_RANGE;
++	pix->xfer_func = V4L2_XFER_FUNC_SRGB;
 +}
 +
 +static int t20_isp_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
 +			       unsigned int *nplanes, unsigned int sizes[],
 +			       struct device *alloc_devs[])
 +{
-+	struct t20_isp *isp = vb2_get_drv_priv(q);
++	struct t20_isp_path *path = vb2_get_drv_priv(q);
 +
 +	if (*nplanes)
-+		return sizes[0] < isp->pix.sizeimage ? -EINVAL : 0;
++		return sizes[0] < path->pix.sizeimage ? -EINVAL : 0;
 +	*nplanes = 1;
-+	sizes[0] = isp->pix.sizeimage;
++	sizes[0] = path->pix.sizeimage;
 +	return 0;
 +}
 +
 +static int t20_isp_buf_prepare(struct vb2_buffer *vb)
 +{
-+	struct t20_isp *isp = vb2_get_drv_priv(vb->vb2_queue);
++	struct t20_isp_path *path = vb2_get_drv_priv(vb->vb2_queue);
 +
-+	if (vb2_plane_size(vb, 0) < isp->pix.sizeimage)
++	if (vb2_plane_size(vb, 0) < path->pix.sizeimage)
 +		return -EINVAL;
-+	vb2_set_plane_payload(vb, 0, isp->pix.sizeimage);
++	vb2_set_plane_payload(vb, 0, path->pix.sizeimage);
 +	return 0;
 +}
 +
 +static void t20_isp_buf_queue(struct vb2_buffer *vb)
 +{
-+	struct t20_isp *isp = vb2_get_drv_priv(vb->vb2_queue);
++	struct t20_isp_path *path = vb2_get_drv_priv(vb->vb2_queue);
 +	struct t20_isp_buffer *buf =
 +		container_of(to_vb2_v4l2_buffer(vb), struct t20_isp_buffer, vb);
 +	unsigned long flags;
 +
-+	spin_lock_irqsave(&isp->buf_lock, flags);
-+	if (vb2_start_streaming_called(vb->vb2_queue) && !isp->active) {
++	spin_lock_irqsave(&path->buf_lock, flags);
++	if (vb2_start_streaming_called(vb->vb2_queue) && !path->active) {
 +		/* Writes were off for lack of buffers: on again from next frame */
-+		isp->active = buf;
-+		t20_isp_set_buffer(isp, buf);
++		path->active = buf;
++		t20_isp_set_buffer(path, buf);
 +	} else {
-+		list_add_tail(&buf->list, &isp->pending);
++		list_add_tail(&buf->list, &path->pending);
 +	}
-+	spin_unlock_irqrestore(&isp->buf_lock, flags);
++	spin_unlock_irqrestore(&path->buf_lock, flags);
 +}
 +
-+static void t20_isp_return_buffers(struct t20_isp *isp, enum vb2_buffer_state state)
++static void t20_isp_return_buffers(struct t20_isp_path *path, enum vb2_buffer_state state)
 +{
 +	struct t20_isp_buffer *buf, *tmp;
 +	unsigned long flags;
 +
-+	spin_lock_irqsave(&isp->buf_lock, flags);
-+	if (isp->active)
-+		list_add(&isp->active->list, &isp->pending);
-+	isp->active = NULL;
-+	list_for_each_entry_safe(buf, tmp, &isp->pending, list) {
++	spin_lock_irqsave(&path->buf_lock, flags);
++	if (path->active)
++		list_add(&path->active->list, &path->pending);
++	path->active = NULL;
++	list_for_each_entry_safe(buf, tmp, &path->pending, list) {
 +		list_del(&buf->list);
 +		vb2_buffer_done(&buf->vb.vb2_buf, state);
 +	}
-+	spin_unlock_irqrestore(&isp->buf_lock, flags);
++	spin_unlock_irqrestore(&path->buf_lock, flags);
 +}
 +
++/*
++ * The sensor's Bayer order changes with its mirror and flip: the ISP's sink
++ * takes the sensor's format before the links are validated
++ */
++static int t20_isp_sync_sensor_fmt(struct t20_isp *isp)
++{
++	struct v4l2_subdev_format fmt = {
++		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
++		.pad = isp->sensor_pad,
++	};
++	struct v4l2_subdev_state *state;
++	int ret;
++
++	ret = v4l2_subdev_call_state_active(isp->sensor, pad, get_fmt, &fmt);
++	if (ret)
++		return ret;
++	fmt.pad = T20_ISP_PAD_SINK;
++	state = v4l2_subdev_lock_and_get_active_state(&isp->sd);
++	t20_isp_sd_set_fmt(&isp->sd, state, &fmt);
++	v4l2_subdev_unlock_state(state);
++	isp->rggb_start = t20_isp_rggb_start(fmt.format.code);
++	return 0;
++}
++
++/*
++ * The first path to stream starts the hardware and the sensor, the last to
++ * stop stops them
++ */
 +static int t20_isp_start_streaming(struct vb2_queue *q, unsigned int count)
 +{
-+	struct t20_isp *isp = vb2_get_drv_priv(q);
++	struct t20_isp_path *path = vb2_get_drv_priv(q);
++	struct t20_isp *isp = path->isp;
 +	unsigned long flags;
 +	int ret;
 +
-+	ret = video_device_pipeline_alloc_start(&isp->vdev);
++	mutex_lock(&isp->hw_lock);
++	if (!isp->streaming) {
++		ret = t20_isp_sync_sensor_fmt(isp);
++		if (ret)
++			goto err_unlock;
++	}
++	ret = video_device_pipeline_alloc_start(&path->vdev);
 +	if (ret)
-+		goto err_return;
++		goto err_unlock;
 +
-+	ret = pm_runtime_resume_and_get(isp->dev);
-+	if (ret)
-+		goto err_pipeline;
++	if (!isp->streaming) {
++		ret = pm_runtime_resume_and_get(isp->dev);
++		if (ret)
++			goto err_pipeline;
++		t20_isp_hw_start(isp);
++		ret = v4l2_ctrl_handler_setup(&isp->ctrls);
++		if (ret)
++			goto err_hw;
++	}
 +
-+	isp->sequence = 0;
-+	spin_lock_irqsave(&isp->buf_lock, flags);
-+	isp->active = list_first_entry(&isp->pending, struct t20_isp_buffer, list);
-+	list_del(&isp->active->list);
-+	spin_unlock_irqrestore(&isp->buf_lock, flags);
++	path->sequence = 0;
++	spin_lock_irqsave(&path->buf_lock, flags);
++	path->active = list_first_entry(&path->pending, struct t20_isp_buffer, list);
++	list_del(&path->active->list);
++	spin_unlock_irqrestore(&path->buf_lock, flags);
++	t20_isp_path_start(path);
++	t20_isp_set_buffer(path, path->active);
 +
-+	t20_isp_hw_start(isp);
-+	t20_isp_set_buffer(isp, isp->active);
-+
-+	ret = v4l2_subdev_enable_streams(isp->sensor, isp->sensor_pad, BIT_ULL(0));
-+	if (ret)
-+		goto err_hw;
++	if (!isp->streaming) {
++		isp_write(isp, ISP_INPUT_MODE, ISP_INPUT_SAFE_START);
++		ret = v4l2_subdev_enable_streams(isp->sensor, isp->sensor_pad, BIT_ULL(0));
++		if (ret) {
++			t20_isp_path_stop(path);
++			goto err_hw;
++		}
++	}
++	isp->streaming++;
++	mutex_unlock(&isp->hw_lock);
 +	return 0;
 +
 +err_hw:
-+	t20_isp_hw_stop(isp);
-+	pm_runtime_put(isp->dev);
++	if (!isp->streaming) {
++		t20_isp_hw_stop(isp);
++		pm_runtime_put(isp->dev);
++	}
 +err_pipeline:
-+	video_device_pipeline_stop(&isp->vdev);
-+err_return:
-+	t20_isp_return_buffers(isp, VB2_BUF_STATE_QUEUED);
++	video_device_pipeline_stop(&path->vdev);
++err_unlock:
++	mutex_unlock(&isp->hw_lock);
++	t20_isp_return_buffers(path, VB2_BUF_STATE_QUEUED);
 +	return ret;
 +}
 +
 +static void t20_isp_stop_streaming(struct vb2_queue *q)
 +{
-+	struct t20_isp *isp = vb2_get_drv_priv(q);
++	struct t20_isp_path *path = vb2_get_drv_priv(q);
++	struct t20_isp *isp = path->isp;
 +
-+	v4l2_subdev_disable_streams(isp->sensor, isp->sensor_pad, BIT_ULL(0));
-+	t20_isp_hw_stop(isp);
++	mutex_lock(&isp->hw_lock);
++	t20_isp_path_stop(path);
++	if (!--isp->streaming) {
++		v4l2_subdev_disable_streams(isp->sensor, isp->sensor_pad, BIT_ULL(0));
++		t20_isp_hw_stop(isp);
++	}
 +	synchronize_irq(isp->irq);
-+	pm_runtime_put(isp->dev);
-+	video_device_pipeline_stop(&isp->vdev);
-+	t20_isp_return_buffers(isp, VB2_BUF_STATE_ERROR);
++	if (!isp->streaming)
++		pm_runtime_put(isp->dev);
++	mutex_unlock(&isp->hw_lock);
++	video_device_pipeline_stop(&path->vdev);
++	t20_isp_return_buffers(path, VB2_BUF_STATE_ERROR);
 +}
 +
 +static const struct vb2_ops t20_isp_vb2_ops = {
@@ -495,28 +1076,41 @@ index 000000000..076de7775
 +
 +static int t20_isp_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 +{
-+	struct t20_isp *isp = video_drvdata(file);
++	struct t20_isp_path *path = video_drvdata(file);
 +
-+	f->fmt.pix = isp->pix;
++	f->fmt.pix = path->pix;
 +	return 0;
 +}
 +
-+/* The DS1 scaler is bypassed: the output is the sensor's size */
++/*
++ * The main path is the sensor's size (its scaler is bypassed); the second
++ * path scales down to any even size
++ */
 +static int t20_isp_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 +{
-+	struct t20_isp *isp = video_drvdata(file);
++	struct t20_isp_path *path = video_drvdata(file);
++	struct t20_isp *isp = path->isp;
++	u32 w = isp->width, h = isp->height;
 +
-+	f->fmt.pix = isp->pix;
++	if (path != &isp->paths[T20_ISP_MAIN]) {
++		w = clamp_t(u32, f->fmt.pix.width, T20_ISP_MIN_SIZE, w) & ~1;
++		h = clamp_t(u32, f->fmt.pix.height, T20_ISP_MIN_SIZE, h) & ~1;
++	}
++	t20_isp_fill_pix(&f->fmt.pix, w, h, f->fmt.pix.quantization);
 +	return 0;
 +}
 +
 +static int t20_isp_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 +{
-+	struct t20_isp *isp = video_drvdata(file);
++	struct t20_isp_path *path = video_drvdata(file);
++	int ret;
 +
-+	if (vb2_is_busy(&isp->queue))
++	if (vb2_is_busy(&path->queue))
 +		return -EBUSY;
-+	return t20_isp_try_fmt(file, fh, f);
++	ret = t20_isp_try_fmt(file, fh, f);
++	if (!ret)
++		path->pix = f->fmt.pix;
++	return ret;
 +}
 +
 +static const struct v4l2_ioctl_ops t20_isp_ioctl_ops = {
@@ -554,16 +1148,105 @@ index 000000000..076de7775
 +	.link_validate = t20_isp_link_validate,
 +};
 +
++/* Controls */
++
++static int t20_isp_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct t20_isp *isp = container_of(ctrl->handler, struct t20_isp, ctrls);
++
++	/* The gains the AWB found */
++	if (ctrl->id == V4L2_CID_AUTO_WHITE_BALANCE) {
++		isp->red->val = isp->wb_red;
++		isp->blue->val = isp->wb_blue;
++	}
++	return 0;
++}
++
++static int t20_isp_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct t20_isp *isp = container_of(ctrl->handler, struct t20_isp, ctrls);
++
++	switch (ctrl->id) {
++	case V4L2_CID_AUTO_WHITE_BALANCE:
++		if (!ctrl->val) {
++			isp->wb_red = isp->red->val;
++			isp->wb_blue = isp->blue->val;
++		}
++		WRITE_ONCE(isp->awb_on, ctrl->val);
++		t20_isp_set_wb(isp, isp->wb_red, isp->wb_blue);
++		return 0;
++	case V4L2_CID_BRIGHTNESS:
++		t20_isp_set_csc(&isp->paths[T20_ISP_MAIN]);
++		t20_isp_set_csc(&isp->paths[T20_ISP_SUB]);
++		return 0;
++	case T20_ISP_CID_NOISE_REDUCTION:
++		t20_isp_set_sinter(isp, ctrl->val);
++		return 0;
++	case V4L2_CID_SHARPNESS:
++		t20_isp_set_sharpen(isp, ctrl->val);
++		return 0;
++	}
++	return -EINVAL;
++}
++
++static const struct v4l2_ctrl_ops t20_isp_ctrl_ops = {
++	.g_volatile_ctrl = t20_isp_g_volatile_ctrl,
++	.s_ctrl = t20_isp_s_ctrl,
++};
++
++static const struct v4l2_ctrl_config t20_isp_noise_reduction = {
++	.ops = &t20_isp_ctrl_ops,
++	.id = T20_ISP_CID_NOISE_REDUCTION,
++	.name = "Noise Reduction",
++	.type = V4L2_CTRL_TYPE_INTEGER,
++	.max = 255,
++	.step = 1,
++	.def = T20_ISP_NOISE_REDUCTION_DEFAULT,
++};
++
++static int t20_isp_init_ctrls(struct t20_isp *isp)
++{
++	struct v4l2_ctrl_handler *h = &isp->ctrls;
++	const struct v4l2_ctrl_ops *ops = &t20_isp_ctrl_ops;
++
++	isp->wb_red = ISP_WB_GAIN_ONE;
++	isp->wb_blue = ISP_WB_GAIN_ONE;
++	v4l2_ctrl_handler_init(h, 8);
++	isp->awb = v4l2_ctrl_new_std(h, ops, V4L2_CID_AUTO_WHITE_BALANCE, 0, 1, 1, 1);
++	isp->red = v4l2_ctrl_new_std(h, ops, V4L2_CID_RED_BALANCE, 0,
++				     ISP_WB_GAIN_MAX, 1, ISP_WB_GAIN_ONE);
++	isp->blue = v4l2_ctrl_new_std(h, ops, V4L2_CID_BLUE_BALANCE, 0,
++				      ISP_WB_GAIN_MAX, 1, ISP_WB_GAIN_ONE);
++	isp->brightness = v4l2_ctrl_new_std(h, ops, V4L2_CID_BRIGHTNESS, -128, 127, 1, 0);
++	isp->contrast = v4l2_ctrl_new_std(h, ops, V4L2_CID_CONTRAST, 0, 255, 1, 128);
++	isp->saturation = v4l2_ctrl_new_std(h, ops, V4L2_CID_SATURATION, 0, 255, 1, 128);
++	v4l2_ctrl_new_custom(h, &t20_isp_noise_reduction, NULL);
++	v4l2_ctrl_new_std(h, ops, V4L2_CID_SHARPNESS, 0, 255, 1, T20_ISP_SHARPNESS_DEFAULT);
++	if (h->error)
++		return h->error;
++	v4l2_ctrl_auto_cluster(3, &isp->awb, 0, true);
++	v4l2_ctrl_cluster(3, &isp->brightness);
++	isp->sd.ctrl_handler = h;
++	isp->paths[T20_ISP_MAIN].vdev.ctrl_handler = h;
++	isp->paths[T20_ISP_SUB].vdev.ctrl_handler = h;
++	return 0;
++}
++
 +/* ISP subdevice: Bayer in, YUV out at the same size */
 +
 +static int t20_isp_sd_enum_mbus_code(struct v4l2_subdev *sd,
 +				     struct v4l2_subdev_state *state,
 +				     struct v4l2_subdev_mbus_code_enum *code)
 +{
++	if (code->pad == T20_ISP_PAD_SINK) {
++		if (code->index >= ARRAY_SIZE(t20_isp_bayer))
++			return -EINVAL;
++		code->code = t20_isp_bayer[code->index];
++		return 0;
++	}
 +	if (code->index)
 +		return -EINVAL;
-+	code->code = code->pad == T20_ISP_PAD_SINK ? MEDIA_BUS_FMT_SBGGR10_1X10 :
-+						      MEDIA_BUS_FMT_YUV10_1X30;
++	code->code = MEDIA_BUS_FMT_YUV10_1X30;
 +	return 0;
 +}
 +
@@ -571,18 +1254,23 @@ index 000000000..076de7775
 +			      struct v4l2_subdev_format *fmt)
 +{
 +	struct v4l2_mbus_framefmt *sink = v4l2_subdev_state_get_format(state, T20_ISP_PAD_SINK);
-+	struct v4l2_mbus_framefmt *src = v4l2_subdev_state_get_format(state, T20_ISP_PAD_SOURCE);
++	struct v4l2_mbus_framefmt *src;
++	unsigned int pad;
 +
-+	if (fmt->pad == T20_ISP_PAD_SINK) {
-+		*sink = fmt->format;
-+		sink->code = MEDIA_BUS_FMT_SBGGR10_1X10;
-+		sink->field = V4L2_FIELD_NONE;
++	if (fmt->pad != T20_ISP_PAD_SINK) {
++		fmt->format = *v4l2_subdev_state_get_format(state, fmt->pad);
++		return 0;
++	}
++	*sink = fmt->format;
++	sink->code = t20_isp_bayer[t20_isp_rggb_start(fmt->format.code)];
++	sink->field = V4L2_FIELD_NONE;
++	fmt->format = *sink;
++	/* Both sources at the sink's size; the second path's video node scales */
++	for (pad = T20_ISP_PAD_SOURCE; pad <= T20_ISP_PAD_SOURCE_SUB; pad++) {
++		src = v4l2_subdev_state_get_format(state, pad);
 +		*src = *sink;
 +		src->code = MEDIA_BUS_FMT_YUV10_1X30;
 +		src->colorspace = V4L2_COLORSPACE_SMPTE170M;
-+		fmt->format = *sink;
-+	} else {
-+		fmt->format = *src;
 +	}
 +	return 0;
 +}
@@ -660,7 +1348,10 @@ index 000000000..076de7775
 +	state = v4l2_subdev_lock_and_get_active_state(&isp->sd);
 +	t20_isp_sd_set_fmt(&isp->sd, state, &fmt);
 +	v4l2_subdev_unlock_state(state);
-+	t20_isp_fill_pix(&isp->pix, fmt.format.width, fmt.format.height);
++	isp->width = fmt.format.width;
++	isp->height = fmt.format.height;
++	t20_isp_fill_pix(&isp->paths[T20_ISP_MAIN].pix, isp->width, isp->height,
++			 isp->paths[T20_ISP_MAIN].pix.quantization);
 +
 +	ret = v4l2_device_register_subdev_nodes(&isp->v4l2_dev);
 +	if (ret)
@@ -721,65 +1412,105 @@ index 000000000..076de7775
 +	return 0;
 +}
 +
-+static int t20_isp_register_video(struct t20_isp *isp)
++static void t20_isp_init_path(struct t20_isp *isp, unsigned int id)
 +{
-+	struct video_device *vdev = &isp->vdev;
-+	struct vb2_queue *q = &isp->queue;
++	static const struct {
++		const char *name;
++		u32 y_writer, uv_writer;
++		unsigned int line, source, pad;
++	} paths[T20_ISP_PATHS] = {
++		[T20_ISP_MAIN] = { "t20-isp-main", ISP_DS1_Y_WRITER, ISP_DS1_UV_WRITER,
++				   ISP_LINE_DS1_DONE, ISP_SRC_DS1_DONE, T20_ISP_PAD_SOURCE },
++		[T20_ISP_SUB] = { "t20-isp-sub", ISP_DS2_Y_WRITER, ISP_DS2_UV_WRITER,
++				  ISP_LINE_DS2_DONE, ISP_SRC_DS2_DONE, T20_ISP_PAD_SOURCE_SUB },
++	};
++	struct t20_isp_path *path = &isp->paths[id];
++
++	path->isp = isp;
++	path->name = paths[id].name;
++	path->y_writer = paths[id].y_writer;
++	path->uv_writer = paths[id].uv_writer;
++	path->line = paths[id].line;
++	path->source = paths[id].source;
++	path->pad = paths[id].pad;
++	mutex_init(&path->lock);
++	spin_lock_init(&path->buf_lock);
++	INIT_LIST_HEAD(&path->pending);
++	if (id == T20_ISP_MAIN)
++		t20_isp_fill_pix(&path->pix, isp->width, isp->height, 0);
++	else
++		t20_isp_fill_pix(&path->pix, T20_ISP_SUB_WIDTH, T20_ISP_SUB_HEIGHT, 0);
++}
++
++static int t20_isp_register_video(struct t20_isp_path *path)
++{
++	struct t20_isp *isp = path->isp;
++	struct video_device *vdev = &path->vdev;
++	struct vb2_queue *q = &path->queue;
 +	int ret;
 +
 +	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 +	q->io_modes = VB2_MMAP | VB2_DMABUF;
-+	q->drv_priv = isp;
++	q->drv_priv = path;
 +	q->buf_struct_size = sizeof(struct t20_isp_buffer);
 +	q->ops = &t20_isp_vb2_ops;
 +	q->mem_ops = &vb2_dma_contig_memops;
 +	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 +	q->min_queued_buffers = 1;
-+	q->lock = &isp->lock;
++	/*
++	 * Userspace may ask for cached buffers (V4L2_MEMORY_FLAG_NON_COHERENT),
++	 * from normal memory, to read frames faster than through the reserved
++	 * memory's uncached mapping
++	 */
++	q->allow_cache_hints = 1;
++	q->lock = &path->lock;
 +	q->dev = isp->dev;
 +	ret = vb2_queue_init(q);
 +	if (ret)
 +		return ret;
 +
-+	strscpy(vdev->name, "t20-isp-main", sizeof(vdev->name));
++	strscpy(vdev->name, path->name, sizeof(vdev->name));
 +	vdev->fops = &t20_isp_fops;
 +	vdev->ioctl_ops = &t20_isp_ioctl_ops;
 +	vdev->v4l2_dev = &isp->v4l2_dev;
 +	vdev->queue = q;
-+	vdev->lock = &isp->lock;
++	vdev->lock = &path->lock;
 +	vdev->release = video_device_release_empty;
 +	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
 +			    V4L2_CAP_IO_MC;
 +	vdev->entity.ops = &t20_isp_video_entity_ops;
-+	video_set_drvdata(vdev, isp);
++	video_set_drvdata(vdev, path);
 +
-+	isp->vpad.flags = MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
-+	ret = media_entity_pads_init(&vdev->entity, 1, &isp->vpad);
++	path->vpad.flags = MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
++	ret = media_entity_pads_init(&vdev->entity, 1, &path->vpad);
 +	if (ret)
 +		return ret;
 +	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 +	if (ret)
 +		return ret;
-+	return media_create_pad_link(&isp->sd.entity, T20_ISP_PAD_SOURCE,
-+				     &vdev->entity, 0,
-+				     MEDIA_LNK_FL_ENABLED | MEDIA_LNK_FL_IMMUTABLE);
++	ret = media_create_pad_link(&isp->sd.entity, path->pad, &vdev->entity, 0,
++				    MEDIA_LNK_FL_ENABLED | MEDIA_LNK_FL_IMMUTABLE);
++	if (ret)
++		video_unregister_device(vdev);
++	return ret;
 +}
 +
 +static int t20_isp_probe(struct platform_device *pdev)
 +{
 +	struct device *dev = &pdev->dev;
 +	struct t20_isp *isp;
-+	int irq, ret;
++	int irq, ret, i;
 +
 +	isp = devm_kzalloc(dev, sizeof(*isp), GFP_KERNEL);
 +	if (!isp)
 +		return -ENOMEM;
 +	isp->dev = dev;
-+	mutex_init(&isp->lock);
-+	spin_lock_init(&isp->buf_lock);
-+	INIT_LIST_HEAD(&isp->pending);
++	mutex_init(&isp->hw_lock);
++	isp->width = 1920;
++	isp->height = 1080;
++	for (i = 0; i < T20_ISP_PATHS; i++)
++		t20_isp_init_path(isp, i);
 +	platform_set_drvdata(pdev, isp);
-+	t20_isp_fill_pix(&isp->pix, 1920, 1080);
 +
 +	isp->vic = devm_platform_ioremap_resource_byname(pdev, "vic");
 +	if (IS_ERR(isp->vic))
@@ -825,6 +1556,9 @@ index 000000000..076de7775
 +		goto err_mdev;
 +
 +	v4l2_subdev_init(&isp->sd, &t20_isp_sd_ops);
++	ret = t20_isp_init_ctrls(isp);
++	if (ret)
++		goto err_ctrls;
 +	isp->sd.internal_ops = &t20_isp_sd_internal_ops;
 +	isp->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 +	isp->sd.entity.function = MEDIA_ENT_F_PROC_VIDEO_ISP;
@@ -833,9 +1567,10 @@ index 000000000..076de7775
 +	strscpy(isp->sd.name, "t20-isp", sizeof(isp->sd.name));
 +	isp->pads[T20_ISP_PAD_SINK].flags = MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
 +	isp->pads[T20_ISP_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	isp->pads[T20_ISP_PAD_SOURCE_SUB].flags = MEDIA_PAD_FL_SOURCE;
 +	ret = media_entity_pads_init(&isp->sd.entity, T20_ISP_PADS, isp->pads);
 +	if (ret)
-+		goto err_v4l2;
++		goto err_ctrls;
 +	ret = v4l2_subdev_init_finalize(&isp->sd);
 +	if (ret)
 +		goto err_entity;
@@ -843,10 +1578,18 @@ index 000000000..076de7775
 +	if (ret)
 +		goto err_sd;
 +
-+	ret = t20_isp_register_video(isp);
++	ret = t20_isp_register_video(&isp->paths[T20_ISP_MAIN]);
 +	if (ret)
 +		goto err_unreg_sd;
++	ret = t20_isp_register_video(&isp->paths[T20_ISP_SUB]);
++	if (ret)
++		goto err_video_main;
 +
++	/* Clocks on here: without CONFIG_PM runtime PM never turns them on */
++	ret = t20_isp_runtime_resume(dev);
++	if (ret)
++		goto err_video;
++	pm_runtime_set_active(dev);
 +	pm_runtime_enable(dev);
 +
 +	v4l2_async_nf_init(&isp->notifier, &isp->v4l2_dev);
@@ -862,14 +1605,21 @@ index 000000000..076de7775
 +err_nf:
 +	v4l2_async_nf_cleanup(&isp->notifier);
 +	pm_runtime_disable(dev);
-+	video_unregister_device(&isp->vdev);
++	if (!pm_runtime_status_suspended(dev))
++		t20_isp_runtime_suspend(dev);
++	pm_runtime_set_suspended(dev);
++err_video:
++	video_unregister_device(&isp->paths[T20_ISP_SUB].vdev);
++err_video_main:
++	video_unregister_device(&isp->paths[T20_ISP_MAIN].vdev);
 +err_unreg_sd:
 +	v4l2_device_unregister_subdev(&isp->sd);
 +err_sd:
 +	v4l2_subdev_cleanup(&isp->sd);
 +err_entity:
 +	media_entity_cleanup(&isp->sd.entity);
-+err_v4l2:
++err_ctrls:
++	v4l2_ctrl_handler_free(&isp->ctrls);
 +	v4l2_device_unregister(&isp->v4l2_dev);
 +err_mdev:
 +	media_device_cleanup(&isp->mdev);
@@ -886,10 +1636,15 @@ index 000000000..076de7775
 +	v4l2_async_nf_unregister(&isp->notifier);
 +	v4l2_async_nf_cleanup(&isp->notifier);
 +	pm_runtime_disable(isp->dev);
-+	video_unregister_device(&isp->vdev);
++	if (!pm_runtime_status_suspended(isp->dev))
++		t20_isp_runtime_suspend(isp->dev);
++	pm_runtime_set_suspended(isp->dev);
++	video_unregister_device(&isp->paths[T20_ISP_SUB].vdev);
++	video_unregister_device(&isp->paths[T20_ISP_MAIN].vdev);
 +	v4l2_device_unregister_subdev(&isp->sd);
 +	v4l2_subdev_cleanup(&isp->sd);
 +	media_entity_cleanup(&isp->sd.entity);
++	v4l2_ctrl_handler_free(&isp->ctrls);
 +	v4l2_device_unregister(&isp->v4l2_dev);
 +	media_device_cleanup(&isp->mdev);
 +	of_reserved_mem_device_release(isp->dev);

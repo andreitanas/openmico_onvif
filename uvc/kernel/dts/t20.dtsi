@@ -267,6 +267,10 @@
 		clocks = <&cgu T20_CLK_MSC0>;
 		clock-names = "mmc";
 
+		/* DMA requests 0x1b (MSC0 receive) and 0x1a (transmit) */
+		dmas = <&pdma 0x1b 0xffffffff>, <&pdma 0x1a 0xffffffff>;
+		dma-names = "rx", "tx";
+
 		status = "disabled";
 	};
 
@@ -279,6 +283,10 @@
 
 		clocks = <&cgu T20_CLK_MSC1>;
 		clock-names = "mmc";
+
+		/* DMA requests 0x1d (MSC1 receive) and 0x1c (transmit) */
+		dmas = <&pdma 0x1d 0xffffffff>, <&pdma 0x1c 0xffffffff>;
+		dma-names = "rx", "tx";
 
 		status = "disabled";
 	};
@@ -295,6 +303,68 @@
 
 		clocks = <&cgu T20_CLK_ISP_GATE>, <&cgu T20_CLK_ISP>;
 		clock-names = "isp", "core";
+
+		status = "disabled";
+	};
+
+	/* VPU: the JPEG and H.264 encoders */
+	vpu: video-codec@13200000 {
+		compatible = "ingenic,t20-vpu";
+		reg = <0x13200000 0x100000>, <0x100000c4 0x4>;
+		reg-names = "vpu", "srbc";
+
+		interrupt-parent = <&intc>;
+		interrupts = <62>;
+
+		clocks = <&cgu T20_CLK_VPU_GATE>, <&cgu T20_CLK_VPU>;
+		clock-names = "vpu", "core";
+
+		status = "disabled";
+	};
+
+	/* 32 programmable channels, as the X1830's */
+	pdma: dma-controller@13420000 {
+		compatible = "ingenic,t20-dma", "ingenic,x1830-dma";
+		reg = <0x13420000 0x400>, <0x13421000 0x40>;
+		#dma-cells = <2>;
+
+		interrupt-parent = <&intc>;
+		interrupts = <10>;
+
+		clocks = <&cgu T20_CLK_PDMA>;
+
+		status = "disabled";
+	};
+
+	/* Audio: the AIC (I2S), and the internal codec as its I2S master */
+	aic: audio-controller@10020000 {
+		compatible = "ingenic,t20-i2s";
+		reg = <0x10020000 0x38>;
+		#sound-dai-cells = <0>;
+
+		interrupt-parent = <&intc>;
+		interrupts = <1>;
+
+		clocks = <&cgu T20_CLK_AIC>, <&cgu T20_CLK_I2S>;
+		clock-names = "aic", "i2s";
+
+		/* DMA requests 7 (I2S0 receive) and 6 (transmit), any channel */
+		dmas = <&pdma 7 0xffffffff>, <&pdma 6 0xffffffff>;
+		dma-names = "rx", "tx";
+
+		status = "disabled";
+	};
+
+	codec: audio-codec@10021000 {
+		compatible = "ingenic,t20-codec";
+		reg = <0x10021000 0x134>;
+		#sound-dai-cells = <0>;
+
+		/* The AIC's system clock from the M/N divider, set to 256 fs */
+		clocks = <&cgu T20_CLK_I2SPLL>;
+		clock-names = "mclk";
+		assigned-clocks = <&cgu T20_CLK_I2SPLLMUX>, <&cgu T20_CLK_I2S>;
+		assigned-clock-parents = <&cgu T20_CLK_MPLL>, <&cgu T20_CLK_I2SPLL>;
 
 		status = "disabled";
 	};

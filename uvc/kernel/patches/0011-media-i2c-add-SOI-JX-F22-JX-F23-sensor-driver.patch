@@ -44,7 +44,7 @@ new file mode 100644
 index 000000000..2884ebe77
 --- /dev/null
 +++ b/drivers/media/i2c/jxf2x.c
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,644 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * SOI JX-F22 and JX-F23 image sensors (1920x1080, 10-bit Bayer, parallel
@@ -78,6 +78,8 @@ index 000000000..2884ebe77
 +#define JXF2X_REG_VER		CCI_REG8(0x0b)
 +#define JXF2X_REG_SYS		CCI_REG8(0x12)
 +#define JXF2X_SYS_SLEEP		0x40
++#define JXF2X_SYS_MIRROR	0x20
++#define JXF2X_SYS_FLIP		0x10
 +#define JXF2X_REG_GROUP		CCI_REG8(0x1f)
 +#define JXF2X_GROUP_LATCH	0x80
 +#define JXF2X_REG_HTS_L		CCI_REG8(0x20)
@@ -198,11 +200,33 @@ index 000000000..2884ebe77
 +	struct v4l2_ctrl_handler ctrls;
 +	struct v4l2_ctrl *exposure;
 +	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *hflip;
++	struct v4l2_ctrl *vflip;
 +};
 +
 +static inline struct jxf2x *to_jxf2x(struct v4l2_subdev *sd)
 +{
 +	return container_of(sd, struct jxf2x, sd);
++}
++
++/*
++ * Mirror and flip move the readout by one column or line, so the Bayer
++ * order follows them (BGGR without either)
++ */
++static u32 jxf2x_code(struct jxf2x *s)
++{
++	static const u32 codes[] = {
++		MEDIA_BUS_FMT_SBGGR10_1X10, MEDIA_BUS_FMT_SGBRG10_1X10,
++		MEDIA_BUS_FMT_SGRBG10_1X10, MEDIA_BUS_FMT_SRGGB10_1X10,
++	};
++
++	return codes[(s->hflip && s->hflip->val) | (s->vflip && s->vflip->val) << 1];
++}
++
++static u8 jxf2x_sys_flip(struct jxf2x *s)
++{
++	return (s->hflip->val ? JXF2X_SYS_MIRROR : 0) |
++	       (s->vflip->val ? JXF2X_SYS_FLIP : 0);
 +}
 +
 +/* 25 frames per second with the default frame length */
@@ -252,7 +276,16 @@ index 000000000..2884ebe77
 +static int jxf2x_s_ctrl(struct v4l2_ctrl *ctrl)
 +{
 +	struct jxf2x *s = container_of(ctrl->handler, struct jxf2x, ctrls);
++	struct v4l2_subdev_state *state;
 +	int ret = 0;
++
++	/* Applied when streaming starts (grabbed while streaming) */
++	if (ctrl->id == V4L2_CID_HFLIP || ctrl->id == V4L2_CID_VFLIP) {
++		state = v4l2_subdev_get_locked_active_state(&s->sd);
++		if (state)
++			v4l2_subdev_state_get_format(state, 0)->code = jxf2x_code(s);
++		return 0;
++	}
 +
 +	if (ctrl->id == V4L2_CID_VBLANK) {
 +		u32 vts = JXF2X_HEIGHT + ctrl->val;
@@ -318,6 +351,12 @@ index 000000000..2884ebe77
 +	/* Register codes; jxf2x_again_log2[] gives the gain of each */
 +	v4l2_ctrl_new_std(h, &jxf2x_ctrl_ops, V4L2_CID_ANALOGUE_GAIN, 0,
 +			  ARRAY_SIZE(jxf2x_again_log2) - 1, 1, 0);
++	s->hflip = v4l2_ctrl_new_std(h, &jxf2x_ctrl_ops, V4L2_CID_HFLIP, 0, 1, 1, 0);
++	s->vflip = v4l2_ctrl_new_std(h, &jxf2x_ctrl_ops, V4L2_CID_VFLIP, 0, 1, 1, 0);
++	if (s->hflip)
++		s->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++	if (s->vflip)
++		s->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
 +
 +	ret = v4l2_fwnode_device_parse(s->dev, &props);
 +	if (!ret)
@@ -377,10 +416,14 @@ index 000000000..2884ebe77
 +	if (!ret)
 +		ret = __v4l2_ctrl_handler_setup(&s->ctrls);
 +	if (!ret)
-+		ret = cci_write(s->regmap, JXF2X_REG_SYS, 0x00, NULL);
-+	if (ret)
++		ret = cci_write(s->regmap, JXF2X_REG_SYS, jxf2x_sys_flip(s), NULL);
++	if (ret) {
 +		pm_runtime_put(s->dev);
-+	return ret;
++		return ret;
++	}
++	__v4l2_ctrl_grab(s->hflip, true);
++	__v4l2_ctrl_grab(s->vflip, true);
++	return 0;
 +}
 +
 +static int jxf2x_disable_streams(struct v4l2_subdev *sd,
@@ -390,16 +433,19 @@ index 000000000..2884ebe77
 +	struct jxf2x *s = to_jxf2x(sd);
 +	int ret;
 +
-+	ret = cci_write(s->regmap, JXF2X_REG_SYS, JXF2X_SYS_SLEEP, NULL);
++	ret = cci_write(s->regmap, JXF2X_REG_SYS,
++			JXF2X_SYS_SLEEP | jxf2x_sys_flip(s), NULL);
++	__v4l2_ctrl_grab(s->hflip, false);
++	__v4l2_ctrl_grab(s->vflip, false);
 +	pm_runtime_put(s->dev);
 +	return ret;
 +}
 +
-+static void jxf2x_fill_fmt(struct v4l2_mbus_framefmt *fmt)
++static void jxf2x_fill_fmt(struct jxf2x *s, struct v4l2_mbus_framefmt *fmt)
 +{
 +	fmt->width = JXF2X_WIDTH;
 +	fmt->height = JXF2X_HEIGHT;
-+	fmt->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++	fmt->code = jxf2x_code(s);
 +	fmt->field = V4L2_FIELD_NONE;
 +	fmt->colorspace = V4L2_COLORSPACE_RAW;
 +	fmt->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
@@ -413,7 +459,7 @@ index 000000000..2884ebe77
 +{
 +	if (code->index)
 +		return -EINVAL;
-+	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++	code->code = jxf2x_code(to_jxf2x(sd));
 +	return 0;
 +}
 +
@@ -421,7 +467,7 @@ index 000000000..2884ebe77
 +				 struct v4l2_subdev_state *state,
 +				 struct v4l2_subdev_frame_size_enum *fse)
 +{
-+	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
++	if (fse->index || fse->code != jxf2x_code(to_jxf2x(sd)))
 +		return -EINVAL;
 +	fse->min_width = fse->max_width = JXF2X_WIDTH;
 +	fse->min_height = fse->max_height = JXF2X_HEIGHT;
@@ -432,7 +478,7 @@ index 000000000..2884ebe77
 +static int jxf2x_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 +			 struct v4l2_subdev_format *fmt)
 +{
-+	jxf2x_fill_fmt(&fmt->format);
++	jxf2x_fill_fmt(to_jxf2x(sd), &fmt->format);
 +	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
 +	return 0;
 +}
@@ -457,7 +503,7 @@ index 000000000..2884ebe77
 +
 +static int jxf2x_init_state(struct v4l2_subdev *sd, struct v4l2_subdev_state *state)
 +{
-+	jxf2x_fill_fmt(v4l2_subdev_state_get_format(state, 0));
++	jxf2x_fill_fmt(to_jxf2x(sd), v4l2_subdev_state_get_format(state, 0));
 +	return 0;
 +}
 +
