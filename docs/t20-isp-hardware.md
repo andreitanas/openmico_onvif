@@ -197,6 +197,35 @@ frame with the filtered previous one, which it keeps in memory:
   per 1080p frame is the same with it on (H.264 18.8 ms, JPEG 10.7 ms).
 - Base modes 1-14 all give a picture; 6 (RAW16) as bright as 5, the
   others darker or brighter. Mode 15 stalled the stream.
+- RAW16 (mode 6, line offset width × 2, 4.1 MB at 1080p) filters, but less
+  (2026-10-28, gain code 79, threshold 64, switched while streaming; two
+  runs with a film playing in the scene): of the noise GEN32 removes, RAW16
+  removes 30-75% (frame-to-frame differences in the quietest blocks and on
+  the desk; spatial residual in the flattest blocks). No banding or other
+  artefacts seen.
+
+## Iridix, local tone mapping (verified 2026-10-28)
+
+Iridix (the Apical "Iridix" and "Iridix LUT" groups) runs from its reset
+values once its bypass, 0x40 bit 15, is cleared: 0x3c0 is 0x29 at reset
+(enable bit 0 already on), 0x3c4 bits 7:0 the strength (0x80 at reset),
+0x3c8 variance and slope limits, 0x3d0/0x3d4 black and white level,
+0x3e0 the two percept LUT enables (off). The LUTs are written through
+index/data ports: asymmetry (the target curve, 33 nodes of 16 bits) at
+0x1c00/0x1c04, reverse percept (65 × 16 bits) at 0x1c20/0x1c24, forward
+percept (65 × 12 bits) at 0x1c30/0x1c34. The asymmetry data port reads
+back 0; with nothing written it works anyway.
+
+- At a fixed exposure in a dim room with a bright monitor, strength 0x80
+  raised the 5th percentile of luma from 41 to 105 and the median from 105
+  to 142: shadows come up, and the whole picture flattens.
+- With auto exposure aiming at the same mean (v4l2grab, 2026-10-28), the
+  exposure comes down instead: analog gain code 67 without, 64 at strength
+  32, 51 at 64, 13 at 128; clipped pixels 7.8%, 6.5%, 2.5%, 0%. At 128
+  the monitor's text is readable, the room looks hazy.
+- At strength 64 and a fixed exposure the dark desk's chroma did not move
+  (no tint); 0x3d0 at 64, 128 and 256 made the picture brighter, not less
+  affected, so its meaning differs from the header's description.
 
 ## Sensor (JX-F22) mirror and flip
 
@@ -206,11 +235,13 @@ GBRG, flip into GRBG, both into RGGB.
 ## Not known yet
 
 - The interrupt source numbers of frame start/end, statistics and errors.
-- The shading and Iridix tables and their formats; what the noise
-  profile entries mean exactly (the vendor's are calibrated per sensor).
-- What Temper keeps in its 32 bits a pixel, and Temper2 mode (bit 7 of
-  0x2c0) against the default Temper3; whether RAW16 (2 bytes a pixel,
-  half the memory) filters as well.
+- The shading tables and their format (mesh shading: R, G, B pages of
+  up to 64×64 in memory; radial: per-channel LUTs and centres), and a
+  flat-field calibration of this lens; the meaning of Iridix's LUTs and of
+  0x3d0. What the noise profile entries mean exactly (the vendor's are calibrated per sensor).
+- What Temper keeps in its 32 bits a pixel (RAW16 filters less, so more
+  than the pixel), and Temper2 mode (bit 7 of 0x2c0) against the default
+  Temper3.
 - The zoned statistics (AE and AWB per zone, in the metering memory at
   0x8000) and the default config sequence's format
   (`SENSOR_ISP_SEQUENCE_DEFAULT`).

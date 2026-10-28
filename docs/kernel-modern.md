@@ -17,7 +17,7 @@ them to H.264 and JPEG, and uvcd streams them to Protect (2026-10-28). Read
 | Interrupts (INTC) | mainline `irq-ingenic` (jz4780) | runs |
 | Timers | mainline `ingenic-sysost` (OST) and `ingenic-timer` (TCU) | runs: OST is the clocksource (24 MHz, BogoMIPS 858), TCU registered too |
 | UART console (ttyS1) | mainline `8250_ingenic` | runs |
-| Pins, GPIO, LEDs, `/sys/class/gpio` | mainline `pinctrl-ingenic` + T20 (patch 0008) | runs (LEDs and GPIOs not tested one by one) |
+| Pins, GPIO, LEDs, `/sys/class/gpio` | mainline `pinctrl-ingenic` + T20 (patch 0008) | runs: IR cut filter (GPIO 25/26) and IR LEDs (GPIO 49) checked from frames; the status LEDs not checked by eye |
 | SPI NOR flash, partitions | gtxaspec's `spi-ingenic-sfc` (0005, 0009), mainline spi-nor + 32 KiB erase (0010) | runs: reads, `flashcp` writes, JFFS2 config |
 | SD card (MSC0) | mainline `jz4740_mmc`, DMA through the PDMA (`dma-jz4780`, built in) | runs: 16 MB/s reads (one 8 GB card read only zeros; see below) |
 | Watchdog | mainline `jz4740_wdt` | runs: `/dev/watchdog`, an unfed watchdog resets the SoC |
@@ -46,14 +46,25 @@ console attached:
   the microphone; listening in Protect still to do),
   and `flash-modern.sh` from both kernels. S50camera loads the camera drivers
   at boot.
-- Open from bring-up: the 8 GB card that read only zeros, step 3 (LEDs, IR
-  cut, IR LEDs one by one).
+- Open from bring-up: the 8 GB card that read only zeros; of step 3, only the
+  status LEDs (the IR cut filter and IR LEDs were checked from frames on
+  2026-10-28: at fixed exposure the filter out raised the mean luma from 104
+  to 133 with the magenta cast of IR, the IR LEDs to 208, and the filter back
+  in returned it to 110).
 - Done since (2026-10-28): colour (white balance with AWB, colour matrix,
   gamma, noise reduction), the DS2 stream, mirror and flip, and the VPU's JPEG
   and H.264 encoders (`t20-vpu`, one driver, a video node each; tests
   `v4l2jpeg` and `v4l2h264`, which also feed ISP frames as dma-bufs).
 - Temporal noise reduction (Temper) runs since 2026-10-28, from the camera
-  memory, which is now a CMA area (below). Not started: ISP shading, Iridix.
+  memory, which is now a CMA area (below). Iridix (local tone mapping) runs
+  since 2026-10-28 as Protect's WDR (below). Not started: ISP shading, which
+  needs a flat-field calibration of the lens (a white target in front of
+  the camera).
+  **Decision (2026-10-28): Temper's frame buffer stays GEN32 (8.3 MB), not
+  RAW16 (4.1 MB):** RAW16 removed only 30-75% of the noise GEN32 removes at
+  full gain ([`t20-isp-hardware.md`](t20-isp-hardware.md)), night pictures
+  are where that matters, and the memory is not short (about 45 MB free
+  with uvcd streaming).
 - uvcd streams on this kernel (2026-10-28) through `src/capture_v4l2.c`
   (below), not through a libimp of our own as first planned.
 - Audio (2026-10-28): the microphone in the kernel (patches 0014, 0015) and in
@@ -61,7 +72,28 @@ console attached:
   was silent in Protect: the audio clock ran 1.2x fast (the CGU read the
   I2SCDR PLL select as the X1000's) and the signal was 30 dB too low (the
   codec's gain controls do nothing). Both fixed; see Audio gain below.
-- Next: the remaining ISP tuning, the speaker for talkback.
+- Snapshots (2026-10-28) take 40-60 ms, from 86-116 ms: the JPEG buffer is
+  now cached (Snapshot buffers, below).
+- Not checked yet: booting without an SD card. From the scripts it should
+  work, 10 s slower (S10config waits that long for the card; the rollback
+  runs only with the card mounted; uvcd and its model are in flash).
+- Left on the test camera (2026-10-28): uvcd runs from the SD card
+  (`/sdcard/uvc/uvcd`, which `uvcd-run` prefers to the one in flash), as the
+  flashed image predates the audio limiter; delete it once an image with
+  the limiter is flashed. `/sdcard/nightlog.sh` appends the exposure figure,
+  gain and day/night state to `/sdcard/nightlog.txt` every minute, for the
+  night test below; stop it and delete both when done.
+- Next: night mode in real darkness (the day/night thresholds were measured
+  under the vendor's ISP; uvcd's exposure figure follows the same formula
+  but has not seen a dark room yet: read `/sdcard/nightlog.txt` after a
+  night), shading (needs a flat field), the speaker for talkback (the test
+  camera's speaker is not connected).
+- Needs someone at the camera or in Protect: the status LEDs by eye, the
+  8 GB card, a boot without an SD card, the way back to OpenMiko with
+  `demo.bin` (hardware test step 8), listening to the microphone in Protect
+  (the limiter has not met a loud sound yet), judging WDR level 1 and
+  whether Protect shows the WDR setting (WDR, below), and the white target
+  for shading.
 
 ## Sources
 
@@ -245,10 +277,10 @@ the `mm32`/`ftrunc32` shims stay only for the 3.10 kernel.
 | Sensor JX-F22/JX-F23 | `jxf2x` (patch 0011): V4L2 subdevice, exposure, analog gain, frame length; both sensors, told apart by chip ID | `IMP_ISP_AddSensor`, `EnableSensor`; exposure and gain from our AE | runs (JX-F22) |
 | ISP | `t20-isp` (patch 0012): VIC + ISP core, NV12 out of DS1 at sensor size, one video node | FrameSource channels | runs: 25 fps |
 | Auto exposure, white balance | AWB in the driver (grey world from the ISP's global R/G, B/G statistics, every frame); white balance, brightness, contrast, saturation and noise reduction as V4L2 controls | our AE from the frames | runs: AWB in `t20-isp`, AE on frame luma in uvcd (`src/capture_v4l2.c`) and `capture/v4l2grab.c` |
-| Image tuning (gamma, noise reduction, shading, sharpness) | fixed in the driver: sRGB gamma, a generic colour matrix, Sinter with a flat noise profile | `IMP_ISP_Tuning_*` | gamma, colour, Sinter, sharpening, Temper run; shading, Iridix not started |
+| Image tuning (gamma, noise reduction, shading, sharpness) | fixed in the driver: sRGB gamma, a generic colour matrix, Sinter with a flat noise profile | `IMP_ISP_Tuning_*` | gamma, colour, Sinter, sharpening, Temper, Iridix run; shading not started |
 | Second stream | DS2 path: a second video node (`t20-isp-sub`, `/dev/video1`) scaled to any even size, 640x360 by default | detector channel | runs, alone or with the main stream |
 | H.264 encoder | `t20-vpu` (patch 0013), node `t20-h264`: V4L2 stateful encoder, NV12 in (MMAP or dma-buf), Annex B out (SPS and PPS before every IDR frame); controls GOP size, force key frame, frame rate control with bit rate and min/max QP (or I/P QP), frame rate by `S_PARM`. The VPU does motion search, mode decision, transform and CABAC; the driver writes the headers and runs the rate control | `IMP_Encoder_*` | runs (`v4l2h264`): 1080p at the ISP's 25 fps, 16 ms a frame in the VPU; PSNR 43 dB on a synthetic pan; 1-8 Mbit/s held within 2% |
-| JPEG | `t20-vpu` (patch 0013), node `t20-jpeg`: V4L2 mem2mem, NV12 in (MMAP or dma-buf), JFIF out, `V4L2_CID_JPEG_COMPRESSION_QUALITY` | snapshot channel | runs (`v4l2jpeg`), also while H.264 encodes (the jobs take turns) |
+| JPEG | `t20-vpu` (patch 0013), node `t20-jpeg`: V4L2 mem2mem, NV12 in (MMAP or dma-buf), JFIF out, `V4L2_CID_JPEG_COMPRESSION_QUALITY` | snapshot channel | runs (`v4l2jpeg`), also while H.264 encodes (the jobs take turns); uvcd's snapshots take 40-60 ms (below) |
 | Audio | ALSA: the AIC (mainline `jz4740-i2s`, a T20 variant), PDMA (`dma-jz4780` as the X1830's), our internal codec driver `t20-codec` (patch 0014), `simple-audio-card`; the codec is the I2S master on the AIC's 256 fs system clock; its one ADC is the right channel | uvcd's `src/audio.c`: `/dev/dsp` at 16 kHz, AAC-LC 32 kbit/s (vo-aacenc), into the streams' audio track in place of silence | microphone runs (`audiorec`, `test/test_audio.c`; uvcd streams it, gain from Protect's microphone volume); speaker (DAC, amplifier GPIO) not started |
 
 What `t20-isp` does today: VIC set up for the 10-bit parallel bus, the ISP core's
@@ -277,12 +309,53 @@ control stays, as the vendor's register, but changes nothing measurable), and
   full scale;
 - then a gain linear in dB from Protect's microphone volume
   (`ChangeVideoSettings` `audio.volume`, 0-100, default 100): 0 is silence,
-  100 is +30 dB; samples are clamped, not limited.
+  100 is +30 dB;
+- then a peak limiter at -3 dBFS (instant attack, 100 ms release), so a
+  loud sound near the camera is turned down instead of clipping (added
+  2026-10-28: a -20 dBFS burst at +30 dB came out at -3 dBFS peak with no
+  clipped samples, and quiet sound after it at its level again).
 
 At volume 100 a quiet room comes out at -46 dBFS RMS (peaks -21 dBFS), so
 background sound is audible and a loud sound has about 20 dB before it
-clips. An automatic gain control in software, if needed, would go in the
-same place.
+reaches the limiter. An automatic gain control in software, if needed,
+would go in the same place.
+
+### WDR
+
+**Decision (2026-10-28): Protect's WDR setting drives the ISP's Iridix, and
+level 1, Protect's default, turns it on at a quarter of its reset strength.**
+`t20-isp` has a "Dynamic Range Compression" control, Iridix's strength, 0
+(the default) bypassing it; uvcd sets it from Protect's `wdr` (0 off, 1 to 3
+strength 32, 64, 128) and reports `hasWdr`, so that Protect can offer the
+setting. Iridix lifts the shadows and auto exposure, aiming at the same
+mean, takes the exposure down, which keeps highlights (a window, a
+screen) from clipping; the cost is a flatter, hazier picture, already
+plain at 128 ([`t20-isp-hardware.md`](t20-isp-hardware.md)). Protect sends
+`wdr: 1` to this camera even without `hasWdr`; at 32 the change is small
+(clipped pixels 7.8% to 6.5% in the test scene). If Protect keeps its
+cached feature flags until the camera is adopted again, the slider is not
+shown and level 1 stays.
+
+### Snapshot buffers
+
+**Decision (2026-10-28): the JPEG encoder's capture buffer is cached, with the
+driver keeping it coherent, rather than a bounce buffer.** A snapshot took
+86-116 ms: about 14 ms in the VPU, up to a frame's wait for the next ISP
+frame, and 40-57 ms for uvcd to copy the 250-450 KB JPEG out of the
+encoder's buffer, which `vb2_dma_contig` maps uncached (reads run at about
+7 MB/s). The H.264 node avoids this with a vmalloc capture buffer that the
+driver fills from its own buffer, read through the cached KSEG0 alias; the
+same for JPEG would cost another 2 MB (the capture buffer is sized for the
+raw frame). Instead `t20-vpu` lets its dma-contig capture queue take
+`V4L2_MEMORY_FLAG_NON_COHERENT` (`allow_cache_hints`), and uvcd asks for it.
+The JPEG codec then writes back what the CPU writes into that buffer, the
+header before the job and the EOI marker after it (with that line
+invalidated first): the XBurst core is one of those that get a post-DMA
+invalidate (`cpu_needs_post_dma_flush`), which would otherwise drop them. The
+copy now takes 2-3 ms, a snapshot 40-60 ms in `test_capture_v4l2` (which asks
+just after a frame, so it waits most of one; about 35 ms on average
+otherwise). Without the flag the buffer stays uncached and correct, as
+`v4l2jpeg` uses it.
 
 ### uvcd's libimp calls
 
@@ -444,7 +517,10 @@ but see the JFFS2 risk below.
    `dmesg`), `ls /config/overlay/etc`. Do not write `/config` until this is clean.
 3. **GPIOs and LEDs**: `echo 1 > /sys/class/leds/led_blue/brightness`, the IR cut
    filter through uvcd's day/night switch or by hand (GPIO 25/26 pulses), IR LEDs
-   (GPIO 49).
+   (GPIO 49). Without anyone at the camera: stop uvcd and grab frames with
+   `v4l2grab` at a fixed exposure, gain and white balance (`EXPOSURE`, `GAIN`,
+   `CTRLS="whitebalanceautomatic=0 ..."`) with the filter in, out, and out
+   with the LEDs on; the mean luma and colour show each one move.
 4. **SD card**: insert, `dmesg` for `mmc0: new ... card`, `mount /dev/mmcblk0p1`,
    read and write a file.
 5. **WiFi**: `modprobe 8189fs`, `ip link` shows wlan0 with the camera's MAC, S20wifi
