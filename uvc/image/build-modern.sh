@@ -32,12 +32,20 @@ mkdir -p $OUT/overlay/usr/sbin $OUT/overlay/usr/bin
 cp build/dropbear/dropbearmulti $OUT/overlay/usr/sbin/dropbear
 ln -s ../sbin/dropbear $OUT/overlay/usr/bin/dropbearkey
 mkdir -p $OUT/payload/rom/uvc/models
+# Mount points: the root is read-only (S10config mounts these)
+mkdir -p $OUT/payload/config $OUT/payload/sdcard
 cp build/uvcd-mipsel $OUT/payload/rom/uvc/uvcd
 chmod 755 $OUT/payload/rom/uvc/uvcd
 # Camera driver test (docs/kernel-modern.md, hardware test plan)
 mkdir -p $OUT/payload/usr/bin
 zig cc -target mipsel-linux-musleabihf -mcpu=mips32r2 -Os -static -s \
     -o $OUT/payload/usr/bin/v4l2grab capture/v4l2grab.c
+zig cc -target mipsel-linux-musleabihf -mcpu=mips32r2 -Os -static -s \
+    -o $OUT/payload/usr/bin/v4l2jpeg capture/v4l2jpeg.c
+zig cc -target mipsel-linux-musleabihf -mcpu=mips32r2 -Os -static -s \
+    -o $OUT/payload/usr/bin/v4l2h264 capture/v4l2h264.c
+zig cc -target mipsel-linux-musleabihf -mcpu=mips32r2 -Os -static -s \
+    -o $OUT/payload/usr/bin/audiorec capture/audiorec.c
 cp third_party/models/yolo-fastest-1.1.param third_party/models/yolo-fastest-1.1.bin \
     $OUT/payload/rom/uvc/models/
 

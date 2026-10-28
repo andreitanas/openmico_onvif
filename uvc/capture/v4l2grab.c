@@ -2,14 +2,20 @@
 // frames from the ISP's video node, run a simple auto exposure on the
 // sensor's controls, and save frames.
 //   v4l2grab out.nv12 [frames] [video] [sensor-subdev]
-// Defaults: 50 frames, /dev/video0, /dev/v4l-subdev0 (see
-// /sys/class/video4linux/*/name: "jxf2x 0-0040" is the sensor). The last
+// Defaults: 50 frames, /dev/video0, the first /dev/v4l-subdev* with an
+// exposure control (the ISP has a subdevice too). The last
 // frame goes to out.nv12 (1920x1080 NV12: ffmpeg -f rawvideo -pix_fmt nv12
 // -s 1920x1080 -i out.nv12 out.png); the log shows the mean luma and the
-// exposure and gain auto exposure picked for each frame.
+// exposure and gain auto exposure picked for each frame. EXPOSURE=lines and
+// GAIN=code in the environment fix them instead (auto exposure off).
+// CTRLS="name=value ..." sets controls of the video node and subdevices by
+// name, lower case without spaces or punctuation (horizontalflip=1,
+// whitebalanceautomatic=0, redbalance=300), and lists them all. SIZE=WxH
+// sets the frame size (the second stream, /dev/video1, scales).
 // Build: zig cc -target mipsel-linux-musleabihf -mcpu=mips32r2 -Os
 //   -static -o v4l2grab capture/v4l2grab.c
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/v4l2-subdev.h>
@@ -53,6 +59,31 @@ static int ctrl_range(int fd, unsigned id, int *min, int *max) {
     return 0;
 }
 
+// Control name as CTRLS spells it: lower case letters and digits only
+static void ctrl_key(const char *name, char *key, size_t n) {
+    size_t k = 0;
+    for (; *name && k + 1 < n; name++)
+        if (isalnum((unsigned char)*name)) key[k++] = tolower((unsigned char)*name);
+    key[k] = 0;
+}
+
+// Set the controls named in list on fd, and print every control of fd
+static void set_ctrls(int fd, const char *path, const char *list) {
+    struct v4l2_queryctrl q = {.id = V4L2_CTRL_FLAG_NEXT_CTRL};
+    for (; xioctl(fd, VIDIOC_QUERYCTRL, &q) == 0; q.id |= V4L2_CTRL_FLAG_NEXT_CTRL) {
+        char key[32], want[48];
+        int v;
+        if (q.type == V4L2_CTRL_TYPE_CTRL_CLASS) continue;
+        ctrl_key((const char *)q.name, key, sizeof(key));
+        snprintf(want, sizeof(want), "%s=", key);
+        const char *m = strstr(list, want);
+        if (m && (m == list || m[-1] == ' ' || m[-1] == ','))
+            if (ctrl_set(fd, q.id, atoi(m + strlen(want))) < 0) perror(key);
+        if (ctrl_get(fd, q.id, &v) == 0)
+            printf("%s: %s = %d (%d..%d)\n", path, key, v, q.minimum, q.maximum);
+    }
+}
+
 // Mean of every 16th luma sample of every 16th line
 static unsigned mean_luma(const uint8_t *y, unsigned w, unsigned h, unsigned stride) {
     unsigned long sum = 0, n = 0;
@@ -90,7 +121,16 @@ int main(int argc, char **argv) {
     }
     int frames = argc > 2 ? atoi(argv[2]) : 50;
     const char *vpath = argc > 3 ? argv[3] : "/dev/video0";
-    const char *spath = argc > 4 ? argv[4] : "/dev/v4l-subdev0";
+    char spath[32] = "";
+    if (argc > 4) snprintf(spath, sizeof(spath), "%s", argv[4]);
+    for (int i = 0; !spath[0] && i < 8; i++) {
+        char p[32];
+        int v, sfd;
+        snprintf(p, sizeof(p), "/dev/v4l-subdev%d", i);
+        if ((sfd = open(p, O_RDWR)) < 0) continue;
+        if (ctrl_get(sfd, V4L2_CID_EXPOSURE, &v) == 0) memcpy(spath, p, sizeof(p));
+        close(sfd);
+    }
 
     int fd = open(vpath, O_RDWR);
     if (fd < 0) {
@@ -109,6 +149,12 @@ int main(int argc, char **argv) {
         perror("VIDIOC_G_FMT");
         return 1;
     }
+    const char *size = getenv("SIZE");
+    if (size && sscanf(size, "%ux%u", &fmt.fmt.pix.width, &fmt.fmt.pix.height) == 2 &&
+        xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        perror("VIDIOC_S_FMT");
+        return 1;
+    }
     struct v4l2_pix_format *pix = &fmt.fmt.pix;
     printf("format %ux%u %.4s, %u bytes per line, %u bytes\n", pix->width, pix->height,
            (char *)&pix->pixelformat, pix->bytesperline, pix->sizeimage);
@@ -118,8 +164,30 @@ int main(int argc, char **argv) {
         ctrl_get(ae.fd, V4L2_CID_ANALOGUE_GAIN, &ae.gain) < 0 ||
         ctrl_range(ae.fd, V4L2_CID_EXPOSURE, &ae.expo_min, &ae.expo_max) < 0 ||
         ctrl_range(ae.fd, V4L2_CID_ANALOGUE_GAIN, &ae.gain_min, &ae.gain_max) < 0) {
-        fprintf(stderr, "%s: no exposure controls, auto exposure off\n", spath);
+        fprintf(stderr, "%s: no exposure controls, auto exposure off\n",
+                spath[0] ? spath : "/dev/v4l-subdev*");
         if (ae.fd >= 0) close(ae.fd);
+        ae.fd = -1;
+    }
+
+    const char *ctrls = getenv("CTRLS");
+    if (ctrls) {
+        set_ctrls(fd, vpath, ctrls);
+        for (int i = 0; i < 8; i++) {
+            char p[32];
+            int sfd;
+            snprintf(p, sizeof(p), "/dev/v4l-subdev%d", i);
+            if ((sfd = open(p, O_RDWR)) < 0) continue;
+            set_ctrls(sfd, p, ctrls);
+            close(sfd);
+        }
+    }
+
+    const char *fe = getenv("EXPOSURE"), *fg = getenv("GAIN");
+    if (ae.fd >= 0 && (fe || fg)) {
+        if (fe) ctrl_set(ae.fd, V4L2_CID_EXPOSURE, ae.expo = atoi(fe));
+        if (fg) ctrl_set(ae.fd, V4L2_CID_ANALOGUE_GAIN, ae.gain = atoi(fg));
+        close(ae.fd);
         ae.fd = -1;
     }
 
