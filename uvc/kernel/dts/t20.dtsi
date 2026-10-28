@@ -363,8 +363,8 @@
 		/* The AIC's system clock from the M/N divider, set to 256 fs */
 		clocks = <&cgu T20_CLK_I2SPLL>;
 		clock-names = "mclk";
-		assigned-clocks = <&cgu T20_CLK_I2SPLLMUX>, <&cgu T20_CLK_I2S>;
-		assigned-clock-parents = <&cgu T20_CLK_MPLL>, <&cgu T20_CLK_I2SPLL>;
+		assigned-clocks = <&cgu T20_CLK_I2SPLLMUX>;
+		assigned-clock-parents = <&cgu T20_CLK_MPLL>;
 
 		status = "disabled";
 	};

@@ -337,8 +337,8 @@ index 000000000..beacae28f
 +
 +	[T20_CLK_I2SPLLMUX] = {
 +		"i2s_pll_mux", CGU_CLK_MUX,
-+		.parents = { T20_CLK_SCLKA, T20_CLK_MPLL, -1, -1 },
-+		.mux = { CGU_REG_I2SCDR, 31, 1 },
++		.parents = { T20_CLK_SCLKA, T20_CLK_MPLL, T20_CLK_VPLL, -1 },
++		.mux = { CGU_REG_I2SCDR, 30, 2 },
 +	},
 +
 +	[T20_CLK_I2SPLL] = {
@@ -359,11 +359,11 @@ index 000000000..beacae28f
 +		},
 +	},
 +
-+	/* Bit 30 selects the M/N divider, bit 29 enables it: both or neither */
++	/* Bits 31:30 pick the divider's PLL; bit 29 runs it (cleared, no clock) */
 +	[T20_CLK_I2S] = {
-+		"i2s", CGU_CLK_MUX,
-+		.parents = { T20_CLK_EXCLK, -1, -1, T20_CLK_I2SPLL },
-+		.mux = { CGU_REG_I2SCDR, 29, 2 },
++		"i2s", CGU_CLK_GATE,
++		.parents = { T20_CLK_I2SPLL, -1, -1, -1 },
++		.gate = { CGU_REG_I2SCDR, 29, true },
 +	},
 +
 +	[T20_CLK_AIC] = {
