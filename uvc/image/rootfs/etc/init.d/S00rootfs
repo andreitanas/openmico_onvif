@@ -1,13 +1,13 @@
 #!/bin/sh
 # With our kernel the root filesystem is the read-only squashfs on the root
-# flash partition: /etc (and /var if it is a directory) get a writable
-# layer in RAM, for the settings S10config installs. Nothing to do on
-# OpenMiko's kernel, whose root is in RAM.
+# flash partition: /etc, /root (ssh keys) and /var if it is a directory get
+# a writable layer in RAM, for the settings S10config installs. Nothing to
+# do on OpenMiko's kernel, whose root is in RAM.
 case "$1" in
 start)
 	awk '$2 == "/" && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts || exit 0
 	grep -q ' /tmp ' /proc/mounts || mount -t tmpfs -o mode=1777 tmpfs /tmp
-	for d in etc var; do
+	for d in etc root var; do
 		[ -d /$d ] && [ ! -L /$d ] || continue
 		mkdir -p /tmp/.rw/$d /tmp/.rw/$d.work
 		mount -t overlay overlay -o lowerdir=/$d,upperdir=/tmp/.rw/$d,workdir=/tmp/.rw/$d.work /$d ||

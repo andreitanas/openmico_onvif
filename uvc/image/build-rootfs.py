@@ -120,6 +120,11 @@ def main(base, overlay, out, *extra):
     def dropped(n):
         if n in DROP_FILES or any(n == t or n.startswith(t + '/') for t in DROP_TREES):
             return True
+        # Our kernel: nothing of the 3.10 kernel's modules, not even their
+        # indexes (the init scripts tell the kernels apart by uname -r, but
+        # an empty lib/modules/3.10.14 misleads anything that looks)
+        if extra and any(n == t or n.startswith(t + '/') for t in ('lib/modules/3.10.14', 'driver')):
+            return True
         m = members[n]
         if m.isreg() and n.endswith('.ko'):
             return bool(extra) or n not in KEEP_MODULES
@@ -158,7 +163,9 @@ def main(base, overlay, out, *extra):
     ours = {}
     for top in (overlay,) + extra:
         for root, dirs, files in os.walk(top):
-            for f in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+            # Empty directories too: mount points on a read-only root
+            for f in files + [d for d in dirs if os.path.islink(os.path.join(root, d)) or
+                              not os.listdir(os.path.join(root, d))]:
                 path = os.path.join(root, f)
                 ours[os.path.relpath(path, top)] = path
     keep -= set(ours)
@@ -193,6 +200,11 @@ def main(base, overlay, out, *extra):
             if os.path.islink(path):
                 t.type, t.linkname, t.mode = tarfile.SYMTYPE, os.readlink(path), 0o777
                 dst.addfile(t)
+                continue
+            if os.path.isdir(path):
+                t.type, t.mode = tarfile.DIRTYPE, 0o755
+                dst.addfile(t)
+                keep.add(n)
                 continue
             st = os.stat(path)
             t.size, t.mode, t.mtime = st.st_size, st.st_mode & 0o777, int(st.st_mtime)

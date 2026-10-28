@@ -1,0 +1,171 @@
+#!/bin/sh
+# Trial boots after image/flash-modern.sh, for a camera without a serial
+# console. flash-modern.sh saves the image the camera ran before (its kernel
+# partition and the root partition's first 274 blocks, as a demo.bin) to the
+# SD card, with the uImage header of the kernel it flashed. While that kernel
+# runs and the saved image is on the card, every boot is a trial: unless
+# `rollback keep` runs within 10 minutes of boot, or by the third boot, the
+# saved image goes back to flash and the camera reboots into it. This covers
+# a kernel that boots but loses WiFi; one that hangs before userspace still
+# needs demo.bin and the setup button.
+#
+#   rollback boot     from S15rollback: count the boot, start the timer
+#   rollback keep     keep what runs now
+#   rollback now      write the saved image back and reboot
+#   rollback status
+#
+# Files in /sdcard/rollback/:
+#   image.bin, image.md5    the previous image (also a demo.bin for recovery)
+#   kernel.md5              md5 of the first 64 bytes of the kernel on trial
+#   boots                   trial boots so far
+#   log                     what happened
+#   trial.txt               dmesg, syslog and network state, every minute
+#   previous.bin            image.bin after `keep`; restored.bin after a rollback
+DIR=/sdcard/rollback
+WAIT=600
+BOOTS=3
+KERNEL=$((0x200000))
+ROOT=$((274 * 32768))
+FL=/tmp/fl
+
+log() {
+	logger -s -t rollback "$*"
+	echo "$(date '+%F %T') $*" >> $DIR/log
+}
+
+uptime_s() { cut -d. -f1 /proc/uptime; }
+
+armed() {
+	[ -f $DIR/image.bin ] && [ -f $DIR/image.md5 ] && [ -f $DIR/kernel.md5 ] || return 1
+	[ "$(head -c 64 /dev/mtd1 | md5sum | cut -d' ' -f1)" = "$(cat $DIR/kernel.md5)" ]
+}
+
+snapshot() {
+	{
+		echo "== $(date) up $(uptime_s) s, trial boot $(cat $DIR/boots 2>/dev/null)"
+		uname -a
+		echo; ip addr
+		echo; cat /proc/mounts
+		echo; lsmod
+		echo; ps
+		echo; logread 2>/dev/null | tail -200
+		echo; dmesg
+	} > $DIR/trial.tmp 2>&1
+	mv $DIR/trial.tmp $DIR/trial.txt
+	sync
+}
+
+# Check the saved image, stop uvcd, and go on from RAM: the rest runs from
+# busybox and uClibc copied to /tmp, with /lib bound over, since the root
+# partition about to be rewritten may be the one we run from.
+restore() {
+	if [ "$(md5sum < $DIR/image.bin | cut -d' ' -f1)" != "$(cat $DIR/image.md5)" ]; then
+		log "$DIR/image.bin does not match image.md5: not rolling back"
+		exit 1
+	fi
+	rm -rf $FL
+	mkdir -p $FL/lib
+	tail -c +65 $DIR/image.bin | head -c $KERNEL > $FL/kernel
+	tail -c +$((65 + KERNEL)) $DIR/image.bin > $FL/root
+	if [ "$(wc -c < $FL/kernel)" != $KERNEL ] || [ "$(wc -c < $FL/root)" != $ROOT ]; then
+		log "$DIR/image.bin has the wrong size: not rolling back"
+		exit 1
+	fi
+
+	sed -i 's|^::respawn:/usr/bin/uvcd-run|#&|' /etc/inittab
+	kill -HUP 1
+	killall uvcd-run uvcd 2>/dev/null
+	sleep 3
+	awk '$2 == "/" && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts ||
+		umount /rom 2>/dev/null
+
+	cp /bin/busybox $FL/
+	for a in sh cat cut date dd head killall logger md5sum flashcp mv reboot rm sleep sync tail umount watchdog wc; do
+		ln -sf busybox $FL/$a
+	done
+	cp -L /lib/ld-uClibc.so.0 /lib/libc.so.1 $FL/lib/
+	cp "$0" $FL/rollback
+	mount -o bind $FL/lib /lib
+	PATH=$FL exec $FL/sh $FL/rollback write
+}
+
+# write image partition: flash and read back, three tries
+write() {
+	for try in 1 2 3; do
+		flashcp $1 /dev/mtd$2 &&
+			[ "$(dd if=/dev/mtd$2 bs=32768 2>/dev/null | head -c $(wc -c < $1) | md5sum)" = "$(md5sum < $1)" ] &&
+			return 0
+		log "mtd$2: write $try did not verify"
+	done
+	return 1
+}
+
+case "$1" in
+boot)
+	armed || exit 0
+	n=$(($(cat $DIR/boots 2>/dev/null || echo 0) + 1))
+	echo $n > $DIR/boots
+	if [ $n -gt $BOOTS ]; then
+		log "trial boot $n without keep: rolling back"
+		snapshot
+		restore
+	fi
+	log "trial boot $n of $BOOTS of $(uname -r): run 'rollback keep' within $((WAIT / 60)) minutes of boot"
+	(
+		while armed && [ "$(uptime_s)" -lt $WAIT ]; do
+			snapshot
+			sleep 60
+		done
+		if armed; then
+			log "not kept within $((WAIT / 60)) minutes: rolling back"
+			snapshot
+			restore
+		fi
+	) < /dev/null > /dev/null 2>&1 &
+	;;
+keep)
+	if ! armed; then
+		echo "no trial running"
+		exit 0
+	fi
+	mv $DIR/image.bin $DIR/previous.bin
+	mv $DIR/image.md5 $DIR/previous.md5
+	rm -f $DIR/kernel.md5 $DIR/boots
+	log "kept $(uname -r); the image before it is $DIR/previous.bin"
+	;;
+now)
+	[ -f $DIR/image.bin ] && [ -f $DIR/image.md5 ] || { echo "no saved image in $DIR"; exit 1; }
+	log "rolling back on request"
+	restore
+	;;
+write)
+	echo 1 > /sys/class/leds/led_yellow/brightness 2>/dev/null
+	# uvcd disarms the watchdog when it stops; if it was killed instead,
+	# keep the watchdog fed while the flash is written.
+	watchdog -t 10 -T 120 /dev/watchdog 2>/dev/null
+	if write $FL/kernel 1 && write $FL/root 2; then
+		mv $DIR/image.bin $DIR/restored.bin
+		mv $DIR/image.md5 $DIR/restored.md5
+		rm -f $DIR/kernel.md5 $DIR/boots
+		log "previous image written back; rebooting"
+		sync
+		umount /sdcard 2>/dev/null
+		reboot -f
+	fi
+	log "ROLLBACK FAILED: flash is in an unknown state; recover with demo.bin and the setup button"
+	;;
+status)
+	if armed; then
+		echo "trial boot $(cat $DIR/boots 2>/dev/null) of $BOOTS of $(uname -r), rollback in $((WAIT - $(uptime_s))) s unless 'rollback keep'"
+	elif [ -f $DIR/image.bin ]; then
+		echo "$DIR/image.bin is saved, but the kernel in flash is not the one on trial"
+	else
+		echo "no trial running"
+	fi
+	tail -5 $DIR/log 2>/dev/null
+	;;
+*)
+	echo "usage: $0 boot|keep|now|status" >&2
+	exit 1
+	;;
+esac

@@ -1,0 +1,9 @@
+#!/bin/sh
+# After a kernel or image change from image/flash-modern.sh, roll back to the
+# previous image unless kept (/usr/sbin/rollback). Needs the SD card, which
+# S10config mounts.
+case "$1" in
+start)
+	grep -q ' /sdcard ' /proc/mounts && /usr/sbin/rollback boot
+	;;
+esac

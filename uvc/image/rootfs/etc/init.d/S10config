@@ -12,6 +12,14 @@ start)
 	awk '$2 == "/" && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts ||
 		mount -t jffs2 -o ro /dev/mtdblock2 /rom || logger -s -t config "cannot mount /rom"
 
+	# Our kernel polls for the card (no card-detect line): wait for it, 10 s
+	# at most. The rollback after a flash (S15rollback) needs it.
+	i=0
+	while [ ! -b /dev/mmcblk0 ] && [ $i -lt 10 ] &&
+		awk '$2 == "/" && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts; do
+		sleep 1
+		i=$((i + 1))
+	done
 	if [ -b /dev/mmcblk0p1 ] && mount -t vfat -o rw,noatime,umask=0000 /dev/mmcblk0p1 /sdcard; then
 		if [ -d /sdcard/config ]; then
 			find /sdcard/config -type f | while read -r f; do
@@ -25,6 +33,11 @@ start)
 		fi
 	fi
 
+	# /etc/dropbear links to a missing /var/run/dropbear in the base image
+	if [ -L /etc/dropbear ] && [ ! -e /etc/dropbear ]; then
+		rm -f /etc/dropbear
+		mkdir -p /etc/dropbear
+	fi
 	if [ -d /config/overlay ]; then
 		find /config/overlay -type f | while read -r f; do
 			install -D "$f" "${f#/config/overlay}"
