@@ -171,7 +171,7 @@ diff --git a/drivers/media/platform/ingenic/t20-vpu-core.c b/drivers/media/platf
 new file mode 100644
 --- /dev/null
 +++ b/drivers/media/platform/ingenic/t20-vpu-core.c
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,413 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Ingenic T20 VPU: JPEG and H.264 encoders as V4L2 mem2mem devices
@@ -346,6 +346,8 @@ new file mode 100644
 +	dst->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 +	dst->ops = ops;
 +	dst->mem_ops = dst_mem_ops;
++	/* Cached (V4L2_MEMORY_FLAG_NON_COHERENT): the codec syncs what it writes */
++	dst->allow_cache_hints = dst_mem_ops == &vb2_dma_contig_memops;
 +	dst->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 +	dst->lock = &ctx->vpu->lock;
 +	dst->dev = ctx->vpu->dev;
@@ -587,7 +589,7 @@ diff --git a/drivers/media/platform/ingenic/t20-vpu-jpeg.c b/drivers/media/platf
 new file mode 100644
 --- /dev/null
 +++ b/drivers/media/platform/ingenic/t20-vpu-jpeg.c
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,558 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Ingenic T20 VPU JPEG encoder: NV12 in, baseline JFIF (4:2:0) out.
@@ -602,6 +604,7 @@ new file mode 100644
 + * quantisation tables (from a quality setting) are new.
 + */
 +
++#include <linux/dma-mapping.h>
 +#include <linux/io.h>
 +#include <linux/slab.h>
 +
@@ -843,6 +846,9 @@ new file mode 100644
 +	ctx->header_len = t20_jpeg_write_header(ctx, vb2_plane_vaddr(&dst->vb2_buf, 0));
 +	raw = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
 +	bs = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0) + ctx->header_len;
++	if (dst->vb2_buf.vb2_queue->non_coherent_mem)
++		dma_sync_single_for_device(vpu->dev, bs - ctx->header_len, ctx->header_len,
++					   DMA_TO_DEVICE);
 +
 +	d = t20_vpu_acfg(d, VPU_TCSM_FLUSH, 0);
 +	d = t20_vpu_acfg(d, VPU_JPGC_GLBI, JPGC_EN);		/* core clock on */
@@ -896,10 +902,21 @@ new file mode 100644
 +	src = v4l2_m2m_src_buf_remove(vctx->fh.m2m_ctx);
 +	dst = v4l2_m2m_dst_buf_remove(vctx->fh.m2m_ctx);
 +	if (dst && state == VB2_BUF_STATE_DONE) {
-+		/* EOI after the bitstream */
++		/*
++		 * EOI after the bitstream. A cached buffer: its line read fresh
++		 * and written back before vb2 invalidates the buffer for the CPU.
++		 */
++		bool cached = dst->vb2_buf.vb2_queue->non_coherent_mem;
++		dma_addr_t eoi = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0) +
++				 ctx->header_len + bs_len;
++
++		if (cached)
++			dma_sync_single_for_cpu(vpu->dev, eoi, 2, DMA_FROM_DEVICE);
 +		p = vb2_plane_vaddr(&dst->vb2_buf, 0) + ctx->header_len + bs_len;
 +		p[0] = 0xff;
 +		p[1] = 0xd9;
++		if (cached)
++			dma_sync_single_for_device(vpu->dev, eoi, 2, DMA_TO_DEVICE);
 +		vb2_set_plane_payload(&dst->vb2_buf, 0, ctx->header_len + bs_len + 2);
 +	}
 +	if (src && dst)
